@@ -38,6 +38,7 @@ import { Router, type NextFunction, type Request, type Response } from "express"
 import { generateKeyPairSync, randomUUID } from "node:crypto";
 import { readFile, rm } from "node:fs/promises";
 import path from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import type { Db } from "@paperclipai/db";
 import type { ChatChannelService } from "../services/chat-channels.js";
 import { activityLog, agents as agentsTable, chatConversations, companies, heartbeatRuns, issues as issuesTable, projects as projectsTable } from "@paperclipai/db";
@@ -5315,10 +5316,17 @@ export function agentRoutes(
     const nextAiBinding = aiRuntimeConnectionBindingSchema.safeParse(requestedRuntimeConfig?.aiConnection ?? existing.runtimeConfig.aiConnection).data;
     if (nextAiBinding) {
       await assertCanUpdateAgent(req, existing);
-      const changed = JSON.stringify(nextAiBinding) !== JSON.stringify(existing.runtimeConfig.aiConnection);
       const aiConfig = (patchData.adapterConfig ?? existing.adapterConfig) as Record<string, unknown>;
+      // Re-test the account only when what it must authenticate changes: the
+      // binding itself or the runtime target. Compare parsed bindings by value;
+      // jsonb reorders keys, so a string comparison saw every edit as a change.
+      const bindingChanged = !isDeepStrictEqual(nextAiBinding, aiRuntimeConnectionBindingSchema.safeParse(existing.runtimeConfig.aiConnection).data);
+      const existingAiConfig = existing.adapterConfig as Record<string, unknown>;
+      const runtimeTargetChanged = requestedAdapterType !== existing.adapterType
+        || (["model", "provider", "acpxAgent", "engine"] as const).some((key) => aiConfig[key] !== existingAiConfig[key])
+        || (patchData.defaultEnvironmentId !== undefined && patchData.defaultEnvironmentId !== existing.defaultEnvironmentId);
       if (nextAiBinding.mode !== "router" && !isAiConnectionCompatible(nextAiBinding, requestedAdapterType, aiConfig.model, aiConfig.provider, aiConfig.acpxAgent)) throw unprocessable("Select an AI connection compatible with the new harness and model");
-      if (changed || (nextAiBinding.mode === "router" && requestedAdapterType !== existing.adapterType)) await validateManagedAgentBinding(req, existing.companyId, existing.id, requestedAdapterType, aiConfig, nextAiBinding, (patchData.defaultEnvironmentId !== undefined ? patchData.defaultEnvironmentId : existing.defaultEnvironmentId) as string | null, true);
+      if (bindingChanged || runtimeTargetChanged) await validateManagedAgentBinding(req, existing.companyId, existing.id, requestedAdapterType, aiConfig, nextAiBinding, (patchData.defaultEnvironmentId !== undefined ? patchData.defaultEnvironmentId : existing.defaultEnvironmentId) as string | null, true);
     }
     if (requestedRuntimeConfig) patchData.runtimeConfig = requestedRuntimeConfig;
     if (touchesAdapterConfiguration || Object.prototype.hasOwnProperty.call(patchData, "defaultEnvironmentId")) {

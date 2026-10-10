@@ -287,6 +287,31 @@ describe("agent-created hires use managed AI connections", () => {
     } finally { unregisterServerAdapter(f.adapterType); }
   });
 
+  it("save re-tests the account only when the binding or runtime target changes", async () => {
+    const f = await fixture("anthropic", "subscription");
+    await db.insert(principalPermissionGrants).values({ companyId: f.companyId, principalType: "user", principalId: f.userId, permissionKey: "agents:configure" });
+    const original = getServerAdapter(f.adapterType);
+    let tests = 0;
+    registerServerAdapter({ ...original, testEnvironment: async () => {
+      tests += 1;
+      return {
+        adapterType: f.adapterType, status: "fail", testedAt: new Date().toISOString(),
+        checks: [{ code: "claude_hello_probe_auth_required", level: "error", message: "The account needs sign-in." }],
+      };
+    } });
+    try {
+      for (const body of [{ adapterConfig: { timeoutSec: 0 } }, { adapterConfig: { graceSec: 30 } }, { runtimeConfig: { aiConnection: { mode: "responsible_user", method: "subscription", provider: "anthropic" } } }]) {
+        const response = await request(f.app).patch(`/api/agents/${f.agentId}`).send(body);
+        expect(response.status, JSON.stringify(response.body)).toBe(200);
+      }
+      expect(tests).toBe(0);
+      expect(await aiConnectionService(db).list(f.companyId, f.userId)).toEqual([expect.objectContaining({ status: "connected" })]);
+      const retarget = await request(f.app).patch(`/api/agents/${f.agentId}`).send({ adapterConfig: { model: "changed-model" } });
+      expect(retarget.status, JSON.stringify(retarget.body)).toBe(422);
+      expect(tests).toBe(1);
+    } finally { unregisterServerAdapter(f.adapterType); }
+  });
+
   it.each([false, true])("a failed environment test preserves connection health for a runtime failure or a newer reconnect (reconnected: %s)", async (reconnected) => {
     const f = await fixture("anthropic", "subscription");
     await db.insert(principalPermissionGrants).values({ companyId: f.companyId, principalType: "user", principalId: f.userId, permissionKey: "agents:configure" });
