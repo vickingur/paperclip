@@ -1,0 +1,102 @@
+name: Fork sync
+
+# Keeps `custom` = upstream master + fork patches. Daily: rebase the fork
+# patches onto paperclipai/paperclip master and force-push `custom`, which
+# triggers the Fork image build. A rebase conflict opens an issue instead.
+#
+# Needs secret FORK_SYNC_TOKEN: a fine-grained PAT on vickingur/paperclip with
+# Contents and Workflows read/write. GITHUB_TOKEN cannot push commits that
+# touch .github/workflows, and its pushes would not trigger the image build.
+
+on:
+  schedule:
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+  actions: write
+
+concurrency:
+  group: fork-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      CONFLICT_LABEL: fork-sync-conflict
+    steps:
+      - name: Checkout custom
+        uses: actions/checkout@v7
+        with:
+          ref: custom
+          fetch-depth: 0
+          token: ${{ secrets.FORK_SYNC_TOKEN }}
+
+      - name: Rebase fork patches onto upstream master
+        id: rebase
+        run: |
+          set -euo pipefail
+          git config user.name "fork-sync[bot]"
+          git config user.email "fork-sync@users.noreply.github.com"
+          git fetch --quiet https://github.com/paperclipai/paperclip.git master:refs/remotes/upstream/master
+          before="$(git rev-parse HEAD)"
+          echo "before=${before}" >> "$GITHUB_OUTPUT"
+          if git merge-base --is-ancestor upstream/master HEAD; then
+            echo "custom already contains upstream master $(git rev-parse --short upstream/master)."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if ! git rebase upstream/master; then
+            git diff --name-only --diff-filter=U > /tmp/conflicts.txt
+            git rebase --abort
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          echo "Rebased $(git rev-list --count upstream/master..HEAD) fork patches onto $(git rev-parse --short upstream/master)."
+
+      - name: Push custom
+        if: steps.rebase.outputs.changed == 'true'
+        run: git push --force-with-lease=custom:${{ steps.rebase.outputs.before }} origin HEAD:custom
+
+      - name: Report rebase conflict
+        if: failure() && steps.rebase.outputs.conflict == 'true'
+        run: |
+          set -euo pipefail
+          gh label create "$CONFLICT_LABEL" --color B60205 --force >/dev/null
+          body="$(printf 'Fork patches no longer rebase cleanly onto upstream master %s.\n\nConflicting files:\n%s\n\nRun: %s/%s/actions/runs/%s\n' \
+            "$(git rev-parse --short upstream/master)" "$(sed 's/^/- `/; s/$/`/' /tmp/conflicts.txt)" \
+            "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID")"
+          existing="$(gh issue list --label "$CONFLICT_LABEL" --state open --json number --jq '.[0].number')"
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body"
+          else
+            gh issue create --title "Fork sync: rebase conflict with upstream" --label "$CONFLICT_LABEL" --body "$body"
+          fi
+
+      - name: Close resolved conflict issue
+        if: success()
+        run: |
+          set -euo pipefail
+          for n in $(gh issue list --label "$CONFLICT_LABEL" --state open --json number --jq '.[].number'); do
+            gh issue close "$n" --comment "Sync succeeded in run $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID."
+          done
+
+      # Upstream workflows need upstream secrets and would fail or publish
+      # from the fork. Keep only fork-*.yml enabled, including any workflow
+      # upstream adds later.
+      - name: Disable upstream workflows
+        if: always()
+        run: |
+          set -euo pipefail
+          gh api --paginate "repos/$GITHUB_REPOSITORY/actions/workflows" \
+            --jq '.workflows[] | select(.state == "active") | select(.path | startswith(".github/workflows/fork-") | not) | "\(.id) \(.path)"' |
+          while read -r id path; do
+            gh api -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/$id/disable"
+            echo "Disabled $path"
+          done
