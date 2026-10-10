@@ -1,0 +1,140 @@
+name: Fork image
+
+# Builds the fork's `custom` branch (upstream master + fork patches) and
+# publishes it to ghcr.io/vickingur/paperclip.
+# Mirrors upstream docker.yml's single-arch build path; amd64 only.
+
+on:
+  push:
+    branches: [custom]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: fork-image
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      # The fork has no release tags of its own. Version = upstream's
+      # describe of the merge base, plus the number of fork-only commits.
+      - name: Compute build version
+        id: build-version
+        run: |
+          set -euo pipefail
+          git fetch --quiet --tags https://github.com/paperclipai/paperclip.git master:refs/remotes/upstream/master
+          base="$(git merge-base HEAD upstream/master)"
+          upstream_version="$(git describe --tags --match 'v*' --long "$base")"
+          patches="$(git rev-list --count "$base"..HEAD)"
+          version="${upstream_version}+vik.${patches}"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "tag=$(printf '%s' "$version" | tr '+' '-')" >> "$GITHUB_OUTPUT"
+          echo "Stamping build version: ${version}"
+
+      - name: Compute tool cache epoch
+        id: tools-epoch
+        run: echo "epoch=$(date -u +%G-W%V)" >> "$GITHUB_OUTPUT"
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 9.15.4
+          run_install: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - name: Refresh lockfile for Docker build context
+        run: |
+          set -euo pipefail
+          pnpm install --resolution-only --ignore-scripts --no-frozen-lockfile
+          changed="$(git status --porcelain)"
+          if [ -z "$changed" ]; then
+            echo "Lockfile already matches package metadata."
+            exit 0
+          fi
+          if printf '%s\n' "$changed" | grep -Fvq ' pnpm-lock.yaml'; then
+            echo "Unexpected files changed during lockfile refresh:"
+            echo "$changed"
+            exit 1
+          fi
+          echo "Using refreshed pnpm-lock.yaml in the Docker build context."
+
+      - name: Free runner disk
+        run: |
+          set -euo pipefail
+          pnpm store prune || true
+          sudo apt-get clean || true
+          sudo rm -rf /usr/share/dotnet /usr/share/swift /usr/local/lib/android \
+            /usr/local/share/boost /usr/local/share/powershell /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /opt/hostedtoolcache/PyPy /opt/hostedtoolcache/Ruby || true
+          docker system prune -af || true
+          df -h /
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+        with:
+          buildkitd-config-inline: |
+            [registry."docker.io"]
+              mirrors = ["mirror.gcr.io"]
+
+      - name: Compute schema migration labels
+        id: schema
+        run: |
+          set -euo pipefail
+          last=$(ls packages/db/src/migrations/*.sql | sed 's|.*/||' | LC_ALL=C sort | tail -1)
+          count=$(ls packages/db/src/migrations/*.sql | wc -l | tr -d ' ')
+          echo "last=${last}" >> "$GITHUB_OUTPUT"
+          echo "count=${count}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: production
+          platforms: linux/amd64
+          build-args: |
+            PAPERCLIP_BUILD_VERSION=${{ steps.build-version.outputs.version }}
+            PAPERCLIP_BUILD_COMMIT=${{ github.sha }}
+            CLI_TOOLS_CACHE_EPOCH=${{ steps.tools-epoch.outputs.epoch }}
+          tags: |
+            ghcr.io/${{ github.repository }}:custom
+            ghcr.io/${{ github.repository }}:${{ steps.build-version.outputs.tag }}
+            ghcr.io/${{ github.repository }}:sha-${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.build-version.outputs.version }}
+            io.github.paperclipai.schema.last-migration=${{ steps.schema.outputs.last }}
+            io.github.paperclipai.schema.migration-count=${{ steps.schema.outputs.count }}
+          cache-from: type=registry,ref=ghcr.io/${{ github.repository }}:buildcache-amd64
+          cache-to: type=registry,ref=ghcr.io/${{ github.repository }}:buildcache-amd64,mode=max
+          push: true
+
+      - name: Summary
+        run: |
+          {
+            echo "Image: ghcr.io/${{ github.repository }}:${{ steps.build-version.outputs.tag }}"
+            echo "Version: ${{ steps.build-version.outputs.version }}"
+            echo "Migrations: ${{ steps.schema.outputs.count }} (last ${{ steps.schema.outputs.last }})"
+          } >> "$GITHUB_STEP_SUMMARY"
