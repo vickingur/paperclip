@@ -28,4 +28,5 @@ Image version: `<upstream describe of merge base>+vik.<fork commit count>`, e.g.
 | Patch | Why |
 |---|---|
 | Fork CI (`fork-*.yml`, this file) | Sync and image build for the fork. |
+| Agent save re-tests AI account only on binding or runtime-target change (`server/src/routes/agents.ts`) | Upstream compared jsonb bindings as strings, so every agent edit (title, reporting line, timeout) ran a live provider hello test and failed while the account needed sign-in. |
 
