@@ -11,6 +11,7 @@ import {
   type AiConnectionBinding,
 } from "@paperclipai/shared";
 import { managedProviderRouting } from "./ai-provider-routing.js";
+import { runAiHomeSetup } from "./ai-home-setup.js";
 import { aiConnectionService } from "./ai-connections.js";
 import { subscriptionService } from "./subscriptions.js";
 import { refreshSubscriptionConnection } from "./subscription-refresh.js";
@@ -356,6 +357,7 @@ export async function prepareManagedAiRuntime(
       if (projected.hermesConfig) await writeFile(path.join(providerHome, "config.yaml"), projected.hermesConfig, { mode: 0o600 });
       if (projected.codexConfig) await writeFile(path.join(providerHome, "config.toml"), 'cli_auth_credentials_store = "file"\n' + projected.codexConfig, { mode: 0o600 });
     }
+    await runAiHomeSetup({ harness, environment: managedAiHomeEnvironment(home) });
     const attribution = { ...selection.attribution } as typeof selection.attribution & { subscriptionId?: string };
     if (attribution.method === "subscription") {
       const subscription = {
