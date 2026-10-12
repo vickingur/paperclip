@@ -181,6 +181,30 @@ RUN echo "cli-tools-epoch: ${CLI_TOOLS_CACHE_EPOCH}" \
   && mkdir -p /paperclip \
   && chown node:node /paperclip
 
+# Fork: media tools for agent workspaces (video-pipeline tests and Blender
+# checks): Python imaging/numerics, ffmpeg, fonts, Blender's runtime libraries
+# and portable Blender, pinned by the release's published sha256. Blender ships
+# x64 only; other architectures get everything else. Its own layer, so the
+# 380 MB download stays cached across app commits.
+ARG TARGETARCH
+ARG BLENDER_VERSION=5.2.2
+ARG BLENDER_SHA256_AMD64=84098912789dc450e95697c4184fb8a90acbe5111c2ba4aede3fecb57806a168
+ARG BLENDER_MIRROR=https://ftp.halifax.rwth-aachen.de/blender/release
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends xz-utils python3-pil python3-numpy python3-scipy ffmpeg util-linux \
+    fontconfig fonts-dejavu-core fonts-noto-core libxi6 libxxf86vm1 libxfixes3 libxrender1 libxkbcommon0 \
+    libgl1 libegl1 libsm6 libice6 libx11-6 libxext6 \
+  && rm -rf /var/lib/apt/lists/* \
+  && if [ "${TARGETARCH:-amd64}" = "amd64" ]; then \
+    series="${BLENDER_VERSION%.*}" \
+    && curl -fsSL -o /tmp/blender.tar.xz "${BLENDER_MIRROR}/Blender${series}/blender-${BLENDER_VERSION}-linux-x64.tar.xz" \
+    && echo "${BLENDER_SHA256_AMD64}  /tmp/blender.tar.xz" | sha256sum -c - \
+    && tar -xJf /tmp/blender.tar.xz -C /opt \
+    && rm /tmp/blender.tar.xz \
+    && chmod -R a+rX "/opt/blender-${BLENDER_VERSION}-linux-x64" \
+    && ln -s "/opt/blender-${BLENDER_VERSION}-linux-x64/blender" /usr/local/bin/blender; \
+  fi
+
 COPY scripts/docker-entrypoint.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
