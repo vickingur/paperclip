@@ -636,6 +636,20 @@ const ACPX_INHERITED_PROVIDER_ENV_KEYS: Readonly<Record<string, ReadonlySet<stri
 };
 
 /**
+ * Server variables the operator names in `PAPERCLIP_AGENT_PASSTHROUGH_ENV`
+ * (comma-separated) reach every host agent as well, e.g. a plugin or hook
+ * directory the agents' CLIs read. Fork patch.
+ */
+function operatorPassthroughEnvKeys(env: NodeJS.ProcessEnv): ReadonlySet<string> {
+  return new Set(
+    (env.PAPERCLIP_AGENT_PASSTHROUGH_ENV ?? "")
+      .split(",")
+      .map((key) => key.trim().toUpperCase())
+      .filter((key) => key.length > 0),
+  );
+}
+
+/**
  * Project the server environment onto the closed set a host ACPX provider may
  * inherit. A runner-backed remote sandbox passes `false` and projects nothing.
  * Explicit adapter/runtime env is merged later and is intentionally not
@@ -652,6 +666,7 @@ export function projectAcpxInheritedHostEnvironment(
   if (!inheritHostEnvironment) return {};
 
   const providerKeys = ACPX_INHERITED_PROVIDER_ENV_KEYS[acpxAgent];
+  const operatorKeys = operatorPassthroughEnvKeys(inheritedEnv);
   const projected: Record<string, string> = {};
   for (const [key, value] of Object.entries(inheritedEnv)) {
     if (typeof value !== "string") continue;
@@ -659,7 +674,8 @@ export function projectAcpxInheritedHostEnvironment(
     const allowed =
       ACPX_INHERITED_HOST_ENV_KEYS.has(normalizedKey) ||
       /^LC_[A-Z0-9_]{1,32}$/.test(normalizedKey) ||
-      providerKeys?.has(normalizedKey) === true;
+      providerKeys?.has(normalizedKey) === true ||
+      operatorKeys.has(normalizedKey);
     if (allowed) projected[key] = value;
   }
   return projected;
