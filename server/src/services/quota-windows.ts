@@ -8,6 +8,7 @@ import { companySecrets, companySecretVersions, userSecretDefinitions, type Db }
 import { fetchCodexQuota } from "@paperclipai/adapter-codex-local/server";
 import { fetchClaudeQuota } from "@paperclipai/adapter-claude-local/server";
 import { aiConnectionService } from "./ai-connections.js";
+import { readObservedClaudeQuota } from "./observed-claude-quota.js";
 
 const accountRequests = new Map<string, { expires: number; result: Promise<ProviderQuotaResult> }>();
 const publicError = "Subscription quota is currently unavailable. Check usage with your provider.";
@@ -91,7 +92,12 @@ export async function fetchCompanyQuotaWindows(db: Db, companyId: string, userId
               windows = await read(auth);
             }
           } else {
-            windows = await fetchClaudeQuota(value, controller.signal);
+            try { windows = await fetchClaudeQuota(value, controller.signal); }
+            catch (error) {
+              const observed = await readObservedClaudeQuota();
+              if (!observed) throw error;
+              return { ...base, ok: true, windows: observed.windows, capturedAt: observed.capturedAt, source: "agent-observed" };
+            }
           }
           return { ...base, ok: true, windows, capturedAt: new Date().toISOString() };
         } catch (error) {
