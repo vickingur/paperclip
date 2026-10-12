@@ -177,6 +177,25 @@ describe("acpx identity split and launch environment", () => {
     });
   });
 
+  it("passes the variables the operator names to every host agent, and only to host agents", () => {
+    const inherited = {
+      PATH: "/usr/bin",
+      PAPERCLIP_AGENT_PASSTHROUGH_ENV: " plugin_dirs , GUARD_DIR,",
+      PLUGIN_DIRS: "/paperclip/guard",
+      GUARD_DIR: "/paperclip/guard-state",
+      UNRELATED_SECRET: "unrelated-host-secret",
+    };
+
+    for (const agent of ["claude", "codex"]) {
+      expect(projectAcpxInheritedHostEnvironment(inherited, agent, true)).toEqual({
+        PATH: "/usr/bin",
+        PLUGIN_DIRS: "/paperclip/guard",
+        GUARD_DIR: "/paperclip/guard-state",
+      });
+    }
+    expect(projectAcpxInheritedHostEnvironment(inherited, "claude", false)).toEqual({});
+  });
+
   it("does not project any ambient host environment across a remote boundary", () => {
     const inherited = {
       PATH: "/host/bin",
