@@ -306,7 +306,7 @@ export async function fetchCodexQuota(
   if (rateLimit?.primary_window != null) {
     const w = rateLimit.primary_window;
     windows.push({
-      label: "5h limit",
+      label: codexWindowLabel(w.limit_window_seconds, "5h limit"),
       usedPercent: normalizeCodexUsedPercent(w.used_percent),
       resetsAt:
         typeof w.reset_at === "number"
@@ -319,7 +319,7 @@ export async function fetchCodexQuota(
   if (rateLimit?.secondary_window != null) {
     const w = rateLimit.secondary_window;
     windows.push({
-      label: "Weekly limit",
+      label: codexWindowLabel(w.limit_window_seconds, "Weekly limit"),
       usedPercent: normalizeCodexUsedPercent(w.used_percent),
       resetsAt:
         typeof w.reset_at === "number"
@@ -389,6 +389,19 @@ function unixSecondsToIso(value: number | null | undefined): string | null {
   return new Date(value * 1000).toISOString();
 }
 
+/**
+ * Names a window by its length when the provider reports one. Plans differ:
+ * on some the primary window is weekly, and a fixed "5h limit" label misnamed
+ * it. Fork patch.
+ */
+export function codexWindowLabel(seconds: number | null | undefined, fallback: string): string {
+  if (typeof seconds !== "number" || !Number.isFinite(seconds) || seconds <= 0) return fallback;
+  const hours = seconds / 3600;
+  if (hours < 24) return `${Math.round(hours)}h limit`;
+  const days = Math.round(hours / 24);
+  return days === 7 ? "Weekly limit" : `${days}d limit`;
+}
+
 function buildCodexRpcWindow(label: string, window: CodexRpcWindow | null | undefined): QuotaWindow | null {
   if (!window) return null;
   return {
@@ -437,9 +450,11 @@ export function mapCodexRpcQuota(result: CodexRpcRateLimitsResult, account?: Cod
       limitId === "codex"
         ? ""
         : `${limit.limitName ?? limitId} · `;
-    const primary = buildCodexRpcWindow(`${prefix}5h limit`, limit.primary);
+    const minutes = (window: CodexRpcWindow | null | undefined) =>
+      typeof window?.windowDurationMins === "number" ? window.windowDurationMins * 60 : null;
+    const primary = buildCodexRpcWindow(`${prefix}${codexWindowLabel(minutes(limit.primary), "5h limit")}`, limit.primary);
     if (primary) windows.push(primary);
-    const secondary = buildCodexRpcWindow(`${prefix}Weekly limit`, limit.secondary);
+    const secondary = buildCodexRpcWindow(`${prefix}${codexWindowLabel(minutes(limit.secondary), "Weekly limit")}`, limit.secondary);
     if (secondary) windows.push(secondary);
     if (limitId === "codex" && limit.credits && limit.credits.unlimited !== true) {
       windows.push({
