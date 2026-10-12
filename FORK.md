@@ -29,4 +29,6 @@ Image version: `<upstream describe of merge base>+vik.<fork commit count>`, e.g.
 |---|---|
 | Fork CI (`fork-*.yml`, this file) | Sync and image build for the fork. |
 | Agent save re-tests AI account only on binding or runtime-target change (`server/src/routes/agents.ts`) | Upstream compared jsonb bindings as strings, so every agent edit (title, reporting line, timeout) ran a live provider hello test and failed while the account needed sign-in. |
+| Operator env pass-through (`packages/adapter-utils/src/acpx-engine/execute.ts`) | `PAPERCLIP_AGENT_PASSTHROUGH_ENV=NAME,NAME` names server variables every host agent inherits. Upstream passes agents a fixed allow-list, so a plugin or hook directory set on the container (usage-guard's `CLAUDE_CODE_PLUGIN_DIRS`, `UG_DIR`) never reached them. |
+| Provider-home setup command (`server/src/services/ai-home-setup.ts`) | `PAPERCLIP_AI_HOME_SETUP_COMMAND` runs once a run's provider home is seeded, with `CODEX_HOME`/`CLAUDE_CONFIG_DIR` and `PAPERCLIP_AI_HARNESS` set. Codex trusts a hook by its `hooks.json` path, and each run gets a fresh home, so the hook must be written and trusted per run. A failure is logged; the run goes on. |
 
