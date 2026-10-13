@@ -682,10 +682,14 @@ export function pluginLifecycleManager(
           { pluginId, pluginKey: plugin.pluginKey, addedCaps },
           "plugin lifecycle: new capabilities detected, transitioning to upgrade_pending",
         );
-        // Skip the inner stopWorkerIfRunning since we already stopped above
-        const result = plugin.status === "upgrade_pending"
-          ? await requirePlugin(pluginId)
-          : await transition(pluginId, "upgrade_pending", null, plugin);
+        // The loader persisted pending status atomically with the candidate.
+        const result = await requirePlugin(pluginId);
+        if (plugin.status !== result.status) {
+          emitter.emit("plugin.status_changed", {
+            pluginId, pluginKey: result.pluginKey,
+            previousStatus: plugin.status, newStatus: result.status,
+          });
+        }
         emitDomain("plugin.upgrade_pending", {
           pluginId,
           pluginKey: result.pluginKey,

@@ -1805,6 +1805,7 @@ export function pluginLoader(
         id: string;
         packageName: string;
         packagePath: string | null;
+        status: string;
         manifestJson: PaperclipPluginManifestV1;
       } | null;
       if (!plugin) throw new Error(`Plugin not found: ${pluginId}`);
@@ -1841,12 +1842,15 @@ export function pluginLoader(
         );
       }
 
-      // Capability approval belongs to the lifecycle manager. Persist the
-      // validated candidate so an escalating upgrade can await admin enable.
+      // Atomically persist approval status with candidate metadata so retry
+      // and boot cannot activate unapproved capabilities from a ready row.
+      const requiresApproval = plugin.status === "upgrade_pending" ||
+        newManifest.capabilities.some((cap) => !oldManifest.capabilities.includes(cap));
       await registry.update(pluginId, {
         packageName: discovered.packageName,
         version: discovered.version,
         manifest: newManifest,
+        ...(requiresApproval ? { status: "upgrade_pending" as const } : {}),
       });
 
       return {
