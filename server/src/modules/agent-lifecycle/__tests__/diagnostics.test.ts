@@ -101,6 +101,9 @@ describe("lifecycle failure diagnostics", () => {
     [{ code: "required_plugin_unavailable" }, "required_plugin_unavailable"],
     [{ code: "harness_test_failed" }, "harness_test_failed"],
     [{ cause: { code: "40P01", message: "private query" } }, "40P01"],
+    [{ details: { code: "ai_connection_incompatible", message: "private credential value" } }, "ai_connection_incompatible"],
+    [{ cause: { details: { code: "ai_connection_credential_not_shared" } } }, "ai_connection_credential_not_shared"],
+    [{ code: "EACCES" }, "EACCES"],
     [{ code: "private credential value" }, "unclassified"],
   ])("logs known codes without provider error contents", (details, failureCode) => {
     const log = vi.spyOn(logger, "warn").mockImplementation(() => {});

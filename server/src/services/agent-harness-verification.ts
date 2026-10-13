@@ -1,3 +1,4 @@
+import { markVerificationFailure, withPreservedFailure, type VerificationSubstage } from "./lifecycle-verification-diagnostics.js";
 import { and, eq } from "drizzle-orm";
 import { agents, companies, type Db } from "@paperclipai/db";
 import type { AdapterEnvironmentTestResult } from "@paperclipai/adapter-utils";
@@ -27,50 +28,68 @@ export function agentHarnessVerificationService(db: Db, manager: PluginWorkerMan
   const secrets = secretService(db);
   const environments = environmentService(db);
   async function verify(snapshot: LifecycleAgent): Promise<"complete" | "pending"> {
-    const [agent] = await db.select().from(agents).where(and(eq(agents.id, snapshot.id), eq(agents.lifecycleVersion, snapshot.lifecycleVersion)));
-    if (!agent) return "pending";
-    if (agent.adapterType === "paperclip_runner" && agent.adapterConfig.provider === "openai_dot") {
-      const binding = await dotRunnerBroker(db).bindingForAgent(agent.companyId, agent.id);
-      return binding?.status === "ready" && binding.subscriptionVerified && binding.id === agent.adapterConfig.dotBindingId ? "complete" : "pending";
-    }
-    const [company] = await db.select().from(companies).where(eq(companies.id, agent.companyId));
-    const responsibleUserId = agent.lifecycleOperation?.responsibleUserId ?? company.defaultResponsibleUserId;
-    const context = { consumerType: "agent" as const, consumerId: agent.id, actorType: "system" as const,
-      actorId: "agent-lifecycle", responsibleUserId };
-    let binding = agent.runtimeConfig.aiConnection ? aiRuntimeConnectionBindingSchema.parse(agent.runtimeConfig.aiConnection) : undefined;
-    let config = agent.adapterConfig;
-    if (binding?.mode === "router") {
-      const selected = await aiConnectionRouterService(db, manager).resolve({ companyId: agent.companyId,
-        poolId: binding.connectionId, agentId: agent.id, userId: responsibleUserId,
-        adapterType: agent.adapterType, taskKey: `lifecycle:${agent.lifecycleOperation!.id}` });
-      binding = selected.binding;
-      config = { ...config, ...selected.runtimeConfig };
-    }
-    if (binding) config = { ...config, env: stripAiAuthBindings(config.env) };
-    config = (await secrets.resolveAdapterConfigForRuntime(agent.companyId, config, context, { adapterType: agent.adapterType })).config;
-    const environmentId = await tests.resolveAdapterTestEnvironmentId(agent.companyId, agent.defaultEnvironmentId);
-    if (environmentId) {
-      await tests.assertAdapterTestEnvironmentForCompany(agent.companyId, environmentId);
-      const environment = await environments.getById(environmentId);
-      const env = Object.fromEntries(Object.entries(binding ? stripAiAuthBindings(environment?.envVars) : parseObject(environment?.envVars))
-        .filter(([key]) => !isForbiddenConfigEnvKey(key)));
-      const resolved = await secrets.resolveEnvBindings(agent.companyId, env,
-        { ...context, consumerType: "environment", consumerId: environmentId });
-      config = { ...config, env: { ...resolved.env, ...parseObject(config.env) } };
-    }
-    const target = await tests.resolveAdapterTestExecutionContext({ agentId: agent.id, companyId: agent.companyId, adapterType: agent.adapterType, environmentId });
-    let status: "released" | "failed" = "failed";
+    let substage: VerificationSubstage = "binding_schema";
     try {
-      if (target.fallbackChecks.length) throw Object.assign(new Error("The test environment is unavailable"), { code: "test_environment_unavailable" });
-      const input = { companyId: agent.companyId, adapterType: agent.adapterType, config,
-        executionTarget: target.executionTarget, environmentName: target.environmentName };
-      const result = binding ? await withManagedAiProbe(db, { ...input, agentId: agent.id, responsibleUserId, binding },
-        managed => tests.testManagedEnvironment(agent.adapterType, { ...input, config: managed.config }, binding!, managed, agent.id))
-        : await requireServerAdapter(agent.adapterType).testEnvironment(input);
-      assertHarnessTestPassed(result);
-      status = "released";
-      return "complete";
-    } finally { await target.release(status); }
+      const [agent] = await db.select().from(agents).where(and(eq(agents.id, snapshot.id), eq(agents.lifecycleVersion, snapshot.lifecycleVersion)));
+      if (!agent) return "pending";
+      if (agent.adapterType === "paperclip_runner" && agent.adapterConfig.provider === "openai_dot") {
+        const binding = await dotRunnerBroker(db).bindingForAgent(agent.companyId, agent.id);
+        return binding?.status === "ready" && binding.subscriptionVerified && binding.id === agent.adapterConfig.dotBindingId ? "complete" : "pending";
+      }
+      const [company] = await db.select().from(companies).where(eq(companies.id, agent.companyId));
+      const responsibleUserId = agent.lifecycleOperation?.responsibleUserId ?? company.defaultResponsibleUserId;
+      const context = { consumerType: "agent" as const, consumerId: agent.id, actorType: "system" as const,
+        actorId: "agent-lifecycle", responsibleUserId };
+      let binding = agent.runtimeConfig.aiConnection ? aiRuntimeConnectionBindingSchema.parse(agent.runtimeConfig.aiConnection) : undefined;
+      let config = agent.adapterConfig;
+      if (binding?.mode === "router") {
+        const selected = await aiConnectionRouterService(db, manager).resolve({ companyId: agent.companyId,
+          poolId: binding.connectionId, agentId: agent.id, userId: responsibleUserId,
+          adapterType: agent.adapterType, taskKey: `lifecycle:${agent.lifecycleOperation!.id}` });
+        binding = selected.binding;
+        config = { ...config, ...selected.runtimeConfig };
+      }
+      if (binding) config = { ...config, env: stripAiAuthBindings(config.env) };
+      substage = "secret_resolution";
+      config = (await secrets.resolveAdapterConfigForRuntime(agent.companyId, config, context, { adapterType: agent.adapterType })).config;
+      substage = "environment_target_resolution";
+      const environmentId = await tests.resolveAdapterTestEnvironmentId(agent.companyId, agent.defaultEnvironmentId);
+      if (environmentId) {
+        await tests.assertAdapterTestEnvironmentForCompany(agent.companyId, environmentId);
+        const environment = await environments.getById(environmentId);
+        const env = Object.fromEntries(Object.entries(binding ? stripAiAuthBindings(environment?.envVars) : parseObject(environment?.envVars))
+          .filter(([key]) => !isForbiddenConfigEnvKey(key)));
+        substage = "secret_resolution";
+        const resolved = await secrets.resolveEnvBindings(agent.companyId, env,
+          { ...context, consumerType: "environment", consumerId: environmentId });
+        config = { ...config, env: { ...resolved.env, ...parseObject(config.env) } };
+      }
+      substage = "environment_target_resolution";
+      const target = await tests.resolveAdapterTestExecutionContext({ agentId: agent.id, companyId: agent.companyId, adapterType: agent.adapterType, environmentId });
+      let status: "released" | "failed" = "failed";
+      return await withPreservedFailure<"complete">(async () => {
+        if (target.fallbackChecks.length) throw Object.assign(new Error("The test environment is unavailable"), { code: "test_environment_unavailable" });
+        const input = { companyId: agent.companyId, adapterType: agent.adapterType, config,
+          executionTarget: target.executionTarget, environmentName: target.environmentName };
+        substage = binding ? "managed_preparation" : "provider_test";
+        const result = binding ? await withManagedAiProbe(db, { ...input, agentId: agent.id, responsibleUserId, binding },
+          async managed => {
+            substage = "provider_test";
+            try {
+              const result = await tests.testManagedEnvironment(agent.adapterType, { ...input, config: managed.config }, binding!, managed, agent.id);
+              assertHarnessTestPassed(result);
+              return result;
+            } catch (error) { markVerificationFailure(error, "provider_test"); throw error; }
+          }, () => { substage = "cleanup_release"; })
+          : await requireServerAdapter(agent.adapterType).testEnvironment(input);
+        assertHarnessTestPassed(result);
+        status = "released";
+        return "complete";
+      }, async () => {
+        try { await target.release(status); }
+        catch (error) { markVerificationFailure(error, "cleanup_release"); throw error; }
+      });
+    } catch (error) { markVerificationFailure(error, substage); throw error; }
   }
   return { verify };
 }

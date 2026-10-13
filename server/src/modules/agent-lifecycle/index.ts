@@ -23,7 +23,7 @@ const policyPageSize = 100;
 const workers = new WeakMap<Db, ReturnType<typeof createLifecycleWorker>>();
 export function configureAgentLifecycle(db: Db, effects: LifecycleEffects, driver: LifecycleDriver, canRun = () => true) {
   assertRootDatabase(db);
-  const worker = createLifecycleWorker(createLifecycleStore(db, effects), driver, effects.reportFailure, canRun);
+  const worker = createLifecycleWorker(createLifecycleStore(db, effects), driver, effects.reportFailure, canRun, effects.describeFailure);
   workers.set(db, worker);
   return worker;
 }

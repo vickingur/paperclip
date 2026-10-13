@@ -7,6 +7,8 @@ import type { ActivityPublication } from "../../../types/activity-publication.js
 /** Services supply integrations; lifecycle owns the transaction and state writes. */
 export interface LifecycleEffects {
   reportFailure(context: LifecycleFailure, error: unknown): void;
+  /** Return only public, allowlisted failure metadata for the stored error. */
+  describeFailure?(error: unknown): string;
   deleteDependencies(db: Db, companyId: string, agentId: string): Promise<void>;
   prepareConfiguration(db: Db, current: AgentConfigurationRecord, data: AgentConfigurationPatch, options?: UpdateAgentOptions): Promise<AgentConfigurationPatch>;
   completeConfiguration(db: Db, before: AgentConfigurationRecord, after: AgentConfigurationRecord, patch: AgentConfigurationPatch, options: UpdateAgentOptions | undefined, publications: ActivityPublication[]): Promise<void>;

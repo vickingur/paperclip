@@ -3,7 +3,8 @@ import type { LifecycleDriver, LifecycleStore, LifecycleFailure } from "./ports.
 import { isLifecycleWorkPending } from "../domain/policy.js";
 
 /** Database leases protect each attempt across server processes. */
-export function createLifecycleWorker(store: LifecycleStore, driver: LifecycleDriver, reportFailure: (context: LifecycleFailure, error: unknown) => void, canRun = () => true) {
+export function createLifecycleWorker(store: LifecycleStore, driver: LifecycleDriver, reportFailure: (context: LifecycleFailure, error: unknown) => void, canRun = () => true,
+  describeFailure: (error: unknown) => string = () => "The lifecycle step failed. Retry the operation.") {
   let stopped = false;
   const active = new Map<string, Promise<void>>();
   let running: Promise<void> | undefined;
@@ -65,8 +66,8 @@ export function createLifecycleWorker(store: LifecycleStore, driver: LifecycleDr
           async () => { await driver.onReady?.(changed); }).catch(() => {});
         }
         if (changed && !isLifecycleWorkPending(changed.lifecycleState)) return;
-      } catch {
-        if (!await runStep("defer", () => store.defer(agent, owner, "The lifecycle step failed. Retry the operation.", new Date()))) continue;
+      } catch (error) {
+        if (!await runStep("defer", () => store.defer(agent, owner, describeFailure(error), new Date()))) continue;
         return;
       } finally {
         clearInterval(renewal);

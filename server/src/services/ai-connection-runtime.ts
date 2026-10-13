@@ -1,3 +1,4 @@
+import { withPreservedFailure } from "./lifecycle-verification-diagnostics.js";
 import { createHash } from "node:crypto";
 import { HttpError, unprocessable } from "../errors.js";
 import { mkdtemp, mkdir, writeFile, readFile, rm } from "node:fs/promises";
@@ -471,7 +472,8 @@ export async function prepareManagedAiRuntime(
       },
     };
   } catch (error) {
-    if (home) await rm(home, { recursive: true, force: true });
+    // Preserve the preparation failure if temporary-home cleanup also fails.
+    if (home) await rm(home, { recursive: true, force: true }).catch(() => {});
     throw error;
   }
 }
@@ -483,11 +485,14 @@ export async function withManagedAiProbe<T>(
   db: Db,
   input: Parameters<typeof prepareManagedAiRuntime>[1],
   probe: (runtime: Awaited<ReturnType<typeof prepareManagedAiRuntime>>) => Promise<T>,
+  onCleanup?: () => void,
 ): Promise<T> {
   const run = async () => {
     const runtime = await prepareManagedAiRuntime(db, input);
-    try { return await probe(runtime); }
-    finally { await runtime.cleanup(); }
+    return withPreservedFailure(() => probe(runtime), async () => {
+      onCleanup?.();
+      await runtime.cleanup();
+    });
   };
   return input.binding.provider === "openai"
     ? withAccountHomeSecretMutationLock(undefined, input.companyId, run).catch(error => {
