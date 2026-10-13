@@ -564,15 +564,25 @@ describe("shared ACPX engine runtime behavior", () => {
   });
 
   it("keeps identity and scoped API access without exposing configured service tokens to Codex shells", async () => {
-    const { meta } = await runExecutor({ agent: "codex", env: { MY_SERVICE_TOKEN: "assigned-tool-token" } }, {
+    const { meta } = await runExecutor({ agent: "codex", env: {
+      MY_SERVICE_TOKEN: "assigned-tool-token",
+      PAPERCLIP_GITHUB_BROKER_TOKEN: "synthetic-broker",
+      PAPERCLIP_GITHUB_BRIDGE_TOKEN: "synthetic-bridge",
+      MY_SERVICE_SECRET: "synthetic-secret",
+      MY_API_KEY: "synthetic-key",
+      PAPERCLIP_GITHUB_BROKER_TOKEN_EXTRA: "synthetic-extra",
+    } }, {
       authToken: "assigned-run-token",
       agentIdentity: { keyId: "sha256:test", publicKeyPem: "public", privateKeyPem: "private" },
     });
     const config = JSON.parse(String((meta[0]?.env as Record<string, string>).CODEX_CONFIG));
     expect(config.shell_environment_policy.include_only).toEqual(expect.arrayContaining([
-      "PAPERCLIP_API_KEY", "PAPERCLIP_AGENT_PRIVATE_KEY",
+      "PAPERCLIP_API_KEY", "PAPERCLIP_AGENT_KEY_ID", "PAPERCLIP_AGENT_PUBLIC_KEY", "PAPERCLIP_AGENT_PRIVATE_KEY", "PAPERCLIP_GITHUB_BROKER_TOKEN",
     ]));
-    expect(config.shell_environment_policy.include_only).not.toContain("MY_SERVICE_TOKEN");
+    for (const key of ["MY_SERVICE_TOKEN", "PAPERCLIP_GITHUB_BRIDGE_TOKEN", "MY_SERVICE_SECRET", "MY_API_KEY", "PAPERCLIP_GITHUB_BROKER_TOKEN_EXTRA"]) {
+      expect(config.shell_environment_policy.include_only).not.toContain(key);
+    }
+    expect(JSON.stringify(config)).not.toContain("synthetic-broker");
     expect(JSON.stringify(config)).not.toContain("assigned-run-token");
     expect(JSON.stringify(config)).not.toContain("assigned-tool-token");
   });

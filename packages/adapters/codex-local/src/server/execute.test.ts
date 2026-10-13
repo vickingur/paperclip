@@ -159,7 +159,14 @@ describe("codex execute — outbound auth copy-back restore contribution", () =>
         engine: "cli",
         // External CODEX_HOME (outside the managed company tree) so no managed
         // seeding rewrites auth.json before teardown; equals the shared host home.
-        env: { CODEX_HOME: sharedHostHome, ...(input.withIdentity ? { MY_SERVICE_TOKEN: "assigned-tool-token" } : {}) },
+        env: { CODEX_HOME: sharedHostHome, ...(input.withIdentity ? {
+          MY_SERVICE_TOKEN: "assigned-tool-token",
+          PAPERCLIP_GITHUB_BROKER_TOKEN: "synthetic-broker",
+          PAPERCLIP_GITHUB_BRIDGE_TOKEN: "synthetic-bridge",
+          MY_SERVICE_SECRET: "synthetic-secret",
+          MY_API_KEY: "synthetic-key",
+          PAPERCLIP_GITHUB_BROKER_TOKEN_EXTRA: "synthetic-extra",
+        } : {}) },
       },
       context: {
         paperclipWorkspace: {
@@ -199,7 +206,11 @@ describe("codex execute — outbound auth copy-back restore contribution", () =>
     expect(keys).toEqual(expect.arrayContaining([
       "PAPERCLIP_API_KEY", "PAPERCLIP_AGENT_PRIVATE_KEY",
     ]));
-    expect(keys).not.toContain("MY_SERVICE_TOKEN");
+    expect(keys).toEqual(expect.arrayContaining(["PAPERCLIP_GITHUB_BROKER_TOKEN", "PAPERCLIP_AGENT_KEY_ID", "PAPERCLIP_AGENT_PUBLIC_KEY"]));
+    for (const key of ["MY_SERVICE_TOKEN", "PAPERCLIP_GITHUB_BRIDGE_TOKEN", "MY_SERVICE_SECRET", "MY_API_KEY", "PAPERCLIP_GITHUB_BROKER_TOKEN_EXTRA"]) {
+      expect(keys).not.toContain(key);
+    }
+    expect(policy).not.toContain("synthetic-broker");
     expect(keys).not.toContain("DATABASE_URL");
     expect(keys).not.toContain("HOST_DATABASE_PASSWORD");
     expect(commandArgs.join(" ")).not.toContain("assigned-run-token");
