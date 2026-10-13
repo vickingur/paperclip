@@ -1,6 +1,7 @@
 import { createContext, useContext, useEffect, useId, useRef, useState, type ReactNode } from "react";
 import type { ExecutionResetInspection, ExecutionResetRequest, ExecutionResetCommittedResponse } from "@paperclipai/shared";
 import { Copy, Loader2, RefreshCw, TriangleAlert } from "lucide-react";
+import { useCopyAction } from "@/lib/use-copy-action";
 import { issuesApi } from "@/api/issues";
 import { ApiError } from "@/api/client";
 import { Link } from "@/lib/router";
@@ -33,8 +34,8 @@ function accessMessage(status: number) {
   return status === 403 ? "Only board members can inspect an execution reset." : "This task isn't available. It may have been removed or you may no longer have access.";
 }
 function CopyValue({ value, label }: { value: string; label: string }) {
-  const [error, setError] = useState(false);
-  return <><Button variant="ghost" size="icon" aria-label={`Copy ${label}`} onClick={() => { void navigator.clipboard.writeText(value).catch(() => setError(true)); }}><Copy className="size-4" /></Button>{error && <span role="status">Couldn't copy. Select the value to copy it.</span>}</>;
+  const { copy, copied, failed } = useCopyAction();
+  return <><Button variant="ghost" size="icon" aria-label={`Copy ${label}`} onClick={() => { void copy(value); }}><Copy className="size-4" /></Button>{copied && <span role="status">Copied</span>}{failed && <span role="status">Couldn't copy. Select the value to copy it.</span>}</>;
 }
 function Hold({ hold, selected, disabled, onSelect, agentId }: { hold: ExecutionResetInspection["holds"][number]; selected: boolean; disabled: boolean; onSelect: () => void; agentId: string | null }) {
   const [expanded, setExpanded] = useState(false);

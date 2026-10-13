@@ -3716,7 +3716,7 @@
           ],
           "isUnique": true,
           "where": "\"agent_wakeup_requests\".\"idempotency_key\" LIKE 'execution-reset:%'",
-          "concurrently": false,
+          "concurrently": true,
           "method": "btree",
           "with": {}
         },

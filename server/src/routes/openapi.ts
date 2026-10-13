@@ -1,3 +1,4 @@
+import { executionResetRequestSchema, executionResetCommittedResponseSchema } from "@paperclipai/shared";
 import { updateFastResponseSchema } from "@paperclipai/shared";
 import { slackRegistrationSchema, slackSetupActionSchema, slackInstallAuthorizationSchema, slackRegistrationStateSchema, slackAppConfigurationSchema, slackAvatarStateSchema, slackAccountStateSchema } from "@paperclipai/shared";
 import { experimentalApiMetadata } from "./experimental-api-metadata.js";
@@ -7303,6 +7304,29 @@ registry.registerPath({
     403: r.forbidden,
     404: r.notFound,
   },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/issues/{id}/execution/reset-inspection",
+  tags: ["runs"],
+  summary: "Inspect execution holds for a board reset",
+  description: "Board-only read-only inspection of effective holds and settled action evidence. Does not retire holds or start execution.",
+  request: { params: z.object({ id: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/issues/{id}/execution/reset",
+  tags: ["runs"],
+  summary: "Reset settled execution holds and queue a fresh turn",
+  description: "Board-only fingerprint-bound reset. Company, issue and principal are server supplied. Exact idempotent retries return the committed response; changed evidence or payload returns a conflict.",
+  request: {
+    params: z.object({ id: z.string() }),
+    body: { content: { "application/json": { schema: executionResetRequestSchema } } },
+  },
+  responses: { 200: r.ok(executionResetCommittedResponseSchema), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict },
 });
 
 registry.registerPath({
