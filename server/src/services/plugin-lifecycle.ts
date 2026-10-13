@@ -652,8 +652,8 @@ export function pluginLifecycleManager(
         "plugin lifecycle: upgrade requested",
       );
 
-      await deactivatePluginRuntime(pluginId, plugin.pluginKey);
-
+      // Validate before stopping the current worker and unregistering tools.
+      // A rejected package must leave the existing runtime available.
       // 1. Download and validate new package via loader
       const { oldManifest, newManifest, discovered } =
         await pluginLoaderInstance.upgradePlugin(pluginId, { version });
@@ -668,20 +668,24 @@ export function pluginLifecycleManager(
         "plugin lifecycle: package upgraded on disk",
       );
 
+      await deactivatePluginRuntime(pluginId, plugin.pluginKey);
+
       // 2. Compare capabilities
       const addedCaps = newManifest.capabilities.filter(
         (cap) => !oldManifest.capabilities.includes(cap),
       );
 
       // 3. Transition state
-      if (addedCaps.length > 0) {
+      if (addedCaps.length > 0 || plugin.status === "upgrade_pending") {
         // New capabilities require operator approval — worker stays stopped
         log.info(
           { pluginId, pluginKey: plugin.pluginKey, addedCaps },
           "plugin lifecycle: new capabilities detected, transitioning to upgrade_pending",
         );
         // Skip the inner stopWorkerIfRunning since we already stopped above
-        const result = await transition(pluginId, "upgrade_pending", null, plugin);
+        const result = plugin.status === "upgrade_pending"
+          ? await requirePlugin(pluginId)
+          : await transition(pluginId, "upgrade_pending", null, plugin);
         emitDomain("plugin.upgrade_pending", {
           pluginId,
           pluginKey: result.pluginKey,
