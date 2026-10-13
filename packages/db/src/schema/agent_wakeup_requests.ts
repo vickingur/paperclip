@@ -56,6 +56,11 @@ export const agentWakeupRequests = pgTable(
       table.agentId,
       table.requestedAt,
     ),
+    // A reset key stays consumed even if delivery fails or is cancelled.
+    executionResetIdempotencyUq: uniqueIndex("agent_wakeup_requests_execution_reset_uq")
+      .on(table.companyId, table.idempotencyKey)
+      .concurrently()
+      .where(sql`${table.idempotencyKey} LIKE 'execution-reset:%'`),
     reviewPathRecoveryIdempotencyUq: uniqueIndex(
       "agent_wakeup_requests_review_path_recovery_idempotency_uq",
     )

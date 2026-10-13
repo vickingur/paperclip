@@ -1,3 +1,4 @@
+import { ExecutionResetEntry, useExecutionResetAccess } from "./ExecutionResetDialog";
 import { isNativeWorkspaceExportRepairCause } from "@paperclipai/shared";
 import { useWorkspaceIsolationControls } from "@/hooks/useWorkspaceIsolationControls";
 import { requiresExecutionReconciliation } from "@paperclipai/shared";
@@ -1001,6 +1002,7 @@ export function IssueRecoveryActionCard({
   variant = "full",
   className,
 }: IssueRecoveryActionCardProps) {
+  const canInspectReset = useExecutionResetAccess();
   const { visible: workspaceIsolationControlsVisible } = useWorkspaceIsolationControls();
   const liveness = useMemo(() => ({ scheduledRetry }), [scheduledRetry]);
   const cardState: RecoveryCardCardState = forcedState ?? deriveRecoveryCardState(action, liveness);
@@ -1117,9 +1119,9 @@ export function IssueRecoveryActionCard({
     showReissueAction ||
     showReconcileForward ||
     showBreakGlass ||
-    showRepairAction;
+    showRepairAction || canInspectReset;
 
-  if (requiresExecutionReconciliation(action.cause) || action.cause === "native_workspace_sync_out_unsafe_archive") return null;
+  if (requiresExecutionReconciliation(action.cause) || action.cause === "native_workspace_sync_out_unsafe_archive") return canInspectReset ? <section className="rounded-lg border p-3 space-y-2"><p>Execution hold</p><ExecutionResetEntry /></section> : null;
 
   return (
     <section
@@ -1489,6 +1491,7 @@ export function IssueRecoveryActionCard({
               onConfirm={(reason) => onBreakGlassOverride?.(reason)}
             />
           ) : null}
+          <ExecutionResetEntry />
           {showResolveActions ? (
             cardState === "observe_only" ? (
               <span className="text-(length:--text-micro) text-muted-foreground">

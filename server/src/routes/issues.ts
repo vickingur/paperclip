@@ -1,3 +1,6 @@
+import { executionResetRequestSchema } from "@paperclipai/shared";
+import { inspectExecutionReset } from "../services/execution-reset-inspection.js";
+import { recordDependencyClosureProof, DEPENDENCY_CLOSURE_RECEIPT_KEY } from "../services/dependency-closure-proof.js";
 import { parseObject } from "../adapters/utils.js";
 import { enqueueFastResponse } from "../services/fast-responses.js";
 import { hasRequiredWorkspaceRecovery, LEGACY_WORKSPACE_RECOVERY_SCHEMA } from "../services/workspace-restore-recovery-state.js";
@@ -19,7 +22,7 @@ import { retryNativeWorkspaceExport } from "../services/native-runtime/native-wo
 import { queuedInteractionId, readQueuedInteractionResponse, hasQueuedInteractionResponse } from "../services/queued-interaction-response.js";
 import { deliverConversationComments, isConversation } from "../services/agent-conversations.js";
 import { issueRecoveryActionReadModel } from "../services/issue-recovery-actions.js";
-import { getExecutionBlocker } from "../services/execution-blocker.js";
+import { executionBlockerPredicate, getExecutionBlocker } from "../services/execution-blocker.js";
 import { requiresExecutionReconciliation } from "@paperclipai/shared";
 import {
   validateExecutionReconciliation,
@@ -36,7 +39,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { Router, type Request, type Response } from "express";
 import multer from "multer";
 import { z } from "zod";
-import { and, asc, desc, eq, inArray, isNull, notInArray, sql, type SQL } from "drizzle-orm";
+import { or, and, asc, desc, eq, inArray, isNull, notInArray, sql, type SQL } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import type { ChatChannelService } from "../services/chat-channels.js";
 import {
@@ -9492,8 +9495,10 @@ export function issueRoutes(
     });
     const retainedHolds = await db.select().from(issueRecoveryActions).where(and(
       eq(issueRecoveryActions.companyId, issue.companyId), eq(issueRecoveryActions.sourceIssueId, issue.id),
-      sql`${issueRecoveryActions.evidence}->'workspaceRestoreRecovery'->>'schema' = ${LEGACY_WORKSPACE_RECOVERY_SCHEMA}`,
-      sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' = 'blocked'`,
+      or(executionBlockerPredicate(), and(
+        sql`${issueRecoveryActions.evidence}->'workspaceRestoreRecovery'->>'schema' = ${LEGACY_WORKSPACE_RECOVERY_SCHEMA}`,
+        sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' = 'blocked'`,
+      )),
     )).orderBy(desc(issueRecoveryActions.createdAt));
     res.json({
       active,
@@ -9752,6 +9757,22 @@ export function issueRoutes(
           throw conflict("Repair the retained sandbox, then use Retry workspace export to finish the accepted result without another provider turn.", { code: "workspace_export_retry_required" });
         }
 
+        // An owner can finish its own bounded disposition repair after the
+        // source becomes actionable again (for example, a review child closes).
+        // This is distinct from retrying a board escalation or execution hold.
+        const ownerDispositionHandBack =
+          req.actor.type === "agent" &&
+          req.actor.agentId === lockedIssue.assigneeAgentId &&
+          lockedIssue.status === "in_progress" &&
+          activeRecoveryAction.kind === "deliberate_wait_without_target" &&
+          activeRecoveryAction.status === "active" &&
+          activeRecoveryAction.ownerType === "agent" &&
+          activeRecoveryAction.ownerAgentId === req.actor.agentId &&
+          activeRecoveryAction.returnOwnerAgentId === req.actor.agentId &&
+          activeRecoveryAction.wakePolicy?.type === "bounded_owner_disposition_repair" &&
+          activeRecoveryAction.wakePolicy?.retryAgentId === req.actor.agentId &&
+          !workspaceBaseRef;
+
         // Retrying an exhausted disposition repair is an explicit retry of the
         // recorded owner, never permission to reopen a stopped/completed task or
         // silently retry a new assignee from an old notice. All admission gates
@@ -9762,9 +9783,11 @@ export function issueRoutes(
           (activeRecoveryAction.kind === "deliberate_wait_without_target" || workspaceBaseRef)
         ) {
           if (
-            lockedIssue.status !== "blocked" ||
-            activeRecoveryAction.ownerType !== "board" ||
-            (!workspaceBaseRef && activeRecoveryAction.wakePolicy?.type !== "board_escalation") ||
+            (!ownerDispositionHandBack && (
+              lockedIssue.status !== "blocked" ||
+              activeRecoveryAction.ownerType !== "board" ||
+              (!workspaceBaseRef && activeRecoveryAction.wakePolicy?.type !== "board_escalation")
+            )) ||
             !activeRecoveryAction.returnOwnerAgentId ||
             lockedIssue.assigneeAgentId !== activeRecoveryAction.returnOwnerAgentId
           ) {
@@ -10051,7 +10074,33 @@ export function issueRoutes(
         );
         if (!recoveryAction) throw notFound("Active recovery action not found");
 
-        return { issue, recoveryAction, chatRetry };
+        // Commit the normal execution intent with the resolution. The existing
+        // durable dispatcher recovers it even if this process exits before wake.
+        if (ownerDispositionHandBack && recordedOutcome === "handed_back" && !chatRetry) {
+          await tx.insert(agentWakeupRequests).values({
+            companyId: issue.companyId,
+            agentId: issue.assigneeAgentId!,
+            source: "automation",
+            triggerDetail: "system",
+            reason: "issue_recovery_action_restored",
+            requestedByActorType: "system",
+            requestedByActorId: "owner-disposition-handback",
+            idempotencyKey: `owner-disposition-handback:${recoveryAction.id}`,
+            payload: {
+              issueId: issue.id, recoveryActionId: recoveryAction.id,
+              originalActorType: actor.actorType, originalActorId: actor.actorId,
+              _paperclipWakeContext: {
+                issueId: issue.id, taskId: issue.id,
+                recoveryActionId: recoveryAction.id,
+                wakeReason: "issue_recovery_action_restored",
+                source: "issue.recovery_action_resolution",
+                forceFreshSession: true,
+              },
+            },
+          });
+        }
+
+        return { issue, recoveryAction, chatRetry, ownerDispositionHandBack };
       });
       if (result.replayed) {
         res.json({
@@ -10125,6 +10174,12 @@ export function issueRoutes(
             "chat recovery retry dispatch deferred to durable worker",
           );
         }
+      } else if ("ownerDispositionHandBack" in result && result.ownerDispositionHandBack) {
+        try {
+          await heartbeat.dispatchPendingNativeStatusWakeups({ companyId: result.issue.companyId });
+        } catch (err) {
+          logger.warn({ err, issueId: result.issue.id }, "owner handback delivery deferred to durable scheduler");
+        }
       } else if (
         !executionReconciliation &&
         sourceIssueStatus === "todo" &&
@@ -10150,6 +10205,9 @@ export function issueRoutes(
               wakeReason: "issue_recovery_action_restored",
               source: "issue.recovery_action_resolution",
               recoveryActionId: result.recoveryAction.id,
+              // Preserve the current repair turn; queue normal work behind it.
+              ...("ownerDispositionHandBack" in result && result.ownerDispositionHandBack
+                ? { forceFreshSession: true } : {}),
             },
           });
         } catch (err) {
@@ -15409,6 +15467,11 @@ export function issueRoutes(
               "failed to check existing dependency wake before issue update wake",
             );
           }
+          const closureReceiptId = await recordDependencyClosureProof(db, {
+            companyId: issue.companyId, issueId: input.dependentIssueId,
+            agentId: input.agentId, resolvedBlockerIssueId: input.resolvedBlockerIssueId,
+            producer: "issue_update",
+          });
           addWakeup(input.agentId, {
             source: "automation",
             triggerDetail: "system",
@@ -15417,6 +15480,7 @@ export function issueRoutes(
               issueId: input.dependentIssueId,
               resolvedBlockerIssueId: input.resolvedBlockerIssueId,
               blockerIssueIds: input.blockerIssueIds,
+              [DEPENDENCY_CLOSURE_RECEIPT_KEY]: closureReceiptId,
               mutation: input.mutation,
             },
             idempotencyKey,
@@ -16182,6 +16246,32 @@ export function issueRoutes(
     res.json(
       await runRedactions.redactForIssue(issue.companyId, issue.id, queue),
     );
+  });
+
+  router.post("/issues/:id/execution/reset", async (req, res) => {
+    assertBoard(req);
+    if (!req.actor.userId) throw forbidden("Board user context required");
+    const issue = await getAccessibleResource(req, res,
+      getIssueById(req, req.params.id as string), "Issue not found");
+    if (!issue || !(await assertIssueReadAllowed(req, res, issue))) return;
+    const request = executionResetRequestSchema.parse(req.body);
+    const response = await heartbeat.resetBoardExecution({
+      ...request, companyId: issue.companyId, issueId: issue.id,
+      principalId: req.actor.userId,
+    });
+    // Replay the exact durable commit; mutable run state is not a new response.
+    res.json(response);
+  });
+
+  router.get("/issues/:id/execution/reset-inspection", async (req, res) => {
+    assertBoard(req);
+    if (!req.actor.userId) throw forbidden("Board user context required");
+    const issue = await getAccessibleResource(req, res,
+      getIssueById(req, req.params.id as string), "Issue not found");
+    if (!issue || !(await assertIssueReadAllowed(req, res, issue))) return;
+    const inspection = await inspectExecutionReset(db, issue.companyId, issue.id);
+    if (!inspection) { res.status(404).json({ error: "Issue not found" }); return; }
+    res.json(await runRedactions.redactForIssue(issue.companyId, issue.id, inspection));
   });
 
   router.patch(
@@ -18900,6 +18990,11 @@ export function issueRoutes(
               "failed to check existing dependency wake before issue comment wake",
             );
           }
+          const closureReceiptId = await recordDependencyClosureProof(db, {
+            companyId: currentIssue.companyId, issueId: input.dependentIssueId,
+            agentId: input.agentId, resolvedBlockerIssueId: input.resolvedBlockerIssueId,
+            producer: "issue_comment",
+          });
           addWakeup(input.agentId, {
             source: "automation",
             triggerDetail: "system",
@@ -18908,6 +19003,7 @@ export function issueRoutes(
               issueId: input.dependentIssueId,
               resolvedBlockerIssueId: input.resolvedBlockerIssueId,
               blockerIssueIds: input.blockerIssueIds,
+              [DEPENDENCY_CLOSURE_RECEIPT_KEY]: closureReceiptId,
               mutation: "comment",
             },
             idempotencyKey,

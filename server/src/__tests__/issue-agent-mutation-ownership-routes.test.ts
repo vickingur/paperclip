@@ -116,6 +116,7 @@ const mockTaskWatchdogService = vi.hoisted(() => ({
 }));
 const mockHeartbeatService = vi.hoisted(() => ({
   wakeup: vi.fn(async () => undefined),
+  dispatchPendingNativeStatusWakeups: vi.fn(async () => undefined),
   reportRunActivity: vi.fn(async () => undefined),
   getRun: vi.fn(async () => null),
   getActiveRunForAgent: vi.fn(async () => null),
@@ -585,6 +586,8 @@ describe("agent issue mutation checkout ownership", () => {
     mockTaskWatchdogService.upsertForIssue.mockReset();
     mockTaskWatchdogService.disableForIssue.mockReset();
     mockTaskWatchdogService.disableForIssue.mockResolvedValue(null);
+    mockHeartbeatService.dispatchPendingNativeStatusWakeups.mockReset();
+    mockHeartbeatService.dispatchPendingNativeStatusWakeups.mockResolvedValue(undefined);
     mockHeartbeatService.wakeup.mockReset();
     mockHeartbeatService.wakeup.mockResolvedValue(undefined);
     mockHeartbeatService.reportRunActivity.mockReset();
@@ -2502,6 +2505,79 @@ describe("agent issue mutation checkout ownership", () => {
       expect(mockIssueService.update).not.toHaveBeenCalled();
       expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
     });
+  });
+
+  describe("owner disposition handback after review closure", () => {
+    function seedOwnerHandBack() {
+      const issue = makeIssue({ status: "in_progress", assigneeAgentId: ownerAgentId,
+        checkoutRunId: ownerRunId, executionRunId: ownerRunId });
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockImplementation(async (_id, patch) => ({ ...issue, ...patch }));
+      mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue({
+        id: recoveryActionId, status: "active", kind: "deliberate_wait_without_target",
+        ownerType: "agent", ownerAgentId, returnOwnerAgentId: ownerAgentId,
+        wakePolicy: { type: "bounded_owner_disposition_repair", retryAgentId: ownerAgentId },
+      });
+    }
+    const handBack = { actionId: recoveryActionId, outcome: "restored", sourceIssueStatus: "todo" };
+    it("lets the owner resolve its repair and requests a new execution boundary", async () => {
+      seedOwnerHandBack();
+      const db = createRunContextDb();
+      const res = await request(await createApp(ownerActor(), db))
+        .post(`/api/issues/${issueId}/recovery-actions/resolve`).send(handBack);
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockIssueRecoveryActionService.resolveActiveForIssue).toHaveBeenCalledWith(
+        expect.objectContaining({ actionId: recoveryActionId, outcome: "handed_back" }), expect.anything());
+      expect(mockIssueService.update).toHaveBeenCalledWith(issueId,
+        expect.objectContaining({ status: "todo" }), expect.anything(), expect.anything());
+      expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+      expect(db.insert).toHaveBeenCalledWith(expect.objectContaining({}));
+      const insertedValues = db.insert.mock.results.at(-1)!.value.values;
+      expect(insertedValues).toHaveBeenCalledWith(expect.objectContaining({
+        companyId, agentId: ownerAgentId, requestedByActorId: "owner-disposition-handback",
+        idempotencyKey: `owner-disposition-handback:${recoveryActionId}`,
+        payload: expect.objectContaining({ recoveryActionId,
+          _paperclipWakeContext: expect.objectContaining({ forceFreshSession: true }) }),
+      }));
+      expect(mockHeartbeatService.dispatchPendingNativeStatusWakeups).toHaveBeenCalledWith({ companyId });
+    });
+    it("keeps the committed wake when immediate dispatch fails", async () => {
+      seedOwnerHandBack();
+      mockHeartbeatService.dispatchPendingNativeStatusWakeups.mockRejectedValueOnce(new Error("synthetic crash"));
+      const db = createRunContextDb();
+      const res = await request(await createApp(ownerActor(), db))
+        .post(`/api/issues/${issueId}/recovery-actions/resolve`).send(handBack);
+      expect(res.status).toBe(200);
+      expect(db.insert.mock.results.at(-1)!.value.values).toHaveBeenCalledWith(
+        expect.objectContaining({ requestedByActorId: "owner-disposition-handback" }));
+      expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+    });
+    it.each(["peer", "board", "ownerChanged", "policy", "blocker", "approval", "pause", "budget", "run", "agentPaused"])(
+      "keeps the %s gate during owner handback", async gate => {
+        seedOwnerHandBack();
+        if (gate === "ownerChanged") mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue({
+          id: recoveryActionId, status: "active", kind: "deliberate_wait_without_target",
+          ownerType: "agent", ownerAgentId: peerAgentId, returnOwnerAgentId: ownerAgentId,
+          wakePolicy: { type: "bounded_owner_disposition_repair", retryAgentId: ownerAgentId },
+        });
+        if (gate === "policy") mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue({
+          id: recoveryActionId, status: "active", kind: "deliberate_wait_without_target",
+          ownerType: "agent", ownerAgentId, returnOwnerAgentId: ownerAgentId,
+          wakePolicy: { type: "board_escalation" },
+        });
+        if (gate === "blocker") mockIssueService.getDependencyReadiness.mockResolvedValue({ unresolvedBlockerCount: 1 });
+        if (gate === "approval") mockIssueApprovalService.listApprovalsForIssue.mockResolvedValue([{ status: "pending" }]);
+        if (gate === "pause") mockIssueTreeControlService.getActivePauseHoldGate.mockResolvedValue({ holdId: "hold", mode: "pause" });
+        if (gate === "budget") mockBudgetService.getInvocationBlock.mockResolvedValue({ scope: "agent", reason: "hard_limit_reached" });
+        if (gate === "run") mockIssueService.getById.mockResolvedValue(makeIssue({ status: "in_progress", assigneeAgentId: ownerAgentId, executionRunId: "77777777-7777-4777-8777-777777777777" }));
+        if (gate === "agentPaused") mockAgentService.getById.mockResolvedValue({ ...makeAgent(ownerAgentId), status: "paused" });
+        const res = await request(await createApp(gate === "peer" ? peerActor() : gate === "board" ? boardActor() : ownerActor()))
+          .post(`/api/issues/${issueId}/recovery-actions/resolve`).send(handBack);
+        expect([403, 409], JSON.stringify(res.body)).toContain(res.status);
+        expect(mockIssueRecoveryActionService.resolveActiveForIssue).not.toHaveBeenCalled();
+        expect(mockIssueService.update).not.toHaveBeenCalled();
+        expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+      });
   });
 
   describe("retrying an escalated disposition repair", () => {

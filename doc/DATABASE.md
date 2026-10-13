@@ -743,3 +743,12 @@ Use the same root client for in-process writers. New queue insertion paths must
 register before writing, or they can remain unseen until the next startup or
 another notification. Tests should verify both the producer and its outer
 transaction boundary.
+
+## Execution reset retry fence
+
+Migration `0333` adds a concurrent unique company/key index for
+`execution-reset:` wake receipts. Every delivery status retains the key.
+Existing duplicate keys fail migration rather than deleting receipts; reconcile
+them before enabling reset producers. The standard top-level migration executor
+repairs interrupted builds and records history only after a valid index exists.
+This fence does not authorize a reset or expose a reset endpoint.

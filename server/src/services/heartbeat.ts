@@ -1,3 +1,4 @@
+import { dispositionSuppressionReceipt, settleLegacyDispositionSuppression } from "./legacy-disposition-suppression.js";
 import { selectHeartbeatEnvironment } from "./heartbeat/environment-selection.js";
 import { prepareHeartbeatWorkspace } from "./heartbeat/workspace-preparation.js";
 import { executeHeartbeatRuntime, NativeSessionResumeScheduledError, NativeWorkspaceFinalizeScheduledError } from "./heartbeat/runtime-execution.js";
@@ -3533,6 +3534,11 @@ export function heartbeatService(
           const cancelled = await setRunStatusIfRunning(run.id, "cancelled", {
             finishedAt: new Date(), errorCode: "legacy_disposition_repair_suppressed",
             error: `Disposition repair suppressed: ${repairBlock}`,
+            ...(!legacyAdapterEntered && !nativeDispatchStarted && !nativeOwnershipHeld ? { resultJson: {
+              dispositionSuppression: dispositionSuppressionReceipt(run, repairBlock),
+              cancellation: { source: "control_plane", expected: true, initiator: { type: "system" },
+                reason: "Disposition repair suppressed before provider dispatch", recordedAt: new Date().toISOString() },
+            } } : {}),
           });
           if (cancelled.updated) {
             await setWakeupStatus(run.wakeupRequestId, "skipped", { finishedAt: new Date(), error: repairBlock });
@@ -5064,6 +5070,11 @@ export function heartbeatService(
           adapterExecutionControls.delete(run.id);
         }
       }
+      if (latestRun?.errorCode === "legacy_disposition_repair_suppressed") {
+        latestRun = await settleLegacyDispositionSuppression(db, { run: latestRun,
+          providerDispatchStarted: legacyAdapterEntered || nativeDispatchStarted || nativeOwnershipHeld,
+        }) ?? latestRun;
+      }
       // Terminalization precedes lease and adapter cleanup. Only now is the
       // owner gone; retry pending input for ordinary completions as well as Stop.
       if (latestRun?.runtimeMode === "legacy" && ["failed", "timed_out"].includes(latestRun.status) &&
@@ -5130,6 +5141,9 @@ export function heartbeatService(
   }
 
   return {
+    // Board routes authenticate the principal before using reset delivery.
+    commitBoardExecutionReset: heartbeatQueue.commitBoardExecutionReset,
+    resetBoardExecution: heartbeatQueue.resetBoardExecution,
     stopInvocationsForAgents,
     waitForRunExecutionDrain: async (
       runId: string,

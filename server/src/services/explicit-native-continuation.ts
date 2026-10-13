@@ -1,17 +1,22 @@
+import { collectExecutionResetInspection } from "./execution-reset-inspection.js";
+import { issueService } from "./issues.js";
+import { issueTreeControlService } from "./issue-tree-control.js";
+import { hasSettledExecutionActions } from "@paperclipai/adapter-utils/execution-action-inventory";
+import { verifyDependencyClosureProof } from "./dependency-closure-proof.js";
+import { readRunCancellation } from "./run-cancellation.js";
+import { isExplicitContinuationRetryClaim } from "./explicit-continuation-retry-claim.js";
 import { hasRequiredWorkspaceRecovery } from "./workspace-restore-recovery-state.js";
 import { createHash } from "node:crypto";
 import { appendHeartbeatRunEvent } from "./heartbeat-run-events.js";
 import { canContinueCancelledRun } from "./run-cancellation.js";
 import { readQueuedInteractionResponse } from "./queued-interaction-response.js";
 import { isCancelledNativeStartup } from "./cancelled-native-startup.js";
-import { hasNativeLocalProcessStop, hasHistoricalSuspendedNativeSession } from "./native-local-process-stop.js";
-import { completeTerminatedRemoteNativeSessionCleanup } from "../vendor/paperclip-runner/index.js";
-import { hasRemoteTerminationReceipt, remoteLeaseCleanupScope } from "./remote-execution-termination.js";
+import { verifyStoppedExecutionEnvironment } from "./execution-stop-proof.js";
 import { z } from "zod";
 import { and, eq, inArray, isNull, ne, or, sql } from "drizzle-orm";
 import {
-  agents, agentWakeupRequests, approvals, issueApprovals, issueThreadInteractions,
-  environmentLeases, heartbeatRuns, issueComments, issueRecoveryActions,
+  agents, agentWakeupRequests, approvals, environmentLeases, issueApprovals, issueThreadInteractions,
+  heartbeatRuns, issueComments, issueRecoveryActions,
   issues, nativeRunFinalizations, nativeRunResults, type Db,
 } from "@paperclipai/db";
 import { executionBlockerPredicate, getExecutionBlocker } from "./execution-blocker.js";
@@ -25,11 +30,6 @@ import { queuedCommentIdsFromWakePayload } from "./issue-queued-comment-queue.js
 
 type Run = typeof heartbeatRuns.$inferSelect;
 const terminal = ["failed", "interrupted", "timed_out", "cancelled"];
-
-function processStopped(pid: number): boolean {
-  try { process.kill(pid, 0); return false; }
-  catch (error) { return (error as NodeJS.ErrnoException).code === "ESRCH"; }
-}
 
 /** Validate the whole saved queue, preserving order and original authors.
  * Call again under the task lock before adopting IDs into a new run.
@@ -69,10 +69,11 @@ export async function undeliveredLegacyUserCommentIds(
 }
 
 /** Called under the issue lock, in the transaction that creates the new turn.
- * A user request authorizes a new conversation, not replay of the failed run.
+ * A user request or positively settled trusted dependency closure authorizes a
+ * fresh turn, never replay of the failed run.
  * Unknown action outcomes and all prior records stay intact.
  */
-export async function admitExplicitNativeContinuation(input: {
+type AdmissionInput = {
   db: Db; companyId: string; issueId: string; agentId: string;
   actorType: string | null | undefined; actorId: string | null | undefined;
   reason: string | null; commentId: string | null; successorRunId: string;
@@ -83,18 +84,78 @@ export async function admitExplicitNativeContinuation(input: {
   queuedCommentRequestId?: string;
   dryRun?: boolean;
   onBlocked?: (reason: string, message: string) => void;
-}): Promise<{ previousRunId: string; commentId: string | null; failedRunId?: string } | null> {
+};
+type Admission = { previousRunId: string; commentId: string | null; failedRunId?: string };
+
+export async function admitExplicitNativeContinuation(input: AdmissionInput): Promise<Admission | null> {
+  return admitStoppedContinuation(input);
+}
+
+/** Internal closure intent is proven from the server receipt, never actor labels.
+ * The queue owns the issue lock and the transaction creating the successor. */
+export async function admitDependencyClosureContinuation(input: AdmissionInput & { receiptId: unknown }): Promise<Admission | null> {
+  if (input.reason !== "issue_blockers_resolved") return null;
+  const proof = await verifyDependencyClosureProof(input.db, input);
+  if (!proof) return null;
+  return admitStoppedContinuation(input, proof);
+}
+
+type BoardResetIntent = { resetId: string; fingerprint: string; expectedHoldingRunId: string; expectedRecoveryActionId: string };
+
+/** Internal helper for reset orchestration, never a public wake intent. Caller
+ * supplies an authenticated board principal and creates the durable receipt and
+ * successor in this same transaction. This helper does not dispatch a provider.
+ */
+export async function admitBoardExecutionReset(input: AdmissionInput & {
+  resetId: string; expectedHoldingRunId: string; expectedRecoveryActionId: string;
+  fingerprint: string; acknowledgeFreshHistoryAwareTurn: boolean;
+}): Promise<Admission | null> {
+  const reject = (reason: string) => { input.onBlocked?.(reason, "Execution reset requires current, safe evidence."); return null; };
+  if (input.actorType !== "user" || !input.actorId || input.reason !== "execution_reset" ||
+      input.commentId !== null || input.failedRunId || input.queuedCommentInterruptId || input.queuedCommentRequestId ||
+      input.acknowledgeFreshHistoryAwareTurn !== true ||
+      ![input.resetId, input.expectedHoldingRunId, input.expectedRecoveryActionId].every(id => z.string().guid().safeParse(id).success))
+    return reject("invalid_reset_intent");
+  // Use the ordinary issue serialization fence. Finalizers/source rows are
+  // locked by the shared evaluator below, in its existing claim lock order.
+  const [task] = await input.db.select().from(issues).where(and(
+    eq(issues.companyId, input.companyId), eq(issues.id, input.issueId),
+  )).for("update");
+  if (!task || task.assigneeUserId) return reject("source_unavailable");
+  const inspection = await collectExecutionResetInspection(input.db, input.companyId, input.issueId);
+  if (!inspection || inspection.fingerprint !== input.fingerprint || !inspection.holds.some(hold =>
+      hold.recoveryActionId === input.expectedRecoveryActionId && hold.holdingRunId === input.expectedHoldingRunId))
+    return reject("stale_reset_expectations");
+  // Preview must classify every affected hold as settled. A missing ledger
+  // stays unknown even if a later startup proof might establish no dispatch.
+  if (inspection.holds.some(hold => hold.outcomeClassification !== "settled"))
+    return reject("unknown_outcome_reconciliation_required");
+  return admitStoppedContinuation(input, undefined, { resetId: input.resetId,
+    fingerprint: input.fingerprint, expectedHoldingRunId: input.expectedHoldingRunId, expectedRecoveryActionId: input.expectedRecoveryActionId });
+}
+
+async function admitStoppedContinuation(input: AdmissionInput, dependency?: { receiptId: string; fingerprint: string; createdAt: Date }, board?: BoardResetIntent): Promise<Admission | null> {
+  const strict = Boolean(dependency || board);
   const { db, companyId, issueId, agentId, actorId, commentId } = input;
   const blocked = (reason: string, message: string) => { input.onBlocked?.(reason, message); return null; };
-  if (input.actorType !== "user" || !actorId) return null;
+  if (!strict && (input.actorType !== "user" || !actorId)) return null;
   const retry = input.reason === "retry_failed_run" &&
     z.string().guid().safeParse(input.failedRunId).success;
-  if (!retry && !input.queuedCommentInterruptId && (!commentId || !z.string().guid().safeParse(commentId).success ||
+  if (!strict && !retry && !input.queuedCommentInterruptId && (!commentId || !z.string().guid().safeParse(commentId).success ||
       !["issue_commented", "issue_reopened_via_comment"].includes(input.reason ?? ""))) return null;
   const [task] = await db.select().from(issues).where(and(
     eq(issues.companyId, companyId), eq(issues.id, issueId),
   ));
   if (!task || task.assigneeAgentId !== agentId || ["done", "cancelled"].includes(task.status)) return null;
+  if (strict && (await issueTreeControlService(db).getActivePauseHoldGate(companyId, issueId) ||
+      (task.executionState?.status === "pending" && ["review", "approval"].includes(String(task.executionState?.currentStageType)))))
+    return blocked("task_gate", "Task pause or required review must be resolved before continuation.");
+  if (strict && task.executionRunId) {
+    const [holder] = await db.select().from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, task.executionRunId),
+    ));
+    if (isExplicitContinuationRetryClaim(task, holder)) return blocked("explicit_retry_claim", "An explicit continuation claim owns this task.");
+  }
   const [interruptQueue] = input.queuedCommentInterruptId ? await db.select().from(agentWakeupRequests).where(and(
     eq(agentWakeupRequests.id, input.queuedCommentInterruptId),
     eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.agentId, agentId),
@@ -126,28 +187,30 @@ export async function admitExplicitNativeContinuation(input: {
     if (undelivered.at(-1) !== commentId) return null;
     partiallyDeliveredQueue = undelivered.length !== ids.length;
   }
-  const [comment] = retry || response ? [] : await db.select().from(issueComments).where(and(
+  const [comment] = strict || retry || response ? [] : await db.select().from(issueComments).where(and(
     eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId),
     eq(issueComments.id, commentId!), eq(issueComments.authorType, "user"),
-    queuedInterrupt ? undefined : eq(issueComments.authorUserId, actorId), isNull(issueComments.createdByRunId),
+    queuedInterrupt ? undefined : eq(issueComments.authorUserId, actorId!), isNull(issueComments.createdByRunId),
     isNull(issueComments.deletedAt),
   ));
-  if (!retry && !response && !comment?.body.trim()) return null;
+  if (!strict && !retry && !response && !comment?.body.trim()) return null;
   const authorizedAt = response?.comment.createdAt ?? comment?.createdAt ?? new Date();
   const [agent] = await db.select().from(agents).where(and(eq(agents.companyId, companyId), eq(agents.id, agentId)));
+  if (board && (!agent || !["idle", "running"].includes(agent.status))) return blocked("agent_unavailable", "The assigned agent is paused or unavailable.");
+  if (board && !(await issueService(db).getDependencyReadiness(issueId)).isDependencyReady) return blocked("issue_dependencies_blocked", "Resolve dependencies before reset.");
   if (!agent || (!isConversationAdapter(agent.adapterType) && agent.adapterType !== "paperclip_runner")) return null;
   if (queuedInterrupt && !isConversationAdapter(agent.adapterType) && !response?.source.requiresFreshSession) return null;
   const actions = await db.select().from(issueRecoveryActions).where(and(
     eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId),
     executionBlockerPredicate(),
-  )).for("update");
+  )).orderBy(issueRecoveryActions.id).for("update");
   if (!actions.length) return null;
   const blocker = await getExecutionBlocker(db, companyId, issueId);
   if (blocker && blocker.recoveryActionId === null) return null;
   const [pendingInteraction] = await db.select({ id: issueThreadInteractions.id }).from(issueThreadInteractions).where(and(
     eq(issueThreadInteractions.companyId, companyId), eq(issueThreadInteractions.issueId, issueId),
     eq(issueThreadInteractions.status, "pending"),
-    activeIssueInteractionCondition({ responsibleUserId: actorId }),
+    strict ? undefined : activeIssueInteractionCondition({ responsibleUserId: actorId! }),
   )).limit(1);
   const [pendingApproval] = await db.select({ id: approvals.id }).from(issueApprovals).innerJoin(approvals, and(
     eq(approvals.id, issueApprovals.approvalId), eq(approvals.companyId, companyId),
@@ -159,6 +222,8 @@ export async function admitExplicitNativeContinuation(input: {
   const stoppedSessions: Array<{ evidence: Record<string, unknown>; retire: () => boolean }> = [];
   const cancelledStartupIds = new Set<string>();
   for (const action of actions) {
+    if (strict && (hasRequiredWorkspaceRecovery(action.evidence) || action.evidence.workspaceRestoreFailure === "restore_unsafe_archive"))
+      return blocked("workspace_repair_required", "Repair the retained workspace before continuation.");
     const runId = action.evidence.runId ?? action.evidence.sourceRunId;
     if (typeof runId !== "string") return blocked("source_missing", "The stopped run could not be identified. Your message is saved.");
     // Text comparison keeps malformed historical evidence a hold, not a UUID cast error.
@@ -168,7 +233,7 @@ export async function admitExplicitNativeContinuation(input: {
     if (!run || run.agentId !== agentId || !terminal.includes(run.status) ||
         (run.nativeIssueId ?? run.contextSnapshot?.issueId) !== issueId ||
         !run.finishedAt) return blocked("source_unavailable", "The previous execution has not finished or its owner changed. Your message is saved.");
-    if (!queuedInterrupt && !queuedRequest && authorizedAt <= run.finishedAt) return blocked("message_predates_stop", "This message arrived before the previous run stopped. Send a new message to continue.");
+    if (!strict && !queuedInterrupt && !queuedRequest && authorizedAt <= run.finishedAt) return blocked("message_predates_stop", "This message arrived before the previous run stopped. Send a new message to continue.");
     if (adapterExecutionControls.has(run.id)) return blocked("execution_settling", "Waiting for the previous run to stop. Your message will start automatically.");
     const unusedAdmission = run.status === "cancelled" && !run.startedAt &&
       run.errorCode === "execution_reconciliation_required" &&
@@ -184,7 +249,7 @@ export async function admitExplicitNativeContinuation(input: {
       const historicalAdapter = await historicalAdapterType(db, run);
       // A settings change never converts a known process/webhook execution into
       // a conversation. Those adapters retain their reconciliation contract.
-      if (historicalAdapter && !isConversationAdapter(historicalAdapter)) return null;
+      if ((strict && !historicalAdapter) || (historicalAdapter && !isConversationAdapter(historicalAdapter))) return null;
     }
     // For pre-upgrade rows without adapter evidence, only a new explicit user
     // turn is allowed, after the termination proofs below. This does not infer
@@ -204,6 +269,33 @@ export async function admitExplicitNativeContinuation(input: {
       return blocked("workspace_repair_required", "Verify safe workspace staging or repair before continuing. Your message is saved.");
     }
     const cancelledStartup = await isCancelledNativeStartup(db, run, coordinator);
+    // Automatic startup admission supports only a locked, never-claimed native
+    // coordinator. Historical pre-selection Stop receipts remain explicit-only.
+    const automaticStartup = Boolean(strict && cancelledStartup && run.runtimeMode === "native");
+    if (strict) {
+      if (dependency && dependency.createdAt <= run.finishedAt!) return blocked("closure_predates_stop", "The closure predates the stopped execution.");
+      const cancellation = readRunCancellation(run.resultJson);
+      if (!(board && board.expectedHoldingRunId === run.id) && (cancellation?.source === "operator" || cancellation?.initiator.type === "user" ||
+          run.resultJson?.operatorInterrupted === true || run.resultJson?.cancelledByUserId ||
+          ["user", "board"].includes(String(run.resultJson?.cancelledByActorType)) ||
+          ["user", "board"].includes(String(run.resultJson?.interruptedByActorType)) ||
+          (run.resultJson?.startupCancellation && !automaticStartup) ||
+          (run.status === "cancelled" && !automaticStartup && (!cancellation || !["shutdown", "control_plane", "provider", "transport"].includes(cancellation.source)))))
+        return blocked("operator_stop_or_unknown_cancellation", "The stopped execution needs explicit inspection before continuation.");
+      // Never-claimed proof positively establishes no provider/tool dispatch.
+      // A contradictory retained inventory still fails closed.
+      const inventory = run.resultJson?.executionActionInventory;
+      if (automaticStartup && inventory != null &&
+          (!hasSettledExecutionActions(inventory) || inventory.dispatch !== "not_attempted" || inventory.actions.length !== 0))
+        return blocked("contradictory_dispatch_evidence", "The startup receipt contradicts retained action evidence.");
+      if (!(automaticStartup && inventory == null) && !hasSettledExecutionActions(inventory))
+        return blocked(board ? "unknown_outcome_reconciliation_required" : "unknown_action_outcomes", "Every action needs recorded settlement before continuation.");
+      if (run.controllerLeaseExpiresAt && run.controllerLeaseExpiresAt > new Date())
+        return blocked("controller_settling", "The previous controller still holds a lease.");
+      if (action.evidence.explicitUserContinuation || action.evidence.dependencyClosureContinuation || action.evidence.boardExecutionReset)
+        return blocked("replacement_claim", "The previous execution already has a continuation claim.");
+      if (!legacyUserTurn && run.runtimeMode !== "native") return null;
+    }
     if (partiallyDeliveredQueue && run.runtimeMode !== "native" && !unusedAdmission && !cancelledStartup) return null;
     if ((queuedInterrupt || queuedRequest) && !legacyUserTurn && !unusedAdmission &&
         !(queuedRequest && run.runtimeMode === "native" &&
@@ -221,7 +313,7 @@ export async function admitExplicitNativeContinuation(input: {
     if (run.runtimeMode !== "native" && !unusedAdmission && !legacyUserTurn && !cancelledStartup) return null;
     // A provider failure can finish the normal result/assessment commit path.
     // Its accepted failed result is immutable history, not a live controller.
-    // Only a new user turn may pass this gate; the process/lease stop proofs
+    // An admitted fresh turn may pass this gate; the process/lease stop proofs
     // below remain mandatory and no previous action is automatically replayed.
     const [committedFailure] = coordinator?.phase === "committed" && coordinator.resultId && run.status === "failed"
       ? await db.select({ id: nativeRunResults.id }).from(nativeRunResults).where(and(
@@ -241,36 +333,11 @@ export async function admitExplicitNativeContinuation(input: {
           run.status === "cancelled" && !coordinator.leaseOwner
             ? "The cancelled run still needs verified cleanup. Your message is saved. Inspect the run and its environment for details."
             : "Waiting for the previous run to finish recovery. Your message will start automatically.");
-    const leases = await db.select()
-      .from(environmentLeases).where(and(
-        eq(environmentLeases.companyId, companyId), eq(environmentLeases.heartbeatRunId, run.id),
-      ));
-    const remote = leases.some(lease => lease.provider !== "local");
-    if (remote) {
-      // Never interpret remote PIDs using the control-plane host's process table.
-      if (!leases.every(hasRemoteTerminationReceipt)) return blocked("remote_cleanup", "Waiting for the previous environment to stop. Your message will start automatically.");
-      if (run.runtimeMode === "native" && !input.dryRun && !leases.every(lease => completeTerminatedRemoteNativeSessionCleanup({
-        companyId, runId: run.id, remoteCleanupScope: remoteLeaseCleanupScope(lease)!,
-      }))) return null;
-    } else {
-      if (leases.some(lease => !lease.releasedAt || lease.cleanupStatus === "failed")) return blocked("local_cleanup", "Waiting for the previous environment to finish cleanup. Your message will start automatically.");
-      if (!unusedAdmission && !cancelledStartup) {
-        // A missing process identity is not evidence that a provider exited.
-        if (!run.processPid && !run.processGroupId &&
-            !await hasNativeLocalProcessStop(db, companyId, run.id) &&
-            !await hasHistoricalSuspendedNativeSession(db, run)) return blocked("process_identity_missing", "The previous run has no verified stop record. Paperclip cannot start this message yet.");
-        if (run.processPid && !processStopped(run.processPid)) return blocked("process_running", "Waiting for the previous process to stop. Your message will start automatically.");
-        if (run.processGroupId && !processStopped(-run.processGroupId)) return blocked("process_running", "Waiting for the previous process to stop. Your message will start automatically.");
-      }
-    }
-    if (!remote && run.runtimeMode === "native" && run.errorCode === "native_session_cleanup_quarantined") {
-      // This is new user input, never permission to retry the interrupted turn.
-      if (retry) return blocked("cleanup_quarantined", "Send a new message after the previous provider has stopped.");
-      const { verifyStoppedNativeSessionForContinuation } = await import("./native-runtime/native-session-executor.js");
-      const stopped = await verifyStoppedNativeSessionForContinuation(db, run);
-      if (!stopped) return blocked("local_cleanup", "Waiting for the previous provider and its tools to stop. Your message is saved.");
-      stoppedSessions.push(stopped);
-    }
+    const stopProof = await verifyStoppedExecutionEnvironment({
+      db, companyId, run, unusedAdmission: strict ? false : unusedAdmission, cancelledStartup: strict ? automaticStartup : cancelledStartup, retry, dryRun: input.dryRun,
+    });
+    if (!stopProof.ok) return blocked(stopProof.reason, stopProof.message);
+    if (stopProof.stoppedSession) stoppedSessions.push(stopProof.stoppedSession);
     sources.push(run);
   }
   const nativeSources = sources.filter(run => run.runtimeMode === "native");
@@ -288,6 +355,19 @@ export async function admitExplicitNativeContinuation(input: {
   await buildExecutionContinuation({ db, companyId, issueId, agentId,
     context: { previousRunId: previous.id, wakeCommentId: commentId },
     summary: null, exposeLowTrustRaw: false });
+  if (board) {
+    if ([task.executionRunId, task.checkoutRunId].some(id => id && !sources.some(run => run.id === id)))
+      return blocked("conflicting_claim", "Another execution claim owns this task.");
+    const leases = await db.select().from(environmentLeases).where(and(
+      eq(environmentLeases.companyId, companyId),
+      or(eq(environmentLeases.issueId, issueId), inArray(environmentLeases.heartbeatRunId, sources.map(run => run.id))),
+    )).orderBy(environmentLeases.id).for("update");
+    if (leases.some(lease => !lease.releasedAt || lease.cleanupStatus !== "success"))
+      return blocked("environment_cleanup_required", "Every affected environment requires completed cleanup before reset.");
+    const inspection = await collectExecutionResetInspection(db, companyId, issueId);
+    if (inspection?.fingerprint !== board.fingerprint)
+      return blocked("stale_reset_expectations", "Execution evidence changed while admitting reset.");
+  }
   if (input.dryRun) return { previousRunId: previous.id, commentId, ...(retry ? { failedRunId: input.failedRunId! } : {}) };
   for (const stopped of stoppedSessions) {
     if (!stopped.retire()) return blocked("local_cleanup", "The previous provider cleanup changed. Your message is saved.");
@@ -298,7 +378,7 @@ export async function admitExplicitNativeContinuation(input: {
       payload: stopped.evidence,
     });
   }
-  const authorization = { actorId, commentId, ...(response ? { interactionId: response.source.interactionId } : {}), ...(retry ? { failedRunId: input.failedRunId } : {}),
+  const authorization = { ...(board ? { ...board, actorId, intent: "start_fresh_history_aware_turn", acknowledgeFreshHistoryAwareTurn: true } : dependency ? { ...dependency, intent: "dependency_blockers_resolved" } : { actorId, commentId }), ...(response ? { interactionId: response.source.interactionId } : {}), ...(retry ? { failedRunId: input.failedRunId } : {}),
     ...(comment ? { commentUpdatedAt: comment.updatedAt.toISOString(),
       commentBodyHash: createHash("sha256").update(comment.body).digest("hex") } : {}),
     ...(queuedInterrupt ? { queuedCommentInterruptId: input.queuedCommentInterruptId } : {}),
@@ -315,25 +395,25 @@ export async function admitExplicitNativeContinuation(input: {
     }).where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, runId)));
   }
   if (nativeSources.length) await db.update(nativeRunFinalizations).set({
-    failureDetail: sql`coalesce(${nativeRunFinalizations.failureDetail}, '{}'::jsonb) || ${JSON.stringify({ replacementDenied: "explicit_user_continuation" })}::jsonb`,
+    failureDetail: sql`coalesce(${nativeRunFinalizations.failureDetail}, '{}'::jsonb) || ${JSON.stringify({ replacementDenied: board ? "board_execution_reset" : dependency ? "dependency_closure_continuation" : "explicit_user_continuation" })}::jsonb`,
     updatedAt: new Date(),
   }).where(and(eq(nativeRunFinalizations.companyId, companyId), inArray(nativeRunFinalizations.runId, nativeSources.map(run => run.id))));
   for (const action of actions) {
     await db.update(issueRecoveryActions).set({
       status: "resolved", outcome: "cancelled", resolvedAt: new Date(), updatedAt: new Date(),
-      nextAction: "The user started a fresh conversation turn. Prior action outcomes remain recorded.",
-      resolutionNote: "The user continued after the prior execution stopped. No action outcomes were inferred.",
+      nextAction: board ? "The board requested a fresh history-aware turn." : dependency ? "A verified dependency closure started a fresh history-aware turn." : "The user started a fresh conversation turn. Prior action outcomes remain recorded.",
+      resolutionNote: strict ? "Verified action settlement and stopped execution; prior outcomes are retained." : "The user continued after the prior execution stopped. No action outcomes were inferred.",
       wakePolicy: null, monitorPolicy: null,
-      evidence: { ...action.evidence, explicitUserContinuation: authorization,
+      evidence: { ...action.evidence, [board ? "boardExecutionReset" : dependency ? "dependencyClosureContinuation" : "explicitUserContinuation"]: authorization,
         ...(action.evidence.automaticRecovery ? { automaticRecovery: {
-          ...(action.evidence.automaticRecovery as Record<string, unknown>), replay: "explicit_user_continuation",
+          ...(action.evidence.automaticRecovery as Record<string, unknown>), replay: board ? "board_execution_reset" : dependency ? "dependency_closure_continuation" : "explicit_user_continuation",
         } } : {}),
       },
     }).where(eq(issueRecoveryActions.id, action.id));
   }
-  await persistActivity(db, { companyId, actorType: "user", actorId,
+  await persistActivity(db, { companyId, actorType: dependency ? "system" : "user", actorId: dependency ? "issue-dependencies" : actorId!,
     action: "issue.execution_recovery_settled", entityType: "issue", entityId: issueId,
-    details: { continuation: retry ? "explicit_user_retry" : "explicit_user_message", ...authorization,
+    details: { continuation: board ? "board_execution_reset" : dependency ? "dependency_blockers_resolved" : retry ? "explicit_user_retry" : "explicit_user_message", ...authorization,
       recoveryActionIds: actions.map(action => action.id), previousRunIds: sources.map(run => run.id) },
   });
   return { previousRunId: previous.id, commentId, ...(retry ? { failedRunId: input.failedRunId! } : {}) };

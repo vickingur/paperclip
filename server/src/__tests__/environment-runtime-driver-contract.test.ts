@@ -223,6 +223,10 @@ describeEmbeddedPostgres("environment runtime driver contract", () => {
       expect(released[0]?.environment.id).toBe(environment.id);
       expect(released[0]?.lease.id).toBe(acquired.lease.id);
       expect(released[0]?.lease.status).toBe("released");
+      if (testCase.driver === "local") {
+        expect(released[0]?.lease.cleanupStatus).toBe("success");
+        expect(released[0]?.lease.releasedAt).not.toBeNull();
+      }
 
       const activeRows = await db
         .select()
@@ -234,6 +238,18 @@ describeEmbeddedPostgres("environment runtime driver contract", () => {
       await cleanup?.();
     }
   }
+
+  it("local bookkeeping cleanup rejects an unexpected provider resource", async () => {
+    const runtime = environmentRuntimeService(db);
+    const { companyId, environment, runId } = await seedEnvironment({ driver: "local", config: {} });
+    const acquired = await runtime.acquireRunLease({ companyId, environment, heartbeatRunId: runId,
+      persistedExecutionWorkspace: null });
+    await expect(runtime.getDriver("local")!.releaseRunLease({ environment,
+      lease: { ...acquired.lease, providerLeaseId: "unexpected-provider-resource" }, status: "released",
+    })).rejects.toThrow("Local lease cleanup cannot release a provider resource");
+    const [retained] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, acquired.lease.id));
+    expect(retained).toMatchObject({ status: "active", cleanupStatus: null, releasedAt: null });
+  });
 
   const contractCases: RuntimeContractCase[] = [
     {

@@ -254,6 +254,119 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
     }
   }, 45_000);
 
+  it.each(["restart", "stale claim", "unlinked dispatch"] as const)("recovers owner handback after %s and runs normal work once behind the repair", async mode => {
+    const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), actionId = randomUUID();
+    let finishRepair!: () => void;
+    const repairFinished = new Promise<void>(resolve => { finishRepair = resolve; });
+    mockAdapterExecute.mockImplementationOnce(async () => {
+      await repairFinished;
+      return { exitCode: 0, signal: null, timedOut: false, errorMessage: null,
+        summary: "Handed back to normal work.", provider: "test", model: "test-model" };
+    });
+    mockAdapterExecute.mockImplementationOnce(async () => {
+      const [run] = await db.select().from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.status, "running")));
+      await db.insert(issueComments).values({ companyId, issueId, authorAgentId: agentId,
+        authorType: "agent", createdByRunId: run!.id, body: "Finished normal work." });
+      await db.update(issues).set({ status: "done" }).where(eq(issues.id, issueId));
+      return { exitCode: 0, signal: null, timedOut: false, errorMessage: null,
+        summary: "Finished normal work.", provider: "test", model: "test-model" };
+    });
+    await db.insert(companies).values({ id: companyId, name: "Owner handback",
+      issuePrefix: `H${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false, defaultResponsibleUserId: "responsible-user" });
+    await db.insert(agents).values({ id: agentId, companyId, name: "Owner", role: "engineer",
+      status: "active", adapterType: "codex_local", adapterConfig: {}, permissions: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } } });
+    await db.insert(issues).values({ id: issueId, companyId, title: "Normal work", status: "todo",
+      assigneeAgentId: agentId, responsibleUserId: "responsible-user" });
+    try {
+      const repairRun = await heartbeat.wakeup(agentId, { source: "assignment", triggerDetail: "system",
+        reason: "issue_assigned", payload: { issueId }, contextSnapshot: { issueId } });
+      expect(await waitForCondition(async () => mockAdapterExecute.mock.calls.length === 1, 30_000)).toBe(true);
+      await db.insert(issueComments).values({ companyId, issueId, authorAgentId: agentId,
+        authorType: "agent", createdByRunId: repairRun!.id, body: "Review finished; handing back to normal work." });
+      const [intent] = await db.transaction(async tx => {
+        await tx.insert(issueRecoveryActions).values({ id: actionId, companyId, sourceIssueId: issueId,
+          kind: "deliberate_wait_without_target", status: "resolved", outcome: "handed_back",
+          ownerType: "agent", ownerAgentId: agentId, returnOwnerAgentId: agentId,
+          cause: "deliberate_wait_without_target", fingerprint: actionId, nextAction: "Continue normal work",
+          wakePolicy: { type: "bounded_owner_disposition_repair", retryAgentId: agentId } });
+        await tx.update(issues).set({ status: "todo" }).where(eq(issues.id, issueId));
+        return tx.insert(agentWakeupRequests).values({ companyId, agentId, source: "automation",
+          triggerDetail: "system", reason: "issue_recovery_action_restored",
+          requestedByActorType: "system", requestedByActorId: "owner-disposition-handback",
+          idempotencyKey: `owner-disposition-handback:${actionId}`,
+          payload: { issueId, recoveryActionId: actionId, _paperclipWakeContext: {
+            issueId, taskId: issueId, recoveryActionId: actionId, forceFreshSession: true,
+            source: "issue.recovery_action_resolution" } } }).returning();
+      });
+      if (mode === "stale claim") {
+        // Process death after claiming the intent, before enqueueing.
+        await db.update(agentWakeupRequests).set({ status: "claimed",
+          claimedAt: new Date(Date.now() - 120_000) }).where(eq(agentWakeupRequests.id, intent!.id));
+      }
+      // A new service instance recovers the committed intent without a route wake.
+      const restarted = heartbeatService(db);
+      await restarted.dispatchPendingNativeStatusWakeups({ companyId });
+      if (mode === "unlinked dispatch") {
+        // Enqueue committed; process death prevented linking the intent.
+        await db.update(agentWakeupRequests).set({ status: "claimed", runId: null,
+          finishedAt: null, claimedAt: new Date() }).where(eq(agentWakeupRequests.id, intent!.id));
+        const recovered = await restarted.dispatchPendingNativeStatusWakeups({ companyId });
+        expect(recovered.recovered).toBe(1);
+      }
+      await restarted.dispatchPendingNativeStatusWakeups({ companyId });
+      const deferred = await db.select().from(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.status, "deferred_issue_execution")));
+      expect(deferred).toHaveLength(1);
+      expect(mockAdapterExecute).toHaveBeenCalledTimes(1);
+      finishRepair();
+      expect(await waitForCondition(async () => mockAdapterExecute.mock.calls.length === 2, 10_000)).toBe(true);
+      await heartbeat.drainActiveRunExecutions();
+      const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId));
+      expect(runs).toHaveLength(2);
+      const successor = runs.find(run => run.id !== repairRun!.id)!;
+      expect(successor).toMatchObject({ status: "succeeded", contextSnapshot: {
+        wakeReason: "issue_recovery_action_restored", forceFreshSession: true,
+        source: "issue.recovery_action_resolution", ownerDispositionHandbackIntentId: intent!.id,
+      } });
+      expect(successor.contextSnapshot).not.toHaveProperty("dispositionRecoveryActionId");
+      expect(successor.startedAt!.getTime()).toBeGreaterThanOrEqual(runs.find(run => run.id === repairRun!.id)!.finishedAt!.getTime());
+      await restarted.dispatchPendingNativeStatusWakeups({ companyId });
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId))).toHaveLength(2);
+    } finally { finishRepair(); }
+  }, 45_000);
+
+  it.each(["actionActive", "wrongOutcome", "wrongOwner", "ownerChanged", "closed", "missingFreshBoundary"])(
+    "rejects owner handback delivery when %s", async gate => {
+      const companyId = randomUUID(), agentId = randomUUID(), peerId = randomUUID(), issueId = randomUUID(), actionId = randomUUID();
+      await db.insert(companies).values({ id: companyId, name: "Handback gate",
+        issuePrefix: `G${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`, requireBoardApprovalForNewAgents: false });
+      await db.insert(agents).values([agentId, peerId].map(id => ({ id, companyId, name: id, role: "engineer",
+        status: "active", adapterType: "codex_local", adapterConfig: {}, permissions: {},
+        runtimeConfig: { heartbeat: { wakeOnDemand: true } } })));
+      await db.insert(issues).values({ id: issueId, companyId, title: "Handback gate",
+        status: gate === "closed" ? "done" : "todo", assigneeAgentId: gate === "ownerChanged" ? peerId : agentId,
+        responsibleUserId: "responsible-user" });
+      await db.insert(issueRecoveryActions).values({ id: actionId, companyId, sourceIssueId: issueId,
+        kind: "deliberate_wait_without_target", status: gate === "actionActive" ? "active" : "resolved",
+        outcome: gate === "wrongOutcome" ? "restored" : "handed_back", ownerType: "agent",
+        ownerAgentId: gate === "wrongOwner" ? peerId : agentId, returnOwnerAgentId: agentId,
+        cause: "deliberate_wait_without_target", fingerprint: actionId, nextAction: "Continue",
+        wakePolicy: { type: "bounded_owner_disposition_repair", retryAgentId: agentId } });
+      const [intent] = await db.insert(agentWakeupRequests).values({ companyId, agentId, source: "automation",
+        reason: "issue_recovery_action_restored", requestedByActorType: "system", requestedByActorId: "owner-disposition-handback",
+        payload: { issueId, recoveryActionId: actionId, _paperclipWakeContext: {
+          issueId, forceFreshSession: gate !== "missingFreshBoundary" } } }).returning();
+      await heartbeat.dispatchPendingNativeStatusWakeups({ companyId });
+      await heartbeat.dispatchPendingNativeStatusWakeups({ companyId });
+      expect(mockAdapterExecute).not.toHaveBeenCalled();
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId))).toHaveLength(0);
+      const [saved] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, intent!.id));
+      expect(saved!.status).toBe("skipped");
+    });
+
   it("dispatches and coalesces durable native status wake intents into one heartbeat run", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();

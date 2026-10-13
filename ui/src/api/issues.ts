@@ -1,3 +1,4 @@
+import type { ExecutionResetRequest, ExecutionResetCommittedResponse, ExecutionResetInspection } from "@paperclipai/shared";
 import type { SetIssueTitle } from "@paperclipai/shared";
 import type { ExecutionReconciliation } from "@paperclipai/shared";
 import type {
@@ -40,7 +41,8 @@ import type {
   UpsertIssueWatchdog,
   UpsertIssueDocument,
 } from "@paperclipai/shared";
-import { api, ApiError, detachInflightGet, type RequestOptions } from "./client";
+import { api, ApiError, detachInflightGet, requestResponse, type RequestOptions } from "./client";
+import { readApiJson } from "./response";
 import { CommentSubmissionUnknownError } from "../lib/comment-submit-result";
 
 function hasCommentReceipt(value: unknown): boolean {
@@ -164,6 +166,10 @@ function issueListSearchParams(filters?: IssueListFilters) {
 }
 
 export const issuesApi = {
+  resetExecution: (id: string, request: ExecutionResetRequest) =>
+    api.post<ExecutionResetCommittedResponse>(`/issues/${id}/execution/reset`, request),
+  inspectExecutionReset: (id: string) =>
+    requestResponse(`/issues/${id}/execution/reset-inspection`, { method: "GET", cache: "no-store" }).then(response => readApiJson<ExecutionResetInspection>(response)),
   /** Fetch every page for bounded task-detail relations, not just the default first page. */
   listAll: async (companyId: string, filters: Omit<IssueListFilters, "limit" | "offset" | "sortField" | "sortDir" | "afterId" | "attention">, options?: RequestOptions): Promise<Issue[]> => {
     const pageSize = 500;

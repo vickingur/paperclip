@@ -11959,12 +11959,25 @@ export function issueService(db: Db) {
         return enriched;
       }
 
+      const holdingRunId = current.executionRunId ?? current.checkoutRunId;
+      const holdingRun = holdingRunId
+        ? await db
+            .select({ status: heartbeatRuns.status })
+            .from(heartbeatRuns)
+            .where(and(
+              eq(heartbeatRuns.id, holdingRunId),
+              eq(heartbeatRuns.companyId, issueCompany.companyId),
+            ))
+            .then((rows) => rows[0] ?? null)
+        : null;
       throw conflict("Issue checkout conflict", {
         issueId: current.id,
         status: current.status,
         assigneeAgentId: current.assigneeAgentId,
         checkoutRunId: current.checkoutRunId,
         executionRunId: current.executionRunId,
+        holdingRunId,
+        holdingRunStatus: holdingRun?.status ?? null,
       });
     },
 

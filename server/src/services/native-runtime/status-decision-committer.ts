@@ -1,3 +1,4 @@
+import { recordDependencyClosureProof, DEPENDENCY_CLOSURE_RECEIPT_KEY } from "../dependency-closure-proof.js";
 import { eligibleIssueMonitorWait } from "../issue-monitors.js";
 import { readNativePlanWait, type NativePlanWaitSource } from "./native-plan-wait.js";
 import { activeIssueInteractionCondition } from "../issue-question-context.js";
@@ -433,6 +434,13 @@ async function enqueueWake(input: {
     .limit(1)
     .then((rows) => rows[0] ?? null);
   if (existing) return existing.id;
+  const closureReceiptId = input.reason === "issue_blockers_resolved" &&
+      typeof input.payload.resolvedBlockerIssueId === "string"
+    ? await recordDependencyClosureProof(input.tx, {
+        companyId: input.companyId, issueId: input.issueId, agentId: input.agentId,
+        resolvedBlockerIssueId: input.payload.resolvedBlockerIssueId,
+        producer: "native_status_decision",
+      }) : null;
   const inserted = await input.tx
     .insert(agentWakeupRequests)
     .values({
@@ -445,6 +453,7 @@ async function enqueueWake(input: {
         issueId: input.issueId,
         taskId: input.issueId,
         ...input.payload,
+        ...(closureReceiptId ? { [DEPENDENCY_CLOSURE_RECEIPT_KEY]: closureReceiptId } : {}),
         _paperclipWakeContext: {
           issueId: input.issueId,
           taskId: input.issueId,

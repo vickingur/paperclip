@@ -749,6 +749,16 @@ describeEmbeddedPostgres("heartbeat resolved dependency wake reconciliation", ()
 
   it.each(["active", "resolved"] as const)("keeps repeated wakes behind a %s execution hold run-free, then resumes once", async (status) => {
     const { companyId, agentId, blockedIssueId, action } = await seedExecutionWait(status);
+    const sourceRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({ id: sourceRunId, companyId, agentId,
+      status: "cancelled", runtimeMode: "legacy", contextSnapshot: { issueId: blockedIssueId },
+      startedAt: new Date("2026-09-11T10:00:00Z"), finishedAt: new Date("2026-09-11T11:00:00Z"),
+      resultJson: { cancellation: { source: "provider", expected: false,
+        initiator: { type: "provider" }, reason: "Synthetic provider cancellation",
+        recordedAt: "2026-09-11T11:00:00Z" } },
+    });
+    await db.update(issueRecoveryActions).set({ evidence: { ...action.evidence, runId: sourceRunId } })
+      .where(eq(issueRecoveryActions.id, action.id));
     const heartbeat = heartbeatService(db);
     // Different producers and wake keys must not create new attempts or notices.
     await Promise.all(Array.from({ length: 6 }, (_, i) => heartbeat.wakeup(agentId, {
@@ -762,12 +772,17 @@ describeEmbeddedPostgres("heartbeat resolved dependency wake reconciliation", ()
       expect((await heartbeatService(db).reconcileResolvedDependencyWakes()).healed).toBe(0);
     }
     const waits = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId));
-    expect(waits).toHaveLength(1);
-    expect(waits[0]).toMatchObject({
-      status: "skipped", runId: null, reason: "execution_reconciliation_required", coalescedCount: 8,
+    // Generic probes share one diagnostic. The dependency closure owns a
+    // separate durable receipt, which the backstop never discards or duplicates.
+    expect(waits).toHaveLength(2);
+    expect(waits.find(wake => wake.status === "skipped")).toMatchObject({
+      runId: null, reason: "execution_reconciliation_required", coalescedCount: 5,
       payload: { issueId: blockedIssueId, executionWait: { recoveryActionId: action.id } },
     });
-    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId))).toHaveLength(0);
+    const receipt = waits.find(wake => wake.status === "deferred_issue_execution")!;
+    expect(receipt).toMatchObject({ reason: "issue_blockers_resolved", runId: null,
+      payload: { executionWait: { recoveryActionId: action.id, holdingRunId: sourceRunId } } });
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId))).toHaveLength(1);
     expect(mockAdapterExecute).not.toHaveBeenCalled();
     expect(await db.select().from(activityLog).where(and(
       eq(activityLog.companyId, companyId), eq(activityLog.action, "issue.blockers_resolved_wake_emitted"),
@@ -779,10 +794,13 @@ describeEmbeddedPostgres("heartbeat resolved dependency wake reconciliation", ()
         summary: "Finished the dependency-ready task.", provider: "test", model: "test-model" };
     });
     await db.update(issueRecoveryActions).set({ status: "resolved", evidence: {} }).where(eq(issueRecoveryActions.id, action.id));
-    expect((await heartbeat.reconcileResolvedDependencyWakes()).healed).toBe(1);
     expect((await heartbeat.reconcileResolvedDependencyWakes()).healed).toBe(0);
+    await db.update(agentWakeupRequests).set({ updatedAt: new Date(Date.now() - 60_000) })
+      .where(eq(agentWakeupRequests.id, receipt.id));
+    await heartbeat.resumeExecutionWaitComments();
+    await heartbeat.resumeExecutionWaitComments();
     await heartbeat.drainActiveRunExecutions();
-    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId))).toHaveLength(1);
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId))).toHaveLength(2);
     expect(mockAdapterExecute).toHaveBeenCalledTimes(1);
   });
 

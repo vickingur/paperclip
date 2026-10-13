@@ -1,3 +1,7 @@
+import { DEPENDENCY_CLOSURE_RECEIPT_KEY, verifyDependencyClosureProof } from "../dependency-closure-proof.js";
+import { commitExecutionReset } from "../execution-reset-producer.js";
+import { deliverExecutionReset } from "../execution-reset-delivery.js";
+import { findCommittedExecutionReset, type ExecutionResetIntent } from "../execution-reset-idempotency.js";
 import { isAgentAwaitingSetup } from "../../modules/agent-lifecycle/index.js";
 import { normalizeAgentNameKey } from "./retries.js";
 import { publishActiveDotComment } from "../dot-assignment-follow-up.js";
@@ -27,6 +31,8 @@ import {
 import { legacyControllerClaim } from "../legacy-controller-lease.js";
 import {
   admitExplicitNativeContinuation,
+  admitBoardExecutionReset,
+  admitDependencyClosureContinuation,
   undeliveredLegacyUserCommentIds,
 } from "../explicit-native-continuation.js";
 import { canRetryStoppedRun } from "../cancelled-native-startup.js";
@@ -2672,7 +2678,8 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               // A user message can join a queue originally created by a
               // system wake. Admission validates the saved user comment or board click.
               (opts.queuedCommentInterruptId ?? opts.queuedCommentRequestId) === executionWaitRequestId
-                ? undefined : eq(agentWakeupRequests.requestedByActorType, "user"),
+                ? undefined : eq(agentWakeupRequests.requestedByActorType,
+                    reason === "issue_blockers_resolved" ? opts.requestedByActorType ?? "system" : "user"),
               opts.queuedCommentInterruptId === executionWaitRequestId
                 ? sql`${agentWakeupRequests.payload}->'queuedCommentInterrupt'->>'actorId' = ${opts.requestedByActorId ?? ""}`
                 : opts.queuedCommentRequestId === executionWaitRequestId ? undefined
@@ -2681,7 +2688,14 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             ));
             // The issue lock serializes cleanup callbacks and periodic workers.
             // An adopted, discarded, or edited receipt is no longer authority.
-            if (!pending || (!(wakeCommentId && queuedCommentIdsFromWakePayload(pending.payload).includes(wakeCommentId)) &&
+            const dependencyReceipt = pending?.reason === "issue_blockers_resolved" &&
+              reason === pending.reason && pending.requestedByActorId === opts.requestedByActorId &&
+              pending.requestedByActorType === opts.requestedByActorType &&
+              pending.payload?.executionWait != null &&
+              (pending.requestedByActorType === "system" || Boolean(await verifyDependencyClosureProof(tx as unknown as Db, {
+                companyId: agent.companyId, issueId, agentId, receiptId: pending.payload?.[DEPENDENCY_CLOSURE_RECEIPT_KEY],
+              })));
+            if (!pending || (!dependencyReceipt && !(wakeCommentId && queuedCommentIdsFromWakePayload(pending.payload).includes(wakeCommentId)) &&
                 !(opts.queuedCommentInterruptId && await readQueuedInteractionResponse(tx as unknown as Db,
                   agent.companyId, issueId, pending.payload)))) {
               return { kind: "deferred" as const };
@@ -3093,11 +3107,13 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             reconciledSourceRunId = sourceRunId;
           }
 
-          let continuationWait = { reason: "execution_recovery", message: "Waiting for execution recovery. Your message is saved." };
+          let continuationWait = reason === "issue_blockers_resolved"
+            ? { reason: "execution_reconciliation_required", message: "Verify stopped execution and recorded action outcomes before continuing this dependency closure." }
+            : { reason: "execution_recovery", message: "Waiting for execution recovery. Your message is saved." };
           const deferBlockedExecution = async (
             executionBlocker: NonNullable<Awaited<ReturnType<typeof getExecutionBlocker>>>,
           ) => {
-            const condition = { recoveryActionId: executionBlocker.recoveryActionId, ...continuationWait };
+            const condition = { recoveryActionId: executionBlocker.recoveryActionId, holdingRunId: executionBlocker.runId, ...continuationWait };
             if (executionWaitRequestId) {
               await tx.update(agentWakeupRequests).set({
                 payload: sql`jsonb_set(coalesce(${agentWakeupRequests.payload}, '{}'::jsonb), '{executionWait}', ${JSON.stringify(condition)}::jsonb)`,
@@ -3105,9 +3121,13 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               }).where(eq(agentWakeupRequests.id, executionWaitRequestId));
               return { kind: "deferred" as const };
             }
-            if (durableRequest || wakeCommentId ||
+            // Dependency closures own durable work, even without a user message.
+            // A retained recovery must not discard the only event that can
+            // resume this task once its execution proofs become eligible.
+            if (durableRequest || wakeCommentId || reason === "issue_blockers_resolved" ||
                 hasInteractionContinuationWakeContext(enrichedContextSnapshot) ||
-                readNonEmptyString(enrichedContextSnapshot.nativeStatusWakeIntentId)) {
+                readNonEmptyString(enrichedContextSnapshot.nativeStatusWakeIntentId) ||
+                readNonEmptyString(enrichedContextSnapshot.ownerDispositionHandbackIntentId)) {
               await tx.insert(agentWakeupRequests).values({
                 ...durableReceiptFields,
                 companyId: agent.companyId, agentId, source, triggerDetail, reason,
@@ -3143,6 +3163,25 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             return { kind: "deferred" as const };
           };
           const explicitContinuationRunId = randomUUID();
+          const dependencyIntent = reason === "issue_blockers_resolved" && Boolean(await verifyDependencyClosureProof(tx as unknown as Db, {
+            companyId: issue.companyId, issueId: issue.id, agentId, receiptId: payload?.[DEPENDENCY_CLOSURE_RECEIPT_KEY],
+          }));
+          if (dependencyIntent) {
+            const [adopted] = await tx.select({ evidence: issueRecoveryActions.evidence }).from(issueRecoveryActions).where(and(
+              eq(issueRecoveryActions.companyId, issue.companyId), eq(issueRecoveryActions.sourceIssueId, issue.id),
+              sql`${issueRecoveryActions.evidence}->'dependencyClosureContinuation'->>'receiptId' = ${String(payload?.[DEPENDENCY_CLOSURE_RECEIPT_KEY])}`,
+            )).limit(1);
+            const successorId = readNonEmptyString(parseObject(adopted?.evidence.dependencyClosureContinuation).runId);
+            if (successorId && isUuidLike(successorId)) {
+              const [successor] = await tx.select().from(heartbeatRuns).where(and(
+                eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.id, successorId), eq(heartbeatRuns.agentId, agentId),
+                sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issue.id}`,
+              ));
+              if (successor) return { kind: "replayed" as const, run: successor };
+              return { kind: "deferred" as const };
+            }
+          }
+          const admitContinuation = dependencyIntent ? admitDependencyClosureContinuation : admitExplicitNativeContinuation;
           const executionBlocker = await getExecutionBlocker(
             tx as unknown as Db, issue.companyId, issue.id,
             { conversationResetCommentId: opts.requestedByActorType === "user" ? wakeCommentId : null },
@@ -3152,13 +3191,14 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           // A bound chat request has already rechecked its current principal
           // above. Treat its new user message like a board comment, but keep
           // failed-run retry actions on their separate exact-request path.
-          if (executionBlocker && !(await admitExplicitNativeContinuation({
+          if (executionBlocker && !(await admitContinuation({
             db: tx as unknown as Db, companyId: issue.companyId, issueId: issue.id,
             agentId, actorType: opts.requestedByActorType, actorId: opts.requestedByActorId,
             reason: durableRequest && !failedChatRetry ? "issue_commented" : reason,
             commentId: wakeCommentId ?? null, failedRunId: opts.failedRunId, successorRunId: explicitContinuationRunId,
             queuedCommentInterruptId: opts.queuedCommentInterruptId,
             queuedCommentRequestId: opts.queuedCommentRequestId,
+            receiptId: payload?.[DEPENDENCY_CLOSURE_RECEIPT_KEY],
             dryRun: true,
             onBlocked: (reason, message) => { continuationWait = { reason, message }; },
           }))) return deferBlockedExecution(executionBlocker);
@@ -3922,19 +3962,21 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             return { kind: "skipped" as const };
           }
 
-          const explicitContinuation = await admitExplicitNativeContinuation({
+          const explicitContinuation = await admitContinuation({
             db: tx as unknown as Db, companyId: issue.companyId, issueId: issue.id,
             agentId, actorType: opts.requestedByActorType, actorId: opts.requestedByActorId,
             reason: durableRequest && !failedChatRetry ? "issue_commented" : reason,
             commentId: wakeCommentId ?? null, failedRunId: opts.failedRunId, successorRunId: explicitContinuationRunId,
             queuedCommentInterruptId: opts.queuedCommentInterruptId,
             queuedCommentRequestId: opts.queuedCommentRequestId,
+            receiptId: payload?.[DEPENDENCY_CLOSURE_RECEIPT_KEY],
           });
           if (!explicitContinuation && executionBlocker) return deferBlockedExecution(executionBlocker);
           if (explicitContinuation) {
             enrichedContextSnapshot.forceFreshSession = true;
             enrichedContextSnapshot.previousRunId = explicitContinuation.previousRunId;
-            enrichedContextSnapshot.explicitUserContinuation = explicitContinuation;
+            if (dependencyIntent) enrichedContextSnapshot.dependencyClosureContinuation = { ...explicitContinuation, receiptId: payload?.[DEPENDENCY_CLOSURE_RECEIPT_KEY] };
+            else enrichedContextSnapshot.explicitUserContinuation = explicitContinuation;
           }
 
           const wakeupRequest = await tx
@@ -4347,7 +4389,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
   }
 
   /**
-   * Native status commitment deliberately persists dependency/parent wake
+   * Native status commitment and owner disposition handback persist wake
    * intents in the same transaction as the authoritative status projection.
    * Those rows are not runnable until the heartbeat scheduler has applied its
    * normal policy, workspace, concurrency, and responsible-user checks. Bridge
@@ -4377,7 +4419,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             ? eq(agentWakeupRequests.companyId, input.companyId)
             : undefined,
           eq(agentWakeupRequests.requestedByActorType, "system"),
-          eq(agentWakeupRequests.requestedByActorId, "native-status-committer"),
+          inArray(agentWakeupRequests.requestedByActorId, ["native-status-committer", "owner-disposition-handback"]),
           inArray(agentWakeupRequests.status, ["queued", "claimed"]),
           isNull(agentWakeupRequests.runId),
         ),
@@ -4394,7 +4436,8 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     >();
 
     for (const candidate of candidates) {
-      const dispatchActorId = `native-status-wake-dispatch:${candidate.id}`;
+      const ownerHandback = candidate.requestedByActorId === "owner-disposition-handback";
+      const dispatchActorId = `${ownerHandback ? "owner-handback-wake-dispatch" : "native-status-wake-dispatch"}:${candidate.id}`;
       const existingDispatch = await db
         .select()
         .from(agentWakeupRequests)
@@ -4473,8 +4516,28 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         readNonEmptyString(payload.taskId) ??
         readNonEmptyString(wakeContext.issueId) ??
         null;
+      if (ownerHandback) {
+        const actionId = readNonEmptyString(payload.recoveryActionId);
+        const [action] = actionId ? await db.select().from(issueRecoveryActions).where(and(
+          eq(issueRecoveryActions.id, actionId),
+          eq(issueRecoveryActions.companyId, candidate.companyId),
+          eq(issueRecoveryActions.sourceIssueId, issueId ?? "00000000-0000-0000-0000-000000000000"),
+        )).limit(1) : [];
+        if (!action || action.status !== "resolved" || action.outcome !== "handed_back" ||
+            action.kind !== "deliberate_wait_without_target" || action.ownerType !== "agent" ||
+            action.ownerAgentId !== candidate.agentId || action.returnOwnerAgentId !== candidate.agentId ||
+            action.wakePolicy?.type !== "bounded_owner_disposition_repair" ||
+            action.wakePolicy?.retryAgentId !== candidate.agentId ||
+            candidate.reason !== "issue_recovery_action_restored" || wakeContext.forceFreshSession !== true) {
+          await db.update(agentWakeupRequests).set({ status: "skipped", finishedAt: now,
+            error: "Owner handback no longer matches its resolved recovery action", updatedAt: now,
+          }).where(eq(agentWakeupRequests.id, candidate.id));
+          recovered += 1;
+          continue;
+        }
+      }
       const scopeKey = issueId
-        ? `${candidate.companyId}:${candidate.agentId}:${issueId}:${readNativeReviewAssignmentContext(wakeContext)?.nativeReviewInteractionId ?? ""}`
+        ? `${ownerHandback ? "owner-handback:" : ""}${candidate.companyId}:${candidate.agentId}:${issueId}:${readNativeReviewAssignmentContext(wakeContext)?.nativeReviewInteractionId ?? ""}`
         : null;
       const priorDelivery = scopeKey
         ? deliveredByIssueScope.get(scopeKey)
@@ -4521,9 +4584,13 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           companyId: candidate.companyId, issueId, agentId: candidate.agentId,
           reason: candidate.reason, contextSnapshot: wakeContext,
         });
+        if (ownerHandback && targetIssue) completedOnboardingGuard = {
+          assigneeAgentId: candidate.agentId, statuses: ["todo", "in_progress"], statusVersion: targetIssue.statusVersion,
+        };
         if (onboardingResultReport) completedOnboardingGuard = { assigneeAgentId: candidate.agentId, statuses: ["done"], statusVersion: targetIssue!.statusVersion };
         if (
           !targetIssue ||
+          (ownerHandback && !["todo", "in_progress"].includes(targetIssue.status)) ||
           (["done", "cancelled"].includes(targetIssue.status) && !onboardingResultReport) ||
           (targetIssue.assigneeAgentId !== candidate.agentId && !nativeReview) ||
           (candidate.reason === "native_completion_review" && !nativeReview)
@@ -4561,9 +4628,14 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             ...wakeContext,
             ...(issueId ? { issueId, taskId: issueId } : {}),
             wakeReason: candidate.reason,
-            source: "native_status_decision",
-            statusDecisionSource: "native_status_decision",
-            nativeStatusWakeIntentId: candidate.id,
+            ...(ownerHandback ? {
+              source: "issue.recovery_action_resolution",
+              ownerDispositionHandbackIntentId: candidate.id,
+            } : {
+              source: "native_status_decision",
+              statusDecisionSource: "native_status_decision",
+              nativeStatusWakeIntentId: candidate.id,
+            }),
           },
         });
 
@@ -4646,7 +4718,98 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     return { scanned: candidates.length, dispatched, recovered, deferred };
   }
 
+  /** Internal board-reset queue producer. The route must authenticate its board
+   * principal before calling this; public wakes cannot select this admission.
+   * Queued runs are durable and recovered by resumeQueuedRuns after a crash.
+   * No provider is dispatched while the producer transaction is open.
+   */
+  async function commitBoardExecutionReset(intent: ExecutionResetIntent) {
+    // Budget reconciliation owns a separate accounting transaction and can
+    // cancel work. Keep it outside issue/agent locks, as ordinary enqueue does.
+    // A saved commit is immutable and must bypass mutable preflight gates.
+    const saved = await findCommittedExecutionReset(db, intent);
+    if (saved) return saved;
+    const [source] = await db.select().from(issues).where(and(
+      eq(issues.companyId, intent.companyId), eq(issues.id, intent.issueId),
+    ));
+    if (!source?.assigneeAgentId) throw conflict("execution_reset_source_unavailable");
+    const budgetBlock = await budgets.getInvocationBlock(source.companyId, source.assigneeAgentId,
+      { issueId: source.id, projectId: source.projectId });
+    if (budgetBlock) throw conflict(budgetBlock.reason, { scopeType: budgetBlock.scopeType, scopeId: budgetBlock.scopeId });
+    return commitExecutionReset(db, intent, async ({ db: tx, issue, resetId, successorRunId }) => {
+      // Do not admit a newly assigned budget scope with the old preflight.
+      if (issue.assigneeAgentId !== source.assigneeAgentId || issue.projectId !== source.projectId)
+        throw conflict("execution_reset_source_changed");
+      const [company] = await tx.select({ status: companies.status }).from(companies)
+        .where(eq(companies.id, issue.companyId));
+      if (company?.status !== "active") throw conflict("execution_reset_company_unavailable");
+      // Match ordinary queue lock order: issue first, assigned agent second.
+      const [agent] = await tx.select().from(agents).where(and(
+        eq(agents.companyId, issue.companyId), eq(agents.id, issue.assigneeAgentId!),
+      )).for("update");
+      if (!agent) throw conflict("execution_reset_agent_unavailable");
+      const suppression = await getSchedulingSuppression();
+      if (suppression.suppressed) throw conflict(`execution_reset_${suppression.reason}`);
+      const cutoff = await getWorktreeExecutionCutoff();
+      if (cutoff && issue.createdAt < cutoff) throw conflict("execution_reset_worktree_execution_cutoff");
+      const invokability = await getAgentInvokability(agent);
+      if (!invokability.invokable) throw conflict(invokability.message, { reason: invokability.reason });
+      const policy = parseHeartbeatPolicy(agent);
+      if (!policy.wakeOnDemand) throw conflict("execution_reset_wake_on_demand_disabled");
+      const dailyCap = await getHeartbeatDailyCapBlock(agent, policy, {}, tx);
+      if (dailyCap) throw conflict(dailyCap.reason, { observed: dailyCap.observed, limit: dailyCap.limit });
+      if ((await instanceSettings.getExperimental()).enableIsolatedWorkspaces) {
+        const issueSettings = parseIssueExecutionWorkspaceSettings(issue.executionWorkspaceSettings);
+        const resolvedMode = resolveExecutionWorkspaceMode({ projectPolicy: null, issueSettings, legacyUseProjectWorkspace: null });
+        const managedConfig = buildExecutionWorkspaceAdapterConfig({
+          agentConfig: parseObject(agent.adapterConfig), projectPolicy: null,
+          issueSettings, mode: resolvedMode, legacyUseProjectWorkspace: null,
+        });
+        const existingStatus = issue.executionWorkspaceId
+          ? await tx.select({ status: executionWorkspaces.status }).from(executionWorkspaces)
+            .where(and(eq(executionWorkspaces.id, issue.executionWorkspaceId), eq(executionWorkspaces.companyId, issue.companyId)))
+            .then(rows => rows[0]?.status ?? null) : null;
+        const reuse = resolveExecutionWorkspaceReuseRequestForIssue({
+          issueExecutionWorkspaceId: issue.executionWorkspaceId,
+          issueExecutionWorkspacePreference: issue.executionWorkspacePreference,
+          existingExecutionWorkspaceStatus: existingStatus,
+        });
+        // Reset starts a fresh session; only durable workspace reuse can supply
+        // an existing cwd, never the previous adapter session.
+        if (isUnrunnableWorktreeCombo({ issue, resolvedMode,
+          resolvedStrategy: resolveEffectiveWorkspaceStrategyType(resolvedMode, managedConfig),
+          reusableExecutionWorkspaceAvailable: reuse.existingExecutionWorkspaceAvailable,
+          hasResolvablePriorSessionWorkspace: false,
+        })) throw conflict(WORKSPACE_WORKTREE_REQUIRES_PROJECT_MESSAGE, {
+          reason: WORKSPACE_WORKTREE_REQUIRES_PROJECT_CODE,
+          remediation: WORKSPACE_WORKTREE_REQUIRES_PROJECT_REMEDIATION,
+        });
+      }
+      return admitBoardExecutionReset({
+        db: tx, companyId: issue.companyId, issueId: issue.id, agentId: agent.id,
+        actorType: "user", actorId: intent.principalId, reason: "execution_reset", commentId: null,
+        resetId, successorRunId, expectedHoldingRunId: intent.expectedHoldingRunId,
+        expectedRecoveryActionId: intent.expectedRecoveryActionId, fingerprint: intent.fingerprint,
+        acknowledgeFreshHistoryAwareTurn: intent.acknowledgeFreshHistoryAwareTurn,
+      });
+    });
+  }
+
   return {
+    commitBoardExecutionReset,
+    resetBoardExecution: (intent: ExecutionResetIntent) => deliverExecutionReset(
+      db, intent, () => commitBoardExecutionReset(intent), {
+        publish: run => publishLiveEvent({
+          companyId: run.companyId, type: "heartbeat.run.queued",
+          payload: { runId: run.id, agentId: run.agentId,
+            invocationSource: run.invocationSource, triggerDetail: run.triggerDetail,
+            wakeupRequestId: run.wakeupRequestId },
+        }),
+        start: startNextQueuedRunForAgent,
+        failed: (err, response) => logger.warn({ err, ...response },
+          "execution reset committed; queued successor delivery will resume on retry or startup"),
+      },
+    ),
     enqueueWakeup,
     dispatchPendingNativeStatusWakeups,
     startNextQueuedRunForAgent,

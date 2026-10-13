@@ -1548,6 +1548,17 @@ describe("agent live run routes", () => {
     });
   });
 
+  it("strips internal dependency closure receipts from public board wake payloads", async () => {
+    const res = await requestApp(await createApp(), baseUrl => request(baseUrl)
+      .post(`/api/agents/${routeAgentId}/wakeup`)
+      .send({ reason: "issue_blockers_resolved", payload: {
+        dependencyClosureReceiptId: "11111111-1111-4111-8111-111111111111", marker: "kept",
+      } }));
+    expect(res.status, JSON.stringify(res.body)).toBe(202);
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(routeAgentId,
+      expect.objectContaining({ payload: { dependencyClosureReceiptId: undefined, marker: "kept" } }));
+  });
+
   it("allows implicit local administrators to opt one manual run into raw provider tracing", async () => {
     const res = await requestApp(await createApp(), (baseUrl) =>
       request(baseUrl)

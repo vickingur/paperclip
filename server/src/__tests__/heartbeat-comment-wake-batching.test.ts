@@ -365,7 +365,7 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
     expect(runs[0]?.id).toBe(runId);
   });
 
-  it("defers recovery hand-back wakes until the resolving run exits", async () => {
+  it.each([false, true])("defers recovery hand-back wakes until the resolving run exits (fresh=%s)", async forceFreshSession => {
     const companyId = randomUUID();
     const agentId = randomUUID();
     const issueId = randomUUID();
@@ -443,6 +443,7 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
         recoveryActionId,
         wakeReason: "issue_recovery_action_restored",
         source: "issue.recovery_action_resolution",
+        ...(forceFreshSession ? { forceFreshSession: true } : {}),
       },
       requestedByActorType: "agent",
       requestedByActorId: agentId,
@@ -479,6 +480,7 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
       recoveryActionId,
       wakeReason: "issue_recovery_action_restored",
       source: "issue.recovery_action_resolution",
+        ...(forceFreshSession ? { forceFreshSession: true } : {}),
     });
 
     const runs = await db

@@ -1,4 +1,5 @@
 import { cancellableSandboxStartup } from "./startup-cancellation.js";
+import { createExecutionActionInventory } from "../execution-action-inventory.js";
 import { withAdapterExecutionPhase, type AdapterExecutionPhase } from "../execution-phase.js";
 import fs from "node:fs/promises";
 import fsSync from "node:fs";
@@ -4062,6 +4063,8 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
     let safeInterruptedSession = false;
     let preserveInterruptedSession = false;
     const interruptionTools = new Map<string, { kind?: string; status?: string }>();
+    const executionActions = createExecutionActionInventory();
+    let actionStreamCompleted = false;
     let incompleteToolInventory = false;
     try {
       await ctx.onCancellationReady?.();
@@ -4069,7 +4072,10 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         exitCode: null, signal: null, timedOut: false,
         errorCode: "cancelled", errorMessage: "Stopped before provider startup",
         executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
-        resultJson: { executionCancellation: { state: "acknowledged", acknowledgedAt: new Date().toISOString(), forced: false } },
+        resultJson: {
+          executionActionInventory: executionActions.snapshot({ dispatchAttempted: false, streamCompleted: false, turnCompleted: false }),
+          executionCancellation: { state: "acknowledged", acknowledgedAt: new Date().toISOString(), forced: false },
+        },
       };
       // Evict idle staged runtimes BEFORE building the runtime, since buildRuntime
       // consults the staged cache to decide whether a compatible resume may reuse
@@ -4955,8 +4961,12 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
             observedRuntimeEvents += 1;
             // ACPX currently flattens client-side filesystem/terminal receipts
             // into status text. They cannot establish complete action outcomes.
-            if (event.type === "status" && /^(fs|terminal)\//.test(event.text)) incompleteToolInventory = true;
+            if (event.type === "status" && /^(fs|terminal)\//.test(event.text)) {
+              incompleteToolInventory = true;
+              executionActions.invalidate();
+            }
             if (event.type === "tool_call") {
+              executionActions.observe(event);
               if (!event.toolCallId) incompleteToolInventory = true;
               else {
                 const previous = interruptionTools.get(event.toolCallId);
@@ -4985,6 +4995,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
             }
             await emitRuntimeEvent(ctx, event, toolTitles, prepared.coalescePlaceholderToolUpdates);
           }
+          actionStreamCompleted = true;
         })();
         // A latched loss already asked the agent to cancel (above, in
         // `cancelForLoss`); that request settles neither `turn.events` nor
@@ -5018,6 +5029,12 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         // make an otherwise silent turn look active at its execution deadline.
         const lastEventAgeMs = lastRuntimeEventAt === null ? undefined : now() - lastRuntimeEventAt;
         const activityDiagnostics = {
+          executionActionInventory: executionActions.snapshot({
+            dispatchAttempted: turnDispatchAttempted,
+            streamCompleted: actionStreamCompleted && !lossDeadlineTripped,
+            turnCompleted: input.kind === "terminal" && input.terminal.status === "completed" &&
+              !input.timedOut && !forcedStop && prepared.paperclipBridge?.readRunDisposition?.()?.failed !== true,
+          }),
           acpObservedEventCount: observedRuntimeEvents,
           ...(lastEventAgeMs !== undefined && Number.isSafeInteger(lastEventAgeMs) && lastEventAgeMs >= 0
             ? { acpLastEventAgeMs: lastEventAgeMs } : {}),

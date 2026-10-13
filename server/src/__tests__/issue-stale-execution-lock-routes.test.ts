@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
 import { eq } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   authUsers,
   companyMemberships,
@@ -43,6 +43,7 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
   }, 20_000);
 
   afterEach(async () => {
+    vi.unstubAllEnvs();
     await db.delete(issueComments);
     await db.delete(issueRelations);
     await db.delete(activityLog);
@@ -116,6 +117,54 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
 
     return { companyId, agentId, failedRunId, currentRunId };
   }
+
+  it("restricts reset inspection to authenticated board members with issue access", async () => {
+    const { companyId, agentId, failedRunId, currentRunId } = await seedCompanyAgentAndRuns();
+    const issueId = randomUUID();
+    await db.insert(issues).values({ id: issueId, companyId, title: "Inspect", status: "blocked",
+      assigneeAgentId: agentId, executionRunId: failedRunId });
+    const path = `/api/issues/${issueId}/execution/reset-inspection`;
+    const allowed = await request(createApp(boardActor(companyId))).get(path);
+    expect(allowed.status).toBe(200);
+    expect(allowed.body).toMatchObject({ issueId, holds: [], validation: "required_at_reset",
+      continuationMode: "fresh_history_aware" });
+    expect(allowed.body.fingerprint).toMatch(/^[0-9a-f]{64}$/);
+    expect((await request(createApp(agentActor(companyId, agentId, currentRunId))).get(path)).status).toBe(403);
+    expect((await request(createApp({ ...boardActor(companyId), userId: undefined })).get(path)).status).toBe(403);
+    const foreign = await request(createApp(boardActor(randomUUID()))).get(path);
+    expect([403, 404]).toContain(foreign.status);
+    expect(foreign.body.fingerprint).toBeUndefined();
+    expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0].executionRunId).toBe(failedRunId);
+  });
+
+  it("rejects unauthorized resets and authority overrides before queue mutation", async () => {
+    const { companyId, agentId, failedRunId, currentRunId } = await seedCompanyAgentAndRuns();
+    const issueId = randomUUID();
+    await db.insert(issues).values({ id: issueId, companyId, title: "Reset", status: "blocked",
+      assigneeAgentId: agentId, executionRunId: failedRunId });
+    const path = `/api/issues/${issueId}/execution/reset`;
+    const body = { idempotencyKey: "reset", expectedHoldingRunId: failedRunId,
+      expectedRecoveryActionId: randomUUID(), fingerprint: "synthetic",
+      acknowledgeFreshHistoryAwareTurn: true };
+    expect((await request(createApp(agentActor(companyId, agentId, currentRunId))).post(path).send(body)).status).toBe(403);
+    expect((await request(createApp({ ...boardActor(companyId), userId: undefined })).post(path).send(body)).status).toBe(403);
+    expect([403, 404]).toContain((await request(createApp(boardActor(randomUUID()))).post(path).send(body)).status);
+    for (const override of [{ companyId }, { issueId }, { principalId: "other" }, { contextSnapshot: {} }, { acknowledgeFreshHistoryAwareTurn: false }]) {
+      expect((await request(createApp(boardActor(companyId))).post(path).send({ ...body, ...override })).status).toBe(400);
+    }
+    const rejected = await request(createApp(boardActor(companyId))).post(path).send(body);
+    expect(rejected.status).toBe(409);
+    expect(rejected.body.error).toBe("execution_reset_admission_rejected");
+    expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0].executionRunId).toBe(failedRunId);
+    expect(await db.select().from(heartbeatRuns)).toHaveLength(2);
+    vi.stubEnv("PAPERCLIP_ISSUE_PRIVACY_MODE", "enforce");
+    await db.update(issues).set({ visibility: "private", privacyRootIssueId: issueId,
+      responsibleUserId: "another-owner" }).where(eq(issues.id, issueId));
+    const privateDenied = await request(createApp(boardActor(companyId))).post(path).send(body);
+    expect(privateDenied.status).toBe(404);
+    expect(privateDenied.body).toEqual({ error: "Issue not found" });
+
+  });
 
   function agentActor(companyId: string, agentId: string, runId: string): Express.Request["actor"] {
     return {

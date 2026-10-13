@@ -5900,9 +5900,15 @@ export function agentRoutes(
       source: opts.source,
       triggerDetail: req.body.triggerDetail ?? "manual",
       reason: req.body.reason ?? null,
-      payload: req.actor.type === "agent" && wakePayload
-        ? { ...wakePayload, commentId: undefined, wakeCommentId: undefined, wakeCommentIds: undefined }
-        : wakePayload,
+      // Dependency closure authority is minted by internal producers, never
+      // accepted from the public wake endpoint (including board payloads).
+      payload: wakePayload ? {
+        ...wakePayload,
+        dependencyClosureReceiptId: undefined,
+        ...(req.actor.type === "agent" ? {
+          commentId: undefined, wakeCommentId: undefined, wakeCommentIds: undefined,
+        } : {}),
+      } : wakePayload,
       idempotencyKey: req.body.idempotencyKey ?? null,
       requestedByActorType: req.actor.type === "agent" ? "agent" : "user",
       requestedByActorId: req.actor.type === "agent" ? req.actor.agentId ?? null : req.actor.userId ?? null,

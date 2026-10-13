@@ -1,3 +1,4 @@
+import { recordDependencyClosureProof, DEPENDENCY_CLOSURE_RECEIPT_KEY } from "../dependency-closure-proof.js";
 import { isAgentAwaitingSetup } from "../../modules/agent-lifecycle/index.js";
 import { isAiAuthenticationBlocked } from "../ai-auth-failure.js";
 import { hasCommittedNativePlanWait } from "../native-runtime/native-plan-wait.js";
@@ -5782,11 +5783,16 @@ export function recoveryService(
         }
 
         try {
+          const closureReceiptId = await recordDependencyClosureProof(db, {
+            companyId, issueId: candidate.id, agentId, resolvedBlockerIssueId,
+            producer: "dependency_backstop",
+          });
           const wake = await deps.enqueueWakeup(agentId, {
             source: "automation",
             triggerDetail: "system",
             reason: ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
             payload: {
+              [DEPENDENCY_CLOSURE_RECEIPT_KEY]: closureReceiptId,
               issueId: candidate.id,
               resolvedBlockerIssueId,
               blockerIssueIds: readiness.blockerIssueIds,

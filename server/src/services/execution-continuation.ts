@@ -1,3 +1,5 @@
+import { hasSettledExecutionActions } from "@paperclipai/adapter-utils/execution-action-inventory";
+import { verifyDependencyClosureProof } from "./dependency-closure-proof.js";
 import { createHash } from "node:crypto";
 import { and, asc, desc, eq, inArray, isNotNull, isNull, or, sql } from "drizzle-orm";
 import { z } from "zod";
@@ -344,6 +346,15 @@ export async function buildExecutionContinuation(input: {
       },
     ),
   );
+  // Preserve original ACP action identities in the same low-trust completed-work
+  // envelope as API receipts. No arguments or tool output are inferred.
+  for (const run of priorRuns) {
+    const inventory = object(run.result).executionActionInventory;
+    if (hasSettledExecutionActions(inventory)) completedActions.push(...inventory.actions.map(action => ({
+      runId: run.id, receiptId: action.id, operationId: `acp:${action.kind}`,
+      result: { status: action.status, outcome: action.outcome },
+    })));
+  }
   const reconciliations = await db
     .select({
       id: issueRecoveryActions.id,
@@ -357,6 +368,72 @@ export async function buildExecutionContinuation(input: {
         eq(issueRecoveryActions.status, "resolved"),
       ),
     );
+  // Board reset is a separate authority, never borrowed from a user message or
+  // dependency closure. Also detect removal of its context after admission.
+  const boardContinuation = object(input.context.boardExecutionReset);
+  const boardReceipts = reconciliations.filter(row =>
+    input.runId && object(row.evidence.boardExecutionReset).runId === input.runId);
+  if (Object.keys(boardContinuation).length || boardReceipts.length) {
+    const successor = input.runId ? await db.select().from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, input.runId),
+      eq(heartbeatRuns.agentId, input.agentId),
+      sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueId}`,
+    )) : [];
+    const affectedSourceIds = [...new Set(boardReceipts.map(row => string(row.evidence.runId)))];
+    const affectedSources = affectedSourceIds.length && affectedSourceIds.every(id => id !== null)
+      ? await db.select().from(heartbeatRuns).where(and(
+          eq(heartbeatRuns.companyId, companyId), inArray(heartbeatRuns.id, affectedSourceIds as string[]),
+          sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueId}`,
+        )) : [];
+    const saved = object(successor[0]?.contextSnapshot?.boardExecutionReset);
+    const resetId = z.string().guid().safeParse(boardContinuation.resetId);
+    const requests = resetId.success && input.runId ? await db.select().from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.id, resetId.data), eq(agentWakeupRequests.companyId, companyId),
+      eq(agentWakeupRequests.agentId, input.agentId), eq(agentWakeupRequests.runId, input.runId),
+      eq(agentWakeupRequests.reason, "execution_reset"), inArray(agentWakeupRequests.status, ["coalesced", "claimed"]),
+      eq(agentWakeupRequests.requestedByActorType, "user"),
+      sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId}`,
+    )) : [];
+    const request = requests[0];
+    const requestedReset = object(request?.payload?.boardExecutionReset);
+    const fields = ["resetId", "fingerprint", "actorId", "expectedHoldingRunId", "expectedRecoveryActionId", "previousRunId"] as const;
+    const validReceipt = (row: typeof reconciliations[number]) => {
+      const receipt = object(row.evidence.boardExecutionReset);
+      return fields.every(key => typeof boardContinuation[key] === "string" &&
+        boardContinuation[key] !== "" && receipt[key] === boardContinuation[key] && saved[key] === receipt[key]) &&
+        receipt.intent === "start_fresh_history_aware_turn" &&
+        receipt.acknowledgeFreshHistoryAwareTurn === true;
+    };
+    if (!sourceRunId || !input.runId || !boardReceipts.length ||
+        !boardReceipts.every(validReceipt) || !request || !request.idempotencyKey ||
+        request.requestedByActorId !== boardContinuation.actorId ||
+        !fields.every(key => requestedReset[key] === boardContinuation[key]) ||
+        requestedReset.acknowledgeFreshHistoryAwareTurn !== true ||
+        boardContinuation.previousRunId !== sourceRunId ||
+        !boardReceipts.some(row => row.id === boardContinuation.expectedRecoveryActionId &&
+          row.evidence.runId === boardContinuation.expectedHoldingRunId) ||
+        affectedSources.length !== affectedSourceIds.length || affectedSources.some(run =>
+          !["failed", "interrupted", "timed_out", "cancelled"].includes(run.status) ||
+          !hasSettledExecutionActions(run.resultJson?.executionActionInventory)) ||
+        saved.expectedRecoveryActionId !== boardContinuation.expectedRecoveryActionId ||
+        input.context.forceFreshSession !== true || successor[0]?.contextSnapshot?.forceFreshSession !== true ||
+        !priorRuns.some(run => run.id === sourceRunId && hasSettledExecutionActions(object(run.result).executionActionInventory))) {
+      throw new Error("continuation_board_reset_authorization_missing");
+    }
+  }
+  const dependencyContinuation = object(input.context.dependencyClosureContinuation);
+  if (Object.keys(dependencyContinuation).length) {
+    const proof = await verifyDependencyClosureProof(db, { companyId, issueId, agentId: input.agentId,
+      receiptId: dependencyContinuation.receiptId });
+    const matching = reconciliations.filter(row => {
+      const receipt = object(row.evidence.dependencyClosureContinuation);
+      return receipt.receiptId === proof?.receiptId && receipt.fingerprint === proof?.fingerprint &&
+        receipt.previousRunId === sourceRunId && receipt.runId === input.runId &&
+        receipt.intent === "dependency_blockers_resolved";
+    });
+    if (!proof || !input.runId || !matching.length || dependencyContinuation.previousRunId !== sourceRunId ||
+        !priorRuns.some(run => run.id === input.runId)) throw new Error("continuation_dependency_authorization_missing");
+  }
   const lastTerminal = priorRuns.findLast((run) =>
     ["succeeded", "failed", "timed_out", "interrupted", "cancelled"].includes(run.status) &&
     !(run.status === "cancelled" && run.errorCode === "execution_reconciliation_required"),

@@ -1139,7 +1139,12 @@ function createLocalEnvironmentDriver(db: Db): EnvironmentRuntimeDriver {
     },
 
     async releaseRunLease(input) {
-      return await environmentsSvc.releaseLease(input.lease.id, input.status);
+      // Local leases are bookkeeping only. Provider resources must use their
+      // own teardown driver; process settlement remains a separate proof.
+      if (input.lease.provider !== "local" || input.lease.providerLeaseId !== null) {
+        throw new Error("Local lease cleanup cannot release a provider resource.");
+      }
+      return await environmentsSvc.releaseLease(input.lease.id, input.status, { cleanupStatus: "success" });
     },
 
     async retryPendingSandboxTeardown({ lease }) {

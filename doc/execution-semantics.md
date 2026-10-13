@@ -1096,6 +1096,33 @@ future execution until Resume, and missing stop proof still blocks continuation.
 
 A permanently unusable native runner session may be replaced only with evidence that its predecessor is stopped and fenced, completed results and workspace state are preserved, required task history is available, and pending effects have been reconciled. A provider-native shell command or external write without a reliable outcome receipt is unknown. Unknown effects, integrity failures, and unverified process ownership never authorize speculative replay. Once automatic recovery is ruled out, Paperclip selects a conservative default: preserve recorded work, stop the affected task, and retain a durable no-replay hold. Unknown action outcomes remain unknown. No reconciliation form or user diagnosis is required.
 
+ACP run results retain `executionActionInventory` (`paperclip.execution-actions.v1`)
+with the original tool-call IDs, closed kind/status labels, and completed or
+unknown outcomes. It contains no tool arguments, titles, output, or error text.
+Failed and cancelled calls remain unknown because those statuses do not prove
+that an effect was undone. Missing IDs, flattened filesystem/terminal receipts,
+contradictory updates, and an interrupted event relay prevent settlement proof.
+An empty inventory qualifies only with affirmative pre-dispatch or completed
+no-action evidence. Older summary counts and `actionOutcomes=settled` do not
+substitute for the inventory. This evidence alone grants no continuation:
+termination, workspace, ownership, controller, and ordinary execution gates
+still require independent validation.
+
+Trusted last-blocker closures retain a server-owned provenance receipt bound to
+current task ownership, dependency identities and the blocked cycle. Both queue
+admission checks use the shared stopped-continuation evaluator. Automatic hold
+retirement requires every effective hold to have complete action settlement,
+verified source ownership and historical adapter semantics, stopped providers,
+released controllers/finalizers and no competing continuation claim. Operator
+Stop, unknown outcomes, workspace repair, pause and decision gates remain held.
+The successor transaction retires eligible holds with a separate
+`dependencyClosureContinuation` receipt, starts a fresh session, and retains
+source history and original completed ACP action IDs. Dispatch validates the
+receipt against the successor and current dependency state. Adopted closure
+receipts cannot create a second successor with a different request key.
+Historical or unsupported evidence stays deferred; this does not backfill old
+action outcomes or authorize a board reset.
+
 Local Codex crash replacement can use a complete interrupted-turn inventory,
 authenticated process-stop evidence, and unchanged retained-state fingerprints.
 Only text and an exactly receipted task-completion call qualify for this path;
@@ -1714,3 +1741,68 @@ use the same activity projection. Board-owned repairs stay actionable until a
 verified native retry actually starts. Once an explicit board retry is running,
 its live activity takes precedence over the prior owner and exhausted budget.
 Resolved and cancelled actions remain resolved.
+
+
+## Board execution reset API
+
+An authenticated board user with access to the task can inspect a stopped
+execution using `GET /api/issues/:id/execution/reset-inspection`. Inspection
+returns the evidence fingerprint and exact holding-run/recovery-action IDs;
+it performs no cleanup or wake.
+
+Submit `POST /api/issues/:id/execution/reset` with `idempotencyKey`,
+`expectedHoldingRunId`, `expectedRecoveryActionId`, `fingerprint`, and
+`acknowledgeFreshHistoryAwareTurn: true`. Company, task and user identity come
+from the server; caller authority or context overrides are rejected. Agent
+credentials cannot call this endpoint, including the task's assignee.
+
+Reset rechecks the inspected evidence, stopped process/controller state,
+settled action outcomes, workspace cleanup and ordinary execution gates.
+Unknown outcomes or changed evidence reject admission with HTTP 409. The reset
+receipt, resolved holds and fresh queued successor commit in one transaction.
+The response contains `resetId`, `issueId`, `successorRunId`, and `previousRunId`.
+Reuse the same key and payload after a lost response: retries return that exact
+commit, including after successor completion. A changed payload with the same
+key returns HTTP 409. Notification/start failure after commit leaves the
+successor queued for retry or startup recovery.
+
+The fresh turn receives prior task history and original completed-action IDs.
+Reset authorizes a new history-aware turn; it does not replay prior actions or
+clear pause, dependency, approval, review, budget or ownership gates.
+
+## Owner disposition handback delivery
+
+The original assigned agent can resolve its own active bounded disposition repair
+on an in-progress task after its review or other dependency closes. Resolution
+records `handed_back`, changes the task to `todo`, and commits a fresh normal
+execution wake intent in the same transaction. The repair turn finishes before
+the normal successor starts. Startup recovery uses the existing durable status
+wake dispatcher, so a lost immediate dispatch does not lose the handback.
+
+Delivery rechecks the resolved action, original owner, current task status and
+assignment. It preserves dependency, interaction, pause, budget, approval and
+execution admission gates. Retrying an already resolved action cannot insert
+another intent. This owner path does not resolve execution uncertainty or
+board-owned escalation.
+
+### System disposition suppression before provider handoff
+
+A legacy disposition repair cancelled with `legacy_disposition_repair_suppressed`
+can be a false execution incident. The cancellation code and an empty summary
+alone never prove that no action occurred. The exact executor writes a run,
+company and task bound suppression receipt immediately before adapter handoff,
+only while all provider-dispatch flags remain false. After cleanup and controller
+release, settlement independently rejects process/session/coordinator evidence,
+provider/tool/launch events, incomplete or attempted action inventories, pending
+tools, unsafe or retained workspace recovery, and unverified lease cleanup.
+Local bookkeeping release records canonical `cleanupStatus: success`; it cannot
+release a provider resource, and does not itself prove process termination.
+Remote leases still require their exact stopped/destroyed receipt.
+
+Under the task lock, verified settlement resolves only that run's unreconciled
+legacy incident as a false positive and corrects its retained no-replay flag.
+Recorded disposition, original action evidence, other incidents and task status
+remain intact. Ordinary queue admission still enforces dependencies, review,
+pause, assignment and capacity gates. Missing or contradictory receipts remain
+held and are listed by recovery-actions for safe board inspection. Cleanup
+settlement never dispatches a provider or enqueues a successor by itself.

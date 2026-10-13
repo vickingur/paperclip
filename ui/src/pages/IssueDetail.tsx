@@ -1,3 +1,4 @@
+import { ExecutionResetProvider } from "../components/ExecutionResetDialog";
 import { WorkspaceBaseRefRecoveryProvider } from "../components/WorkspaceBaseRefRecovery";
 import { isLockedIssueStub, LockedIssueChip } from "@/components/LockedIssueChip";
 import { canManageIssuePrivacy } from "../lib/issuePrivacy";
@@ -7963,6 +7964,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
               }
             >
               {resolvedDetailTab === "chat" ? (
+                <ExecutionResetProvider value={{ issueId: issue.id, agentId: issue.assigneeAgentId, allowed: !!boardAccess && canResolveBoardRecoveryAction, pauseReason: treeControlStateError ? "Couldn’t check whether this task is paused. Refresh to try again." : activePauseHold ? "The task is paused. Resume it before resetting." : issue.project?.pausedAt ? "The project is paused. Resume it before resetting." : null, onQueued: () => { invalidateIssueDetail(); invalidateIssueCollections(); } }}>
                 <WorkspaceBaseRefRecoveryProvider issue={issue} agentMap={agentMap} onRepaired={() => { invalidateIssueDetail(); invalidateIssueCollections(); }}
                   unavailableReason={!canManageBoardRuntime || !canResolveBoardRecoveryAction ? "You don’t have permission to repair this task’s workspace."
                     : treeControlStateError ? "Couldn’t check whether this task is paused. Refresh to try again."
@@ -8241,6 +8243,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
                 />
                 </DispositionRecoveryProvider>
                 </WorkspaceBaseRefRecoveryProvider>
+                </ExecutionResetProvider>
               ) : null}
             </TabsContent>
 

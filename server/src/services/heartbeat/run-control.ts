@@ -1,3 +1,4 @@
+import { DEPENDENCY_CLOSURE_RECEIPT_KEY, verifyDependencyClosureProof } from "../dependency-closure-proof.js";
 import { isHeartbeatRunTerminalStatus } from "./run-lifecycle.js";
 import { DEFERRED_WAKE_CONTEXT_KEY } from "./queue.js";
 import { CANCELLABLE_HEARTBEAT_RUN_STATUSES } from "./recovery.js";
@@ -640,11 +641,14 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
         sql`${issues.id}::text = ${agentWakeupRequests.payload}->>'issueId'`,
         eq(issues.assigneeAgentId, agentWakeupRequests.agentId)))
       .innerJoin(companies, and(eq(companies.id, issues.companyId), eq(companies.status, "active")))
-      .where(and(exists(db.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions).where(and(
-        eq(issueRecoveryActions.companyId, issues.companyId), eq(issueRecoveryActions.sourceIssueId, issues.id),
-        executionBlockerPredicate(),
-      ))), eq(agentWakeupRequests.status, "deferred_issue_execution"),
-        eq(agentWakeupRequests.requestedByActorType, "user"),
+      .where(and(or(
+        and(eq(agentWakeupRequests.requestedByActorType, "user"),
+          exists(db.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions).where(and(
+            eq(issueRecoveryActions.companyId, issues.companyId), eq(issueRecoveryActions.sourceIssueId, issues.id),
+            executionBlockerPredicate(),
+          )))),
+        eq(agentWakeupRequests.reason, "issue_blockers_resolved"),
+      ), eq(agentWakeupRequests.status, "deferred_issue_execution"),
         sql`${agentWakeupRequests.payload}->'executionWait' is not null`,
         sql`${agentWakeupRequests.payload}->'queuedCommentInterrupt' is null`,
         lte(agentWakeupRequests.updatedAt, new Date(Date.now() - 30_000)),
@@ -666,6 +670,41 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
       // Match normal admission's deterministic current blocker selection. An
       // arbitrary historical action must not choose the retry's source run.
       const blocker = await getExecutionBlocker(db, wake.companyId, issueId);
+      if (wake.reason === "issue_blockers_resolved") {
+        const payload = parseObject(wake.payload);
+        const proof = await verifyDependencyClosureProof(db, { companyId: wake.companyId,
+          issueId, agentId: wake.agentId, receiptId: payload[DEPENDENCY_CLOSURE_RECEIPT_KEY] });
+        // Historical unproven closures keep the existing cleared-hold path.
+        // Trusted closures may reach admission, which rechecks every hold under lock.
+        if (blocker && !proof) continue;
+        if (!proof && wake.requestedByActorType !== "system") continue;
+        const wait = parseObject(payload.executionWait);
+        const previousRunId = readNonEmptyString(wait.holdingRunId);
+        if (!previousRunId || !isUuidLike(previousRunId)) continue;
+        const previous = await getRun(previousRunId, { includeExecutionEvidence: true });
+        if (!previous || previous.companyId !== wake.companyId || previous.agentId !== wake.agentId ||
+            (previous.nativeIssueId ?? previous.contextSnapshot?.issueId) !== issueId ||
+            !isHeartbeatRunTerminalStatus(previous.status)) continue;
+        const cancellation = readRunCancellation(previous.resultJson);
+        // Clearing recovery bookkeeping is never permission to undo Stop.
+        // Ambiguous historical cancellations require the board reset path.
+        if (cancellation?.source === "operator" || cancellation?.initiator.type === "user" ||
+            previous.resultJson?.operatorInterrupted === true || previous.resultJson?.cancelledByUserId ||
+            ["user", "board"].includes(String(previous.resultJson?.cancelledByActorType)) ||
+            ["user", "board"].includes(String(previous.resultJson?.interruptedByActorType)) ||
+            (previous.status === "cancelled" && (!cancellation || cancellation.source === "unknown"))) continue;
+        await enqueueWakeup(wake.agentId, {
+          source: "automation", triggerDetail: "system", reason: wake.reason,
+          requestedByActorType: wake.requestedByActorType as "agent" | "system" | "user", requestedByActorId: wake.requestedByActorId,
+          payload, contextSnapshot: { ...parseObject(payload[DEFERRED_WAKE_CONTEXT_KEY]),
+            issueId, previousRunId, forceFreshSession: true },
+          issueStateGuard: { assigneeAgentId: wake.agentId, statuses: ["todo", "in_progress", "in_review", "blocked"] },
+          idempotencyKey: `execution-wait-delivery:${wake.id}`,
+        }, wake.id).catch(err => {
+          logger.warn({ err, queueId: wake.id }, "failed to resume retained dependency closure");
+        });
+        continue;
+      }
       const sourceId = blocker?.runId;
       if (!sourceId || !isUuidLike(sourceId)) continue;
       const run = await getRun(sourceId, { includeExecutionEvidence: true });

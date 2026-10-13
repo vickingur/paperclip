@@ -259,6 +259,7 @@
   /* New-task dialog geometry inputs and gap tokens. The derived top/height
      calculations live on the dialog element so runtime Visual Viewport
      overrides participate in computed-value resolution. */
+  --execution-reset-max-height: calc(100dvh - var(--sz-calc-26) - max(1rem, env(safe-area-inset-bottom)));
   --new-issue-visual-viewport-height: 100dvh;
   --new-issue-visual-viewport-offset-top: 0px;
   --new-issue-dialog-top-gap: max(1rem, env(safe-area-inset-top));

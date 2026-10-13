@@ -2871,3 +2871,7 @@ export { AGENT_LIFECYCLE_STATES, type AgentLifecycleState, type AgentLifecycleOp
 export type { AgentLifecycleRequest, AgentLifecycleResult } from "./types/agent-lifecycle.js";
 
 export * from "./fast-response.js";
+
+export type { ExecutionResetInspection } from "./types/execution-reset.js";
+export { executionResetRequestSchema, executionResetCommittedResponseSchema,
+  type ExecutionResetRequest, type ExecutionResetCommittedResponse } from "./validators/execution-reset.js";

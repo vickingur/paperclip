@@ -6199,6 +6199,17 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
     expect(row?.executionRunId).toBe(runningRunId);
     expect(row?.executionAgentNameKey).toBe("codexcoder");
     expect(row?.executionLockedAt).toBeInstanceOf(Date);
+
+    await expect(svc.checkout(issueId, agentId, ["in_progress"], randomUUID()))
+      .rejects.toMatchObject({
+        status: 409,
+        details: {
+          checkoutRunId: failedRunId,
+          executionRunId: runningRunId,
+          holdingRunId: runningRunId,
+          holdingRunStatus: "running",
+        },
+      });
   });
 
   it("does not let stale release clobber a successor checkout lock", async () => {

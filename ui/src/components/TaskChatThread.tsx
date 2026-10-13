@@ -1,3 +1,4 @@
+import { ExecutionResetEntry } from "./ExecutionResetDialog";
 import {
   ISSUE_DETAIL_CONTENT_PAINT_MARK,
   ISSUE_DETAIL_CONTENT_MEASURE,
@@ -792,9 +793,10 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   );
 
   const threadHeaderWithBlockers =
-    threadHeader || blockerLinks || liveWorkLinks ? (
+    threadHeader || blockerLinks || liveWorkLinks || props.recoveryAction ? (
       <>
         {threadHeader}
+        {props.recoveryAction && <ExecutionResetEntry />}
         {liveWorkLinks ? (
           <TaskChatLiveWorkLinks liveWork={liveWorkLinks} placement="top" />
         ) : blockerLinks ? (

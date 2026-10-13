@@ -3271,6 +3271,28 @@ describe("gemini ACP flag selection", () => {
 });
 
 describe("ACP activity diagnostics", () => {
+  it("persists completed action evidence in the run result without tool content", async () => {
+    const root = await makeTempRoot(), cwd = path.join(root, "worktree");
+    await fs.mkdir(cwd, { recursive: true });
+    const execute = createAcpxEngineExecutor({
+      createRuntime: () => ({ ...buildRuntime(), startTurn: () => ({
+        events: (async function* () {
+          yield { type: "tool_call", toolCallId: "action-1", kind: "execute", status: "in_progress", title: "private-command-content" };
+          yield { type: "tool_call", toolCallId: "action-1", status: "completed", tag: "tool_call_update" };
+        })(),
+        result: Promise.resolve({ status: "failed", error: new Error("provider failed after completed action") }),
+        cancel: async () => {},
+      }) }) as never,
+    });
+    const result = await execute({ runId: "completed-action-evidence", agent: { id: "agent-1", companyId: "company-1" }, runtime: {},
+      config: { agent: "custom", agentCommand: "node ./fake-acp.js", stateDir: path.join(root, "state"), cwd },
+      context: {}, onMeta: async () => {}, onLog: async () => {} } as never);
+    expect(result.resultJson?.executionActionInventory).toEqual({
+      schema: "paperclip.execution-actions.v1", source: "acp", complete: true, dispatch: "attempted", noActionsConfirmed: false,
+      actions: [{ id: "action-1", kind: "execute", status: "completed", outcome: "completed" }],
+    });
+    expect(JSON.stringify(result.resultJson?.executionActionInventory)).not.toContain("private-command-content");
+  });
   it("classifies rejected definitions before redaction and overrides a transient adapter label", async () => {
     const root = await makeTempRoot(), cwd = path.join(root, "worktree");
     await fs.mkdir(cwd, { recursive: true });
@@ -3334,6 +3356,16 @@ describe("ACP activity diagnostics", () => {
         acpObservedEventCount: outcome === "no_events" ? 0 : 6,
         acpPendingToolCount: outcome === "no_events" ? 0 : 1,
         acpToolInventoryComplete: outcome === "no_events",
+      });
+      expect(result.resultJson?.executionActionInventory).toMatchObject({
+        schema: "paperclip.execution-actions.v1", source: "acp", complete: outcome === "no_events",
+        dispatch: "attempted", noActionsConfirmed: false,
+        actions: outcome === "no_events" ? [] : [
+          { id: "private-pending-id", kind: "execute", status: "in_progress", outcome: "unknown" },
+          { id: "private-done-id", kind: "read", status: "completed", outcome: "completed" },
+          { id: "private-cancelled-id", kind: null, status: "cancelled", outcome: "unknown" },
+          { id: "private-failed-id", kind: null, status: "failed", outcome: "unknown" },
+        ],
       });
       if (outcome === "no_events") expect(result.resultJson).not.toHaveProperty("acpLastEventAgeMs");
       else expect(result.resultJson?.acpLastEventAgeMs).toBe(9000);

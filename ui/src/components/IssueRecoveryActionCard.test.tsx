@@ -5,6 +5,7 @@ import { flushSync } from "react-dom";
 import type { AnchorHTMLAttributes, ReactElement } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Agent, IssueRecoveryAction } from "@paperclipai/shared";
+import { ExecutionResetProvider } from "./ExecutionResetDialog";
 import { IssueRecoveryActionCard, deriveRecoveryCardState } from "./IssueRecoveryActionCard";
 
 vi.mock("@/lib/router", () => ({
@@ -1160,4 +1161,14 @@ it("requires export retry for ordinary restoration while keeping explicit board 
   expect(document.body.textContent).not.toContain("Mark task done");
   expect(document.body.textContent).not.toContain("Send for review");
   expect(document.body.textContent).toContain("False positive, done");
+});
+
+describe("execution reset entry integration", () => {
+  it.each([true, false])("gates hidden execution holds by board context %s", allowed => {
+    const node = render(<ExecutionResetProvider value={{ issueId: "synthetic-issue", agentId: ownerAgent.id, allowed, pauseReason: null, onQueued: vi.fn() }}>
+      <IssueRecoveryActionCard action={buildAction({ cause: "legacy_execution_requires_reconciliation" })} />
+    </ExecutionResetProvider>);
+    expect(node.textContent?.includes("Inspect reset…")).toBe(allowed);
+    expect(node.textContent?.includes("Execution hold")).toBe(allowed);
+  });
 });
