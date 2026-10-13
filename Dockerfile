@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1.20
-FROM node:24-trixie-slim AS base
+FROM node:24-trixie-slim@sha256:173f125896c3b47ddf056734c7ea789d04595a6a08769a8f78e0df642781fb66 AS base
 ARG USER_UID=1000
 ARG USER_GID=1000
 RUN apt-get update \
@@ -204,6 +204,25 @@ RUN apt-get update \
     && chmod -R a+rX "/opt/blender-${BLENDER_VERSION}-linux-x64" \
     && ln -s "/opt/blender-${BLENDER_VERSION}-linux-x64/blender" /usr/local/bin/blender; \
   fi
+
+# Fork qualification tools: cached independently of the application copy.
+# Reuse the runner-owned compiler pin; exclude cargo-chef, caches and targets.
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends build-essential pkg-config \
+  && rm -rf /var/lib/apt/lists/*
+COPY --from=rust-toolchain /usr/local/rustup /usr/local/rustup
+COPY --from=rust-toolchain /usr/local/cargo/bin/rustup /usr/local/qualification/bin/rustup
+RUN chmod -R a+rX /usr/local/rustup \
+  && for proxy in cargo rustc rustdoc rustfmt cargo-fmt; do \
+    ln -s rustup "/usr/local/qualification/bin/$proxy"; \
+  done
+ENV RUSTUP_HOME=/usr/local/rustup \
+    PATH=/usr/local/qualification/bin:$PATH
+COPY scripts/qualify-runtime.py /usr/local/bin/qualify-runtime.py
+COPY packages/paperclip-runner/rust-toolchain.toml /usr/local/share/qualification/rust-toolchain.toml
+# Verify immutable compiler/header access with a writable private Cargo home.
+# Actual remapped runtime UID/architecture acceptance remains a separate check.
+RUN gosu node python3 /usr/local/bin/qualify-runtime.py smoke
 
 COPY scripts/docker-entrypoint.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
