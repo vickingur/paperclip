@@ -14,10 +14,10 @@ const ERROR = "legacy_disposition_repair_suppressed";
 
 /** Only the executor writes this at the boundary preceding adapter handoff.
  * A cancellation message or an empty action summary is never a substitute. */
-export function dispositionSuppressionReceipt(run: Run, reason: string) {
+export function dispositionSuppressionReceipt(run: Run, reason: string, boundaryAt = new Date()) {
   return { schema: "paperclip.disposition-suppression.v1", companyId: run.companyId,
     runId: run.id, issueId: run.contextSnapshot?.issueId, reason,
-    providerDispatchStarted: false, boundaryAt: new Date().toISOString() };
+    providerDispatchStarted: false, boundaryAt: boundaryAt.toISOString() };
 }
 
 export async function isLegacyDispositionSuppressionVerified(db: Db, run: Run): Promise<boolean> {

@@ -1772,7 +1772,7 @@ const support = await getEmbeddedPostgresTestSupport();
     return f;
   }
 
-  it("records suppression at actual handoff, completes cleanup and runs one normal successor", async () => {
+  it("records suppression at actual handoff with one timestamp despite an advancing clock, completes cleanup and runs one normal successor", async () => {
     const f = await seed();
     await db.delete(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, f.sourceRunId));
     await db.delete(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
@@ -1781,10 +1781,22 @@ const support = await getEmbeddedPostgresTestSupport();
     await db.update(issues).set({ status: "todo", responsibleUserId: "board" }).where(eq(issues.id, f.issueId));
     const originalRecovery = recoveryModule.recoveryService;
     let suppressed = false;
+    const RealDate = Date;
+    let clockReads = 0;
+    class AdvancingDate extends RealDate {
+      constructor(value?: string | number) {
+        super(value === undefined ? RealDate.now() + clockReads++ : value);
+      }
+    }
     const recoveryFactory = vi.spyOn(recoveryModule, "recoveryService").mockImplementation((...args) => {
       const service = originalRecovery(...args);
       return { ...service, legacyRepairDispatchBlock: async runId => {
-        if (!suppressed) { suppressed = true; return "recorded_disposition"; }
+        if (!suppressed) {
+          suppressed = true;
+          // Force a millisecond tick between every timestamp read at handoff.
+          vi.stubGlobal("Date", AdvancingDate);
+          return "recorded_disposition";
+        }
         return service.legacyRepairDispatchBlock(runId);
       } };
     });
@@ -1803,6 +1815,8 @@ const support = await getEmbeddedPostgresTestSupport();
       expect(cancelled).toMatchObject({ status: "cancelled", errorCode: "legacy_disposition_repair_suppressed",
         resultJson: { dispositionSuppression: { reason: "recorded_disposition", providerDispatchStarted: false } } });
       expect(execution).not.toHaveBeenCalled();
+      expect(clockReads).toBeGreaterThan(1);
+      expect((cancelled.resultJson!.dispositionSuppression as { boundaryAt: string }).boundaryAt).toBe(cancelled.finishedAt!.toISOString());
       expect(await isLegacyDispositionSuppressionVerified(db, cancelled)).toBe(true);
       expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toBeNull();
       await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, f.issueId));
@@ -1818,7 +1832,7 @@ const support = await getEmbeddedPostgresTestSupport();
       const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId));
       expect(runs).toHaveLength(2);
       expect(runs.filter(run => run.status === "succeeded")).toHaveLength(1);
-    } finally { await heartbeat.drainActiveRunExecutions(); recoveryFactory.mockRestore(); execution.mockRestore(); }
+    } finally { await heartbeat.drainActiveRunExecutions(); vi.stubGlobal("Date", RealDate); recoveryFactory.mockRestore(); execution.mockRestore(); }
   });
 
   async function seedSuppressedDisposition() {

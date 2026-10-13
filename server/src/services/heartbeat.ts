@@ -3531,13 +3531,14 @@ export function heartbeatService(
           return { dispatched: false };
         const repairBlock = await recovery.legacyRepairDispatchBlock(run.id);
         if (repairBlock) {
+          const suppressedAt = new Date();
           const cancelled = await setRunStatusIfRunning(run.id, "cancelled", {
-            finishedAt: new Date(), errorCode: "legacy_disposition_repair_suppressed",
+            finishedAt: suppressedAt, errorCode: "legacy_disposition_repair_suppressed",
             error: `Disposition repair suppressed: ${repairBlock}`,
             ...(!legacyAdapterEntered && !nativeDispatchStarted && !nativeOwnershipHeld ? { resultJson: {
-              dispositionSuppression: dispositionSuppressionReceipt(run, repairBlock),
+              dispositionSuppression: dispositionSuppressionReceipt(run, repairBlock, suppressedAt),
               cancellation: { source: "control_plane", expected: true, initiator: { type: "system" },
-                reason: "Disposition repair suppressed before provider dispatch", recordedAt: new Date().toISOString() },
+                reason: "Disposition repair suppressed before provider dispatch", recordedAt: suppressedAt.toISOString() },
             } } : {}),
           });
           if (cancelled.updated) {
