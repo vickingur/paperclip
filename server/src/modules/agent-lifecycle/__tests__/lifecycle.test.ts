@@ -234,6 +234,21 @@ const support = await getEmbeddedPostgresTestSupport();
     expect((await current(agent.id)).lifecycleOperation).not.toHaveProperty("stopBlocker");
   });
 
+  it("persists resume intent on pre-operation rows and leaves unchanged policy scans read-only", async () => {
+    const agent = await hire(); const store = createLifecycleStore(db);
+    const writes = vi.spyOn(db, "update");
+    try {
+      await store.change(agent.id, "reconcile");
+      expect(writes.mock.calls.filter(([table]) => table === agents)).toHaveLength(0);
+    } finally { writes.mockRestore(); }
+    await db.update(agents).set({ lifecycleState: "pausing", lifecycleOperation: null,
+      lifecycleHolds: ["manual"], pauseReason: "manual" }).where(eq(agents.id, agent.id));
+    expect(await store.change(agent.id, "resume", { reason: "user" })).toMatchObject({
+      lifecycleState: "pausing", lifecycleHolds: [], lifecycleOperation: { resumePending: true, hostComplete: false },
+    });
+    expect((await current(agent.id)).lifecycleOperation?.resumePending).toBe(true);
+  });
+
   it("fences stale diagnostics and caps old-operation rechecks at one minute", async () => {
     const agent = await hire(); const store = createLifecycleStore(db);
     await createAgentLifecycle(db).pauseAgent(agent.id);

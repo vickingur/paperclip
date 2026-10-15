@@ -82,11 +82,18 @@ export function createLifecycleStore(db: Db, effects: LifecycleEffects): Lifecyc
         if (next === agent.lifecycleState) {
           const resumePending = agent.lifecycleState === "pausing" && holds.length === 0 &&
             (command === "resume" || agent.lifecycleOperation?.resumePending === true);
-          const [updated] = await tx.update(agents).set({ lifecycleHolds: holds, pauseReason: holds[0] ?? null,
-            lifecycleOperation: agent.lifecycleOperation
-              ? { ...agent.lifecycleOperation, resumePending } : agent.lifecycleOperation,
-          }).where(eq(agents.id, id)).returning();
-          return updated;
+          const operation = resumePending && !agent.lifecycleOperation
+            ? { id: randomUUID(), hostComplete: false, completedPluginIds: [], attempts: 0, resumePending }
+            : agent.lifecycleOperation && resumePending !== (agent.lifecycleOperation.resumePending === true)
+              ? { ...agent.lifecycleOperation, resumePending } : agent.lifecycleOperation;
+          if (JSON.stringify(holds) !== JSON.stringify(agent.lifecycleHolds) ||
+              agent.pauseReason !== (holds[0] ?? null) || operation !== agent.lifecycleOperation) {
+            const [updated] = await tx.update(agents).set({ lifecycleHolds: holds, pauseReason: holds[0] ?? null,
+              lifecycleOperation: operation,
+            }).where(eq(agents.id, id)).returning();
+            return updated;
+          }
+          return agent;
         }
         const operation: AgentLifecycleOperation = {
           responsibleUserId: agent.lifecycleOperation?.responsibleUserId,
