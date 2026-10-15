@@ -3,7 +3,8 @@ import { createAgentLifecycleEffects } from "../../../services/agent-lifecycle.j
 import { deleteCompany } from "../../../services/company-deletion.js";
 import { agentLifecycleCompanyDeletion } from "../company-deletion.js";
 import { requireServerAdapter } from "../../../adapters/index.js";
-import { agentExecutionsHaveStopped } from "../../../services/agent-execution-stop.js";
+import * as hotRestart from "../../../services/hot-restart.js";
+import { agentExecutionsHaveStopped, getAgentExecutionStopBlocker } from "../../../services/agent-execution-stop.js";
 import { remoteTerminationReceipt } from "../../../services/remote-execution-termination.js";
 import { approvalService } from "../../../services/approvals.js";
 import { updateAgentConfigurationInTransaction } from "../../../services/agent-configuration-transaction.js";
@@ -16,11 +17,11 @@ import { errorHandler } from "../../../middleware/error-handler.js";
 import { createLifecycleDriver } from "../../../services/agent-lifecycle-driver.js";
 import { randomUUID } from "node:crypto";
 import { and, eq, sql } from "drizzle-orm";
-import { agents, approvals, projects, issues, heartbeatRuns, nativeRunFinalizations, budgetPolicies, environmentLeases, agentApiKeys, activityLog, agentConfigRevisions, userCompanyPreferences, companies, companyMemberships, principalPermissionGrants, plugins, pluginCompanySettings, createDb, type Db } from "@paperclipai/db";
+import { agents, approvals, projects, issues, heartbeatRuns, heartbeatRunEvents, nativeRunFinalizations, budgetPolicies, environmentLeases, agentApiKeys, activityLog, agentConfigRevisions, userCompanyPreferences, companies, companyMemberships, principalPermissionGrants, plugins, pluginCompanySettings, createDb, type Db } from "@paperclipai/db";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../../__tests__/helpers/embedded-postgres.js";
 import { createAgentLifecycle, configureAgentLifecycle } from "../../../services/agent-lifecycle.js";
-import { createLifecycleStore as createStore } from "../adapters/postgres.js";
+import { createLifecycleStore as createStore, recordLifecycleStopBlocker } from "../adapters/postgres.js";
 import { transition } from "../domain/policy.js";
 import type { LifecycleAgent } from "../application/ports.js";
 import { budgetService } from "../../../services/budgets.js";
@@ -113,6 +114,140 @@ const support = await getEmbeddedPostgresTestSupport();
       expect(await current(agent.id)).toMatchObject({ lifecycleState: "verifying",
         lifecycleError: "The lifecycle step failed (failureCode=harness_test_failed; verificationSubstage=provider_test). Retry the operation." });
     } finally { probe.mockRestore(); }
+  });
+
+  async function historicalRun(agentId: string) {
+    const [run] = await db.insert(heartbeatRuns).values({ companyId, agentId,
+      status: "cancelled", invocationSource: "on_demand", runtimeMode: "legacy",
+      startedAt: new Date(Date.now() - 2000), finishedAt: new Date(Date.now() - 1000),
+      executionStage: "settled", controllerBootId: randomUUID(), exitCode: 0,
+      runnerProfileJson: { adapterDispatch: { adapterType: "codex_local" } },
+      resultJson: { executionRecovery: { kind: "interrupted", providerStopped: true, actionOutcomes: "settled" } },
+    }).returning();
+    await db.insert(heartbeatRunEvents).values({ companyId, agentId, runId: run.id, seq: 1,
+      eventType: "lifecycle", message: "run cancelled", payload: { status: "cancelled", exitCode: 0 } });
+    return run;
+  }
+
+  it("accepts exact historical completion without fabricating a cancellation acknowledgement", async () => {
+    const agent = await hire();
+    const run = await historicalRun(agent.id);
+    expect(await agentExecutionsHaveStopped(db, [agent.id])).toBe(true);
+    expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id)))[0].resultJson)
+      .toEqual(run.resultJson);
+    // A later dispatch invalidates the earlier completion even if externally sourced.
+    await db.insert(heartbeatRunEvents).values({ companyId, agentId: agent.id, runId: run.id, seq: 2,
+      sourceEventId: "later-dispatch", eventType: "adapter.invoke", payload: { adapterType: "codex_local" } });
+    expect(await getAgentExecutionStopBlocker(db, [agent.id])).toEqual({ runId: run.id, reason: "stop_proof_missing" });
+  });
+
+  it.each(["provider", "event", "exit", "settlement", "adapter", "pending_tools", "event_source", "exit_mismatch", "event_before_finish"])(
+    "keeps missing or contradictory historical %s evidence fail-closed", async missing => {
+      const agent = await hire(); const run = await historicalRun(agent.id);
+      if (missing === "event_source") await db.update(heartbeatRunEvents).set({ sourceEventId: "untrusted-completion" }).where(eq(heartbeatRunEvents.runId, run.id));
+      if (missing === "exit_mismatch") await db.update(heartbeatRunEvents).set({ payload: { status: "cancelled", exitCode: 1 } }).where(eq(heartbeatRunEvents.runId, run.id));
+      if (missing === "event_before_finish") await db.update(heartbeatRunEvents).set({ createdAt: new Date(0) }).where(eq(heartbeatRunEvents.runId, run.id));
+      if (missing === "provider") await db.update(heartbeatRuns).set({ resultJson: {} }).where(eq(heartbeatRuns.id, run.id));
+      if (missing === "event") await db.delete(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, run.id));
+      if (missing === "exit") await db.update(heartbeatRuns).set({ exitCode: null }).where(eq(heartbeatRuns.id, run.id));
+      if (missing === "settlement") await db.update(heartbeatRuns).set({ executionStage: "executing" }).where(eq(heartbeatRuns.id, run.id));
+      if (missing === "adapter") await db.update(heartbeatRuns).set({ runnerProfileJson: {} }).where(eq(heartbeatRuns.id, run.id));
+      if (missing === "pending_tools") await db.update(heartbeatRuns).set({ resultJson: { ...run.resultJson, acpPendingToolCount: 1 } }).where(eq(heartbeatRuns.id, run.id));
+      expect(await getAgentExecutionStopBlocker(db, [agent.id])).toEqual({ runId: run.id, reason: "stop_proof_missing" });
+    });
+
+  it("checks live identity, group, controller lease, and cleanup before historical proof", async () => {
+    const agent = await hire(); const run = await historicalRun(agent.id);
+    await db.update(heartbeatRuns).set({ processPid: process.pid }).where(eq(heartbeatRuns.id, run.id));
+    expect(await getAgentExecutionStopBlocker(db, [agent.id])).toMatchObject({ runId: run.id, reason: "process_running" });
+    await db.update(heartbeatRuns).set({ processStartedAt: new Date() }).where(eq(heartbeatRuns.id, run.id));
+    const unreadable = vi.spyOn(hotRestart, "readProcessStartedAt").mockResolvedValue(null);
+    try { expect(await getAgentExecutionStopBlocker(db, [agent.id])).toMatchObject({ reason: "process_running" }); }
+    finally { unreadable.mockRestore(); }
+
+    await db.update(heartbeatRuns).set({ processPid: null, processGroupId: process.pid }).where(eq(heartbeatRuns.id, run.id));
+    // A synthetic live group must block, without signalling another process.
+    const probe = vi.spyOn(process, "kill").mockImplementation((pid) => {
+      if (pid < 0) return true;
+      throw Object.assign(new Error("absent"), { code: "ESRCH" });
+    });
+    try { expect(await getAgentExecutionStopBlocker(db, [agent.id])).toMatchObject({ reason: "process_running" }); }
+    finally { probe.mockRestore(); }
+    await db.update(heartbeatRuns).set({ processGroupId: null, controllerLeaseExpiresAt: new Date(Date.now() + 60_000) }).where(eq(heartbeatRuns.id, run.id));
+    expect(await getAgentExecutionStopBlocker(db, [agent.id])).toMatchObject({ reason: "controller_lease" });
+    await db.update(heartbeatRuns).set({ controllerLeaseExpiresAt: null }).where(eq(heartbeatRuns.id, run.id));
+    const [lease] = await db.insert(environmentLeases).values({ companyId, heartbeatRunId: run.id,
+      provider: "local", status: "active", metadata: { agentId: agent.id } }).returning();
+    expect(await getAgentExecutionStopBlocker(db, [agent.id])).toEqual({ runId: run.id, leaseId: lease.id, reason: "environment_cleanup" });
+    await db.update(environmentLeases).set({ releasedAt: new Date(), cleanupStatus: "failed" }).where(eq(environmentLeases.id, lease.id));
+    expect(await agentExecutionsHaveStopped(db, [agent.id])).toBe(false);
+    await db.update(environmentLeases).set({ status: "released", cleanupStatus: "success" }).where(eq(environmentLeases.id, lease.id));
+    expect(await agentExecutionsHaveStopped(db, [agent.id])).toBe(true);
+  });
+
+  it("persists resume intent, returns the blocker through HTTP, and bounds unchanged rechecks", async () => {
+    const agent = await hire(); const run = await historicalRun(agent.id);
+    await db.update(heartbeatRuns).set({ resultJson: {} }).where(eq(heartbeatRuns.id, run.id));
+    const lifecycle = createAgentLifecycle(db);
+    await lifecycle.pauseAgent(agent.id);
+    const store = createLifecycleStore(db);
+    const driver = createLifecycleDriver(db, {} as never);
+    const first = await store.claim(agent.id, "owner", new Date());
+    expect(await driver.runHost(first!)).toBe("pending");
+    const expected = { runId: run.id, reason: "stop_proof_missing" };
+    expect((await current(agent.id)).lifecycleOperation?.stopBlocker).toEqual(expected);
+    const now = new Date();
+    await store.defer(first!, "owner", null, now);
+    expect(await store.claim(agent.id, "early", new Date(now.getTime() + 1000))).toBeNull();
+    const again = await store.claim(agent.id, "again", new Date(now.getTime() + 3000));
+    expect(again).not.toBeNull();
+    const writes = vi.spyOn(db, "update");
+    try {
+      expect(await driver.runHost(again!)).toBe("pending");
+      expect(writes.mock.calls.filter(([table]) => table === agents)).toHaveLength(0);
+    } finally { writes.mockRestore(); }
+    await store.defer(again!, "again", null, now);
+    expect(Date.parse((await current(agent.id)).lifecycleOperation!.retryAt!) - now.getTime()).toBe(4000);
+    const stored = await store.change(agent.id, "resume", { reason: "user" });
+    expect(stored).toMatchObject({ lifecycleState: "pausing", lifecycleHolds: [], lifecycleOperation: { resumePending: true, stopBlocker: expected } });
+    const app = express(); app.use(express.json());
+    app.use((req, _res, next) => { req.actor = { type: "board", source: "session", userId: "board", companyIds: [companyId],
+      memberships: [{ companyId, membershipRole: "admin", status: "active" }] }; next(); });
+    app.use("/api", agentRoutes(db)); app.use(errorHandler);
+    await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: "board", membershipRole: "admin" });
+    await db.insert(principalPermissionGrants).values(["agents:create", "agents:configure"].map(permissionKey => ({ companyId, principalType: "user", principalId: "board", permissionKey })));
+    const response = await request(app).post(`/api/agents/${agent.id}/resume`).send({});
+    expect(response.status, JSON.stringify(response.body)).toBe(200);
+    expect(response.body).toMatchObject({ lifecycleState: "pausing", lifecycleResumePending: true, lifecycleStopBlocker: expected });
+    expect(response.body).not.toHaveProperty("lifecycleOperation");
+    // A changed blocker replaces the old diagnosis even while intent is pending.
+    await db.update(heartbeatRuns).set({ processPid: process.pid }).where(eq(heartbeatRuns.id, run.id));
+    const next = await store.claim(agent.id, "next", new Date(now.getTime() + 10_000));
+    expect(await driver.runHost(next!)).toBe("pending");
+    expect((await current(agent.id)).lifecycleOperation).toMatchObject({ resumePending: true, stopBlocker: { runId: run.id, reason: "process_running" } });
+    await store.defer(next!, "next", null, now);
+    await db.update(heartbeatRuns).set({ processPid: null, resultJson: run.resultJson }).where(eq(heartbeatRuns.id, run.id));
+    await lifecycle.retry(agent.id);
+    const work = worker(async snapshot => snapshot.lifecycleState === "pausing" ? driver.runHost(snapshot) : "complete");
+    await work.process(agent.id);
+    expect(await current(agent.id)).toMatchObject({ lifecycleState: "ready", lifecycleHolds: [] });
+    expect((await current(agent.id)).lifecycleOperation).not.toHaveProperty("stopBlocker");
+  });
+
+  it("fences stale diagnostics and caps old-operation rechecks at one minute", async () => {
+    const agent = await hire(); const store = createLifecycleStore(db);
+    await createAgentLifecycle(db).pauseAgent(agent.id);
+    const snapshot = (await store.claim(agent.id, "owner", new Date()))!;
+    const blocker = { runId: randomUUID(), reason: "stop_proof_missing" };
+    await recordLifecycleStopBlocker(db, snapshot, blocker);
+    snapshot.lifecycleOperation!.attempts = 4000;
+    const now = new Date();
+    await store.defer(snapshot, "owner", null, now);
+    expect(Date.parse((await current(agent.id)).lifecycleOperation!.retryAt!) - now.getTime()).toBe(60_000);
+    await recordLifecycleStopBlocker(db, snapshot, { ...blocker, reason: "stale" });
+    expect((await current(agent.id)).lifecycleOperation!.stopBlocker).toEqual(blocker);
+    expect(await store.claim(agent.id, "too-early", new Date(now.getTime() + 59_999))).toBeNull();
+    expect(await store.claim(agent.id, "due", new Date(now.getTime() + 60_000))).not.toBeNull();
   });
 
   it("recovers an expired native owner only after the cancelled run and controller stop", async () => {

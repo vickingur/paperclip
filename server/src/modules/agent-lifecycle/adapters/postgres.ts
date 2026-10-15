@@ -4,7 +4,30 @@ import { agents, agentApiKeys, companies, budgetPolicies, type Db } from "@paper
 import type { AgentLifecycleOperation } from "@paperclipai/shared";
 import { AgentLifecycleConflict, compatibilityStatus, transition } from "../domain/policy.js";
 import type { LifecycleEffects } from "./effects.js";
-import type { LifecycleStore } from "../application/ports.js";
+import type { LifecycleAgent, LifecycleStore } from "../application/ports.js";
+
+/** Worker-owned diagnostics only; preserve concurrently committed resume intent.
+ * Stable blockers do not create repeated writes or failure log entries. */
+export async function recordLifecycleStopBlocker(db: Db, agent: LifecycleAgent,
+  blocker: NonNullable<AgentLifecycleOperation["stopBlocker"]> | null) {
+  if (JSON.stringify(blocker) !== JSON.stringify(agent.lifecycleOperation?.stopBlocker ?? null)) {
+    await db.update(agents).set({ lifecycleOperation: blocker
+      ? sql`jsonb_set(${agents.lifecycleOperation}, '{stopBlocker}', ${JSON.stringify(blocker)}::jsonb)`
+      : sql`${agents.lifecycleOperation} - 'stopBlocker'`,
+    }).where(and(eq(agents.id, agent.id), eq(agents.lifecycleVersion, agent.lifecycleVersion),
+      sql`${agents.lifecycleOperation}->>'leaseOwner' = ${agent.lifecycleOperation!.leaseOwner}`));
+  }
+  if (agent.lifecycleOperation) {
+    if (blocker) agent.lifecycleOperation.stopBlocker = blocker;
+    else delete agent.lifecycleOperation.stopBlocker;
+  }
+}
+
+function pendingDelay(agent: LifecycleAgent, error: string | null) {
+  if (error) return 60_000;
+  if (!agent.lifecycleOperation?.stopBlocker) return 2_000;
+  return Math.min(60_000, 2_000 * 2 ** Math.min(5, Math.max(0, agent.lifecycleOperation.attempts - 1)));
+}
 
 export function assertRootDatabase(db: Db) {
   if ("nestedIndex" in db) throw new AgentLifecycleConflict("Lifecycle commands require the root database connection");
@@ -57,10 +80,13 @@ export function createLifecycleStore(db: Db, effects: LifecycleEffects): Lifecyc
         if (command === "complete" && next === "ready" && holds.length) next = "pausing";
         if (command === "complete" && next === "paused" && !holds.length) next = "resuming";
         if (next === agent.lifecycleState) {
-          if (JSON.stringify(holds) !== JSON.stringify(agent.lifecycleHolds) || agent.pauseReason !== (holds[0] ?? null)) {
-            await tx.update(agents).set({ lifecycleHolds: holds, pauseReason: holds[0] ?? null }).where(eq(agents.id, id));
-          }
-          return agent;
+          const resumePending = agent.lifecycleState === "pausing" && holds.length === 0 &&
+            (command === "resume" || agent.lifecycleOperation?.resumePending === true);
+          const [updated] = await tx.update(agents).set({ lifecycleHolds: holds, pauseReason: holds[0] ?? null,
+            lifecycleOperation: agent.lifecycleOperation
+              ? { ...agent.lifecycleOperation, resumePending } : agent.lifecycleOperation,
+          }).where(eq(agents.id, id)).returning();
+          return updated;
         }
         const operation: AgentLifecycleOperation = {
           responsibleUserId: agent.lifecycleOperation?.responsibleUserId,
@@ -134,7 +160,7 @@ export function createLifecycleStore(db: Db, effects: LifecycleEffects): Lifecyc
       const rows = await db.update(agents).set({
         lifecycleError: error,
         lifecycleOperation: sql`(${agents.lifecycleOperation} - 'leaseOwner' - 'leaseUntil')
-          || jsonb_build_object('retryAt', ${new Date(now.getTime() + (error ? 60_000 : 2_000)).toISOString()}::text)`,
+          || jsonb_build_object('retryAt', ${new Date(now.getTime() + pendingDelay(agent, error)).toISOString()}::text)`,
         updatedAt: now,
       }).where(and(eq(agents.id, agent.id), eq(agents.lifecycleVersion, agent.lifecycleVersion),
         sql`${agents.lifecycleOperation}->>'leaseOwner' = ${owner}`)).returning({ id: agents.id });

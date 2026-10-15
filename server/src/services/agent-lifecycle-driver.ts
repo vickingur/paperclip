@@ -4,6 +4,7 @@ import { heartbeatService } from "./heartbeat.js";
 import { listInvalidOrgChainDescendantIds } from "./agent-invokability.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 import type { LifecycleDriver } from "../modules/agent-lifecycle/index.js";
+import { recordLifecycleStopBlocker } from "../modules/agent-lifecycle/adapters/postgres.js";
 import { agentHarnessVerificationService } from "./agent-harness-verification.js";
 
 export function createLifecycleDriver(db: Db, manager: PluginWorkerManager): LifecycleDriver {
@@ -42,7 +43,9 @@ export function createLifecycleDriver(db: Db, manager: PluginWorkerManager): Lif
         const companyAgents = await db.select().from(agents).where(eq(agents.companyId, agent.companyId));
         const ids = agent.lifecycleState === "pausing" ? [agent.id]
           : [agent.id, ...listInvalidOrgChainDescendantIds(agent.id, companyAgents)];
-        if (!await heartbeat.stopInvocationsForAgents(ids, "Agent lifecycle stop requested")) return "pending";
+        const blocker = await heartbeat.stopInvocationsForAgentsWithDiagnostics(ids, "Agent lifecycle stop requested");
+        await recordLifecycleStopBlocker(db, agent, blocker);
+        if (blocker) return "pending";
       }
       return "complete";
     },
