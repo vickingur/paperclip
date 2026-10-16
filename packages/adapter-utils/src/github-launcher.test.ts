@@ -91,6 +91,29 @@ describe("managed GitHub launchers", () => {
     }
   }, 15_000);
 
+  it("fetches managed credentials only for git network commands", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-lazy-"));
+    cleanups.push(() => rm(root, { recursive: true, force: true }));
+    const bin = path.join(root, "managed");
+    await mkdir(bin);
+    await exec("git", ["init", path.join(root, "repo")]);
+    await writeFile(path.join(bin, "git"), githubLauncherSource(), { mode: 0o700 });
+    let requests = 0;
+    const server = createServer((_req, res) => { requests += 1; res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ status: "unavailable", reason: "test" })); });
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    cleanups.push(() => new Promise<void>(resolve => server.close(() => resolve())));
+    const { port } = server.address() as { port: number };
+    const env = { ...process.env, ...githubBrokerEnvironment({}, { url: `http://127.0.0.1:${port}`, token: "capability" }),
+      GH_CONFIG_DIR: path.join(root, "config"), PATH: `${bin}:${process.env.PATH}` };
+    const git = (...args: string[]) => exec(path.join(bin, "git"), args, { cwd: path.join(root, "repo"), env });
+    await git("status", "--porcelain");
+    await git("-c", "user.name=T", "-c", "user.email=t@example.test", "commit", "--allow-empty", "-m", "local");
+    await git("log", "-1", "--format=%s");
+    expect(requests).toBe(0);
+    await git("ls-remote", path.join(root, "repo")).catch(() => undefined);
+    expect(requests).toBe(1);
+  }, 15_000);
+
   it("explains unavailable access while allowing local work without credentials", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-diagnostic-"));
     cleanups.push(() => rm(root, {recursive:true,force:true}));

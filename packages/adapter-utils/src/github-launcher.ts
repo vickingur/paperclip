@@ -67,9 +67,24 @@ async function main() {
       GIT_CONFIG_KEY_4: 'user.useConfigOnly', GIT_CONFIG_VALUE_4: 'true',
     });
     const base = env.PAPERCLIP_GITHUB_BROKER_URL || env.PAPERCLIP_API_URL;
+    // Local Git commands (init, status, commit, log, ...) never talk to GitHub. Fetching
+    // credentials for each of them turned test suites and builds into thousands of broker
+    // requests per minute. Only network subcommands and gh need the managed identity.
+    const needsCredentials = program === 'gh' || (() => {
+      const args = process.argv.slice(2);
+      for (let i = 0; i < args.length; i++) {
+        const a = args[i];
+        if (a === '-C' || a === '-c' || a === '--git-dir' || a === '--work-tree' || a === '--namespace' || a === '--exec-path' || a === '--config-env') { i++; continue; }
+        if (a.startsWith('-')) continue;
+        return ['clone', 'fetch', 'pull', 'push', 'ls-remote', 'submodule', 'remote', 'archive', 'request-pull', 'lfs', 'fetch-pack', 'send-pack', 'remote-https', 'remote-http', 'credential'].includes(a);
+      }
+      return true; // no subcommand found: keep the managed identity
+    })();
     try {
     let response;
-    if (base && env.PAPERCLIP_GITHUB_BROKER_TOKEN) {
+    if (!needsCredentials) {
+      // Local operation: keep the scrubbed, credential-free environment.
+    } else if (base && env.PAPERCLIP_GITHUB_BROKER_TOKEN) {
       const url = base.replace(/\/+$/, '').replace(/\/api$/, '') + '/runtime-tools/github/credentials';
       // A slow or restarting control plane must not cost the operation its
       // managed identity, so a failed request is retried before giving up.
