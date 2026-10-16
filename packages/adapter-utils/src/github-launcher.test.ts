@@ -110,9 +110,23 @@ describe("managed GitHub launchers", () => {
     await git("-c", "user.name=T", "-c", "user.email=t@example.test", "commit", "--allow-empty", "-m", "local");
     await git("log", "-1", "--format=%s");
     expect(requests).toBe(0);
-    await git("ls-remote", path.join(root, "repo")).catch(() => undefined);
+    // Network commands against local repositories (test fixtures) stay credential-free.
+    await exec("git", ["init", "--bare", path.join(root, "origin.git")]);
+    await git("ls-remote", path.join(root, "repo"));
+    await git("remote", "add", "local", path.join(root, "origin.git"));
+    await git("fetch", "local");
+    await git("push", "local", "HEAD:refs/heads/main");
+    await git("remote", "-v");
+    await exec(path.join(bin, "git"), ["clone", "-q", path.join(root, "origin.git"), path.join(root, "copy")], { env });
+    expect(requests).toBe(0);
+    // A GitHub remote, named or explicit, still fetches the managed identity.
+    await git("remote", "add", "origin", "https://github.com/example/repo.git");
     expect(requests).toBe(1);
-  }, 15_000);
+    await git("remote", "get-url", "origin");
+    expect(requests).toBe(2);
+    await git("remote", "set-url", "local", "git@github.com:example/repo.git");
+    expect(requests).toBe(3);
+  }, 30_000);
 
   it("explains unavailable access while allowing local work without credentials", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-diagnostic-"));

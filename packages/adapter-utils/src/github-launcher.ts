@@ -4,7 +4,7 @@ export function githubLauncherSource(): string {
 const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
-const { spawn } = require('node:child_process');
+const { spawn, spawnSync } = require('node:child_process');
 const directory = path.dirname(fs.realpathSync(process.argv[1]));
 const program = path.basename(process.argv[1]);
 // A PATH entry that leads back to a launcher (another run's launcher directory,
@@ -69,16 +69,55 @@ async function main() {
     const base = env.PAPERCLIP_GITHUB_BROKER_URL || env.PAPERCLIP_API_URL;
     // Local Git commands (init, status, commit, log, ...) never talk to GitHub. Fetching
     // credentials for each of them turned test suites and builds into thousands of broker
-    // requests per minute. Only network subcommands and gh need the managed identity.
+    // requests per minute. Only gh and Git network commands that reach GitHub need the
+    // managed identity; fetch, push or clone against a local path (as test fixtures do)
+    // does not. Anything ambiguous keeps the managed identity.
     const needsCredentials = program === 'gh' || (() => {
       const args = process.argv.slice(2);
-      for (let i = 0; i < args.length; i++) {
+      const globalArgs = [];
+      let sub, i = 0;
+      for (; i < args.length; i++) {
         const a = args[i];
-        if (a === '-C' || a === '-c' || a === '--git-dir' || a === '--work-tree' || a === '--namespace' || a === '--exec-path' || a === '--config-env') { i++; continue; }
-        if (a.startsWith('-')) continue;
-        return ['clone', 'fetch', 'pull', 'push', 'ls-remote', 'submodule', 'remote', 'archive', 'request-pull', 'lfs', 'fetch-pack', 'send-pack', 'remote-https', 'remote-http', 'credential'].includes(a);
+        if (a === '-C' || a === '-c' || a === '--git-dir' || a === '--work-tree' || a === '--namespace' || a === '--exec-path' || a === '--config-env') { globalArgs.push(a, args[i + 1]); i++; continue; }
+        if (a.startsWith('-')) { globalArgs.push(a); continue; }
+        sub = a; break;
       }
-      return true; // no subcommand found: keep the managed identity
+      if (sub === undefined) return true; // no subcommand found: keep the managed identity
+      if (!['clone', 'fetch', 'pull', 'push', 'ls-remote', 'submodule', 'remote', 'archive', 'request-pull', 'lfs', 'fetch-pack', 'send-pack', 'remote-https', 'remote-http', 'credential'].includes(sub)) return false;
+      if (!['clone', 'fetch', 'pull', 'push', 'ls-remote', 'remote'].includes(sub)) return true;
+      const hosts = ['github.com', ...(env.GH_HOST ? [env.GH_HOST.toLowerCase()] : [])];
+      const isGitHub = (value) => {
+        const match = /^(?:[a-z][a-z0-9+.-]*:\/\/)?(?:[^@/\s]+@)?([^/:\s]+)[:/]/i.exec(value);
+        return !!match && hosts.includes(match[1].toLowerCase());
+      };
+      const isUrl = (value) => /^[a-z][a-z0-9+.-]*:\/\//i.test(value) || /^[^/\s]+@[^/\s]+:/.test(value);
+      const withValue = ['-o', '--origin', '-b', '--branch', '--depth', '--filter', '-j', '--jobs', '--reference', '--reference-if-able', '--separate-git-dir', '--template', '-u', '--upload-pack', '--receive-pack', '--exec', '--server-option', '--push-option', '--shallow-since', '--shallow-exclude', '--negotiation-tip', '--refmap', '--recurse-submodules-default'];
+      const positional = [];
+      for (i++; i < args.length; i++) {
+        const a = args[i];
+        if (a === '--') { positional.push(...args.slice(i + 1)); break; }
+        if (withValue.includes(a)) { i++; continue; }
+        if (!a.startsWith('-')) positional.push(a);
+      }
+      if (positional.some(isGitHub)) return true;
+      // Named remotes resolve through the repository's own config (a local read).
+      const remotes = new Map();
+      const config = spawnSync(executable, [...globalArgs, 'config', '--get-regexp', '^remote\\..*\\.(url|pushurl)$'], { env, encoding: 'utf8', timeout: 10000 });
+      for (const line of (config.status === 0 ? config.stdout : '').split('\n')) {
+        const space = line.indexOf(' ');
+        if (space < 0) continue;
+        const key = line.slice(0, space);
+        const name = key.slice('remote.'.length, key.lastIndexOf('.'));
+        remotes.set(name, [...(remotes.get(name) || []), line.slice(space + 1).trim()]);
+      }
+      let targets = [];
+      for (const value of positional) {
+        if (remotes.has(value)) targets.push(...remotes.get(value));
+        else if (isUrl(value) || value.includes('/') || value === '.' || value === '..') targets.push(value);
+      }
+      if (targets.length === 0) targets = [...remotes.values()].flat();
+      if (targets.length === 0) return true; // nothing to inspect: keep the managed identity
+      return targets.some(isGitHub);
     })();
     try {
     let response;
