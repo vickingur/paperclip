@@ -13,12 +13,16 @@ it("removes retired backups containing immutable skills without modifying live f
   mkdirSync(live);
   writeFileSync(join(nested, "SKILL.md"), "retired instructions", { mode: 0o444 });
   writeFileSync(join(live, "SKILL.md"), "live instructions", { mode: 0o444 });
+  chmodSync(join(nested, "SKILL.md"), 0o444);
+  chmodSync(join(live, "SKILL.md"), 0o444);
   symlinkSync(live, join(retired, "outside"));
   chmodSync(nested, 0o555);
   chmodSync(join(retired, "claude", "skills"), 0o555);
   chmodSync(retired, 0o555);
   chmodSync(live, 0o555);
   try {
+    expect(lstatSync(join(nested, "SKILL.md")).mode & 0o777).toBe(0o444);
+    expect(lstatSync(join(live, "SKILL.md")).mode & 0o777).toBe(0o444);
     removeNativeHarnessBackup(retired);
     expect(existsSync(retired)).toBe(false);
     expect(readFileSync(join(live, "SKILL.md"), "utf8")).toBe("live instructions");
