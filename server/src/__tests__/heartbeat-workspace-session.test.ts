@@ -600,18 +600,108 @@ describe("assertGitWorktreeBaseWorkspaceReady", () => {
     };
   }
 
+  const canonicalAbsence = "fatal: not a git repository (or any of the parent directories): .git\n";
+  const boundaryAbsence = "fatal: not a git repository (or any parent up to mount point /)\nStopping at filesystem boundary (GIT_DISCOVERY_ACROSS_FILESYSTEM not set).\n";
+
+  async function withControlledGitAbsence(
+    cwd: string,
+    stderr: string,
+    run: () => Promise<void>,
+    options: { metadataError?: string; exitCode?: number; override?: string; preserveMetadata?: boolean } = {},
+  ) {
+    const bin = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-controlled-git-"));
+    const metadataPaths = new Set<string>();
+    let directory = await fs.realpath(cwd);
+    for (;;) {
+      for (const name of [".git", "HEAD", "objects", "refs"]) metadataPaths.add(path.join(directory, name));
+      const parent = path.dirname(directory);
+      if (parent === directory) break;
+      directory = parent;
+    }
+    const originalLstat = fs.lstat.bind(fs);
+    const lstat = vi.spyOn(fs, "lstat").mockImplementation((...args) => {
+      if (!options.preserveMetadata && metadataPaths.has(String(args[0]))) {
+        return Promise.reject(Object.assign(new Error("controlled metadata evidence"), {
+          code: options.metadataError ?? "ENOENT",
+        }));
+      }
+      return originalLstat(...args);
+    });
+    try {
+      // A wrong locale produces a different exit, so successful classification proves LC_ALL=C.
+      await fs.writeFile(path.join(bin, "git"), `#!/bin/sh
+[ "$LC_ALL" = C ] || exit 1
+printf '%s' '${stderr.replaceAll("'", "'\\''")}' >&2
+exit ${options.exitCode ?? 128}
+`, { mode: 0o755 });
+      vi.stubEnv("PATH", bin);
+      for (const name of ["GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR"]) vi.stubEnv(name, "");
+      if (options.override) vi.stubEnv(options.override, "/synthetic/override");
+      await run();
+    } finally {
+      lstat.mockRestore();
+      vi.unstubAllEnvs();
+      await fs.rm(bin, { recursive: true, force: true });
+    }
+  }
+
   it("marks a proven non-Git local path as an owner configuration conflict without changing the failure", async () => {
     const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-local-path-policy-"));
     try {
-      await expect(assertGitWorktreeBaseWorkspaceReady(configuredLocalPathInput(cwd))).rejects.toMatchObject({
-        code: "workspace_validation_failed",
-        message: expect.stringContaining("is not a git checkout"),
-        resultJson: { workspaceValidation: {
-          reason: "git_worktree_base_not_git_checkout",
-          configurationReason: "local_path_requires_git_checkout",
-        } },
+      await withControlledGitAbsence(cwd, canonicalAbsence, async () => {
+        await expect(assertGitWorktreeBaseWorkspaceReady(configuredLocalPathInput(cwd))).rejects.toMatchObject({
+          code: "workspace_validation_failed",
+          message: expect.stringContaining("is not a git checkout"),
+          resultJson: { workspaceValidation: {
+            reason: "git_worktree_base_not_git_checkout",
+            configurationReason: "local_path_requires_git_checkout",
+          } },
+        });
       });
     } finally { await fs.rm(cwd, { recursive: true, force: true }); }
+  });
+
+  it.each([
+    { name: "boundary absence", stderr: boundaryAbsence, classified: true },
+    { name: "boundary CRLF", stderr: boundaryAbsence.replaceAll("\n", "\r\n"), classified: true },
+    { name: "incomplete boundary", stderr: boundaryAbsence.split("\n")[0], classified: false },
+    { name: "extra stderr", stderr: boundaryAbsence + "fatal: permission denied\n", classified: false },
+    { name: "malformed canonical", stderr: canonicalAbsence + "unexpected\n", classified: false },
+    { name: "metadata permission", stderr: canonicalAbsence, metadataError: "EACCES", classified: false },
+    { name: "boundary metadata permission", stderr: boundaryAbsence, metadataError: "EACCES", classified: false },
+    { name: "wrong exit", stderr: boundaryAbsence, exitCode: 1, classified: false },
+    ...["GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR"].map((override) => ({
+      name: override, stderr: boundaryAbsence, override, classified: false,
+    })),
+  ])("keeps guarded absence classification: $name", async (testCase) => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-absence-matrix-"));
+    try {
+      await withControlledGitAbsence(cwd, testCase.stderr, async () => {
+        const failure = await assertGitWorktreeBaseWorkspaceReady(configuredLocalPathInput(cwd)).catch((error) => error);
+        expect(failure).toMatchObject({
+          code: "workspace_validation_failed",
+          message: expect.stringContaining("is not a git checkout"),
+          resultJson: { workspaceValidation: { reason: "git_worktree_base_not_git_checkout" } },
+        });
+        expect(failure.resultJson.workspaceValidation.configurationReason).toBe(
+          testCase.classified ? "local_path_requires_git_checkout" : undefined,
+        );
+      }, testCase);
+    } finally { await fs.rm(cwd, { recursive: true, force: true }); }
+  });
+
+  it("keeps real ancestor metadata ambiguous with the boundary diagnostic", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-boundary-metadata-"));
+    const cwd = path.join(root, "documents");
+    try {
+      await fs.mkdir(cwd);
+      await fs.mkdir(path.join(root, ".git"));
+      await withControlledGitAbsence(cwd, boundaryAbsence, async () => {
+        const failure = await assertGitWorktreeBaseWorkspaceReady(configuredLocalPathInput(cwd)).catch((error) => error);
+        expect(failure.code).toBe("workspace_validation_failed");
+        expect(failure.resultJson.workspaceValidation.configurationReason).toBeUndefined();
+      }, { preserveMetadata: true });
+    } finally { await fs.rm(root, { recursive: true, force: true }); }
   });
 
   it.each(["legacy", "repository", "fallback", "materialization", "session", "unbound"])(
