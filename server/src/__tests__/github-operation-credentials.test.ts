@@ -34,6 +34,7 @@ import {
   reserveSteeredIdentity,
   acceptSteeredIdentity,
 } from "../services/run-identity.js";
+import { enforceGitHubCredentialRateLimit } from "../services/github-credential-rate-limit.js";
 import { resolveGitHubOperationCredentials } from "../services/github-operation-credentials.js";
 import {
   filterResolvedGitHubConnectionsForRun,
@@ -832,6 +833,33 @@ const support = await getEmbeddedPostgresTestSupport();
         const revoked = await post();
         expect((await revoked.json()).env).toEqual({});
       } finally { await broker.stop(); }
+    });
+
+    it("returns 429 on both transports before accessing the credential store", async () => {
+      const input = await seed();
+      await grant(input, "A");
+      for (let i = 0; i < 120; i++) enforceGitHubCredentialRateLimit(input);
+      vault.resolveUserSecretValue.mockClear();
+      vault.resolveSecretValue.mockClear();
+      const app = express();
+      app.use(runtimeConnectionIntentRoutes(db));
+      app.use(errorHandler);
+      const token = createRuntimeToolsToken({ ...input, responsibleUserId: "A", scope: "github_credentials" })!.token;
+      expect((await request(app).post("/runtime-tools/github/credentials")
+        .set("Authorization", `Bearer ${token}`)).status).toBe(429);
+      const broker = await createNativeGitHubAccess({
+        scope: input, cwd: process.cwd(), env: process.env,
+        target: null, resolveCredentials: binding => resolveGitHubOperationCredentials(db, binding),
+      });
+      try {
+        broker.activate(input);
+        const response = await fetch(`${broker.env.PAPERCLIP_GITHUB_BROKER_URL}/runtime-tools/github/credentials`, {
+          method: "POST", headers: { authorization: `Bearer ${broker.env.PAPERCLIP_GITHUB_BRIDGE_TOKEN}` },
+        });
+        expect(response.status).toBe(429);
+      } finally { await broker.stop(); }
+      expect(vault.resolveUserSecretValue).not.toHaveBeenCalled();
+      expect(vault.resolveSecretValue).not.toHaveBeenCalled();
     });
 
     it("requires a run-scoped runtime capability and never accepts browser authentication or supplied identities", async () => {
