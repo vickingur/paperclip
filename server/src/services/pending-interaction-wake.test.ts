@@ -58,6 +58,28 @@ suite("pending interaction delivery", () => {
     recovery: { escalateStrandedAssignedIssue: async () => {}, escalateStrandedRecoveryIssueInPlace: async () => {} },
   })({ companyId, runId, now: new Date(), suppressImmediateRecovery: true });
 
+  it.each([false, true])("drains the assignee wake after an unavailable retained recipient unless the stop was acknowledged (acknowledged=%s)", async acknowledged => {
+    const f = await fixture("issue_assignee_changed", acknowledged);
+    await db.update(agents).set({ status: "paused" }).where(eq(agents.id, f.recipientId));
+    const ownerWakeId = randomUUID();
+    await db.insert(agentWakeupRequests).values({ id: ownerWakeId, companyId: f.companyId, agentId: f.ownerId,
+      source: "automation", reason: "issue_assigned", status: "deferred_issue_execution",
+      requestedByActorType: "system", requestedAt: new Date(0), payload: { issueId: f.issueId } });
+
+    const result = await release(f.companyId, f.runId);
+    const [retained] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.wakeId));
+    const [ownerWake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, ownerWakeId));
+    // The older assignment receipt must not bypass recovery's priority.
+    expect(retained.status).toBe("failed");
+    expect(ownerWake.status).toBe(acknowledged ? "deferred_issue_execution" : "queued");
+    expect(result.outcome.kind).toBe(acknowledged ? "released" : "promoted");
+    if (!acknowledged) {
+      const [successor] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, ownerWake.runId!));
+      expect(successor.agentId).toBe(f.ownerId);
+      expect((await db.select().from(issues).where(eq(issues.id, f.issueId)))[0].executionRunId).toBe(successor.id);
+    }
+  });
+
   it("dispatches to the live card recipient even when the task has another owner", async () => {
     const f = await fixture();
     await db.update(heartbeatRuns).set({ status: "queued", errorCode: null }).where(eq(heartbeatRuns.id, f.runId));

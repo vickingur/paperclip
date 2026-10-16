@@ -183,7 +183,10 @@ function buildHost(_tx: Db, deps: WakeQueuePostgresAdapterDeps): WakeQueueHost {
   };
 }
 
-function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, run: HeartbeatRunRow, pendingRecoveryWakeId: string | null = null): WakeQueueTransaction {
+function buildTransaction(
+  tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, run: HeartbeatRunRow,
+  pendingRecoveryWakeId: string | null = null, pendingRecoveryOnly = false,
+): WakeQueueTransaction {
   const treeControlSvc = issueTreeControlService(tx);
   const issuesSvc = issueService(tx);
   const interruptQueueId = run.runtimeMode !== "native" && run.status === "cancelled"
@@ -213,12 +216,19 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
               eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS),
               excludedWakeIds?.length ? notInArray(agentWakeupRequests.id, excludedWakeIds) : undefined,
               sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,
-              pendingRecoveryWakeId ? eq(agentWakeupRequests.id, pendingRecoveryWakeId) : undefined,
+              pendingRecoveryOnly && pendingRecoveryWakeId ? eq(agentWakeupRequests.id, pendingRecoveryWakeId) : undefined,
               interruptQueueId ? eq(agentWakeupRequests.id, interruptQueueId) : undefined,
               interruptQueueId ? eq(agentWakeupRequests.agentId, run.agentId) : undefined,
             ),
           )
-          .orderBy(asc(agentWakeupRequests.requestedAt))
+          // Recovery gets first attention, but a failed/cancelled receipt must
+          // not strand unrelated deferred work after automatic supersession.
+          .orderBy(
+            ...(pendingRecoveryWakeId
+              ? [sql`case when ${agentWakeupRequests.id} = ${pendingRecoveryWakeId} then 0 else 1 end`]
+              : []),
+            asc(agentWakeupRequests.requestedAt),
+          )
           .limit(1)
           .then((rows) => rows[0] ?? null);
         if (!row) return null;
@@ -1116,6 +1126,10 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
               sql`${agentWakeupRequests.payload}->>'issueId' = ${issueRow.id}`,
             )).limit(1)
           : [];
+        const executionCancellationAcknowledged = isAcknowledgedNativeReassignmentStop(run) ||
+          (run.status === "cancelled" &&
+          (parseObject(run.resultJson?.executionCancellation).state === "acknowledged" || isAcknowledgedNativeStop(run)) &&
+          !interruptedQueue);
         const preDrainFacts: PreDrainFacts = {
           issueRowPresent: issueRow !== null,
           executionRunIdMatchesRun: !issueRow || !issueRow.executionRunId || issueRow.executionRunId === run.id,
@@ -1129,10 +1143,7 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
           // next explicit wake adopts those messages atomically when it
           // queues a run.
           executionCancellationAcknowledged:
-            !retainedPendingInteraction && (isAcknowledgedNativeReassignmentStop(run) ||
-            (run.status === "cancelled" &&
-            (parseObject(run.resultJson?.executionCancellation).state === "acknowledged" || isAcknowledgedNativeStop(run)) &&
-            !interruptedQueue)),
+            !retainedPendingInteraction && executionCancellationAcknowledged,
         };
         const preDrain = decidePreDrain(preDrainFacts);
 
@@ -1215,7 +1226,13 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
         }
 
         const locked: LockedIssueExecution = { primaryIssue: toIssueSnapshot(issueRow), run: runSnapshot, recoveryOnly };
-        const result = await fn(locked, { host: buildHost(tx, deps), transaction: buildTransaction(tx, deps, db, run, retainedPendingInteraction ? run.wakeupRequestId : null) });
+        const result = await fn(locked, {
+          host: buildHost(tx, deps),
+          // Acknowledged stops authorize only the retained attention receipt.
+          // Other automatic supersessions can continue the ordinary drain.
+          transaction: buildTransaction(tx, deps, db, run,
+            retainedPendingInteraction ? run.wakeupRequestId : null, executionCancellationAcknowledged),
+        });
         // Explicit retry admission requires the exact source's task claim.
         // Preserve it only when the existing queue-first recovery policy
         // requests that retry. The clear/restore stays inside this task lock.

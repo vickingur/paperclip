@@ -17,6 +17,11 @@ for the same recipient cannot produce a retry loop. Existing queue recovery can
 resume a retained receipt after restart. There is no historical-card scan and no
 new timer.
 
+The retained receipt has first priority at release. If its recipient cannot run
+or the receipt is cancelled, ordinary deferred work can proceed in the same
+drain. An acknowledged stop still limits this release to the retained receipt;
+it cannot promote unrelated work.
+
 Explicit operator or agent stops, budget gates, subtree pauses, active execution,
 provider-stop proof and unresolved action outcomes retain their existing gates.
 The follow-up addresses the card; it does not approve work, resolve the card or
