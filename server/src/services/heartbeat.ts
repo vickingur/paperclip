@@ -1,4 +1,4 @@
-import { createAcpxSilenceDeadline, usesClaudeAcpxSilenceDeadline } from "./acpx-silence-deadline.js";
+import { ACPX_SILENCE_DEADLINE_MS, createAcpxSilenceDeadline, usesClaudeAcpxSilenceDeadline } from "./acpx-silence-deadline.js";
 import { createPostgresWatchdogAdapter } from "../modules/active-run-watchdog/adapters/postgres.js";
 import { dispositionSuppressionReceipt, settleLegacyDispositionSuppression } from "./legacy-disposition-suppression.js";
 import { selectHeartbeatEnvironment } from "./heartbeat/environment-selection.js";
@@ -4507,7 +4507,6 @@ export function heartbeatService(
         // pre-tool hooks. Explicit CLI and other providers retain their policy.
         if (usesClaudeAcpxSilenceDeadline(agent.adapterType, runtimeConfig.engine, Boolean(nativeExecution))) {
           silenceDeadline = createAcpxSilenceDeadline({
-            startedAt: run.startedAt?.getTime(),
             admit: async (commit) => {
               await db.transaction(async tx => {
                 const [current] = await tx.select().from(heartbeatRuns).where(and(
@@ -4522,13 +4521,12 @@ export function heartbeatService(
                     executionControl.controller.signal.aborted) return;
                 const snapshot = commit();
                 if (!snapshot) return;
-                // The local progress claim and abort have no await between
-                // them. Operator decisions serialize on this same run row.
-                executionControl.controller.abort(new Error("ACPX meaningful progress silent for 1,200 seconds"));
+                // The local claim fences progress while this marker commits.
+                // Operator decisions serialize on this same run row.
                 await tx.update(heartbeatRuns).set({
                   errorCode: "acpx_silence_timeout",
                   resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || ${JSON.stringify({
-                    acpxSilenceStop: { ...snapshot, thresholdMs: 1_200_000, checkedAt: new Date().toISOString(),
+                    acpxSilenceStop: { ...snapshot, thresholdMs: ACPX_SILENCE_DEADLINE_MS, checkedAt: new Date().toISOString(),
                       recovery: "explicit_operator_continue_required" },
                     cancellation: { source: "control_plane", expected: true, initiator: { type: "system" },
                       reason: "ACPX silence deadline", recordedAt: new Date().toISOString() },
@@ -4537,6 +4535,9 @@ export function heartbeatService(
               });
             },
             onStop: async () => {
+              // Admission has settled: completion must see the committed marker
+              // before abort can wake the adapter. Also abort on audit failure.
+              executionControl.controller.abort(new Error("ACPX meaningful progress silent for 1,200 seconds"));
               await cancelRunInternal(run.id, "ACPX meaningful progress silent for 1,200 seconds", {
                 errorCode: "acpx_silence_timeout", suppressImmediateRecovery: true,
                 eventMessage: "ACPX silence deadline stopped run; explicit recovery required",

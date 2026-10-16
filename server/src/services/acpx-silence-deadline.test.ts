@@ -99,3 +99,42 @@ it("still performs bounded stop cleanup if an audit write fails after the stop c
   await vi.advanceTimersByTimeAsync(1_200_000);
   expect(run.onError).toHaveBeenCalledTimes(1); expect(run.onStop).toHaveBeenCalledTimes(1);
 });
+
+it("waits for the durable marker before abort can trigger immediate completion", async () => {
+  vi.useFakeTimers(); vi.setSystemTime(0);
+  let finishCommit!: () => void;
+  let marker: { recovery: string } | undefined;
+  let completionSnapshot: typeof marker;
+  const controller = new AbortController();
+  controller.signal.addEventListener("abort", () => { completionSnapshot = marker; });
+  const onStop = vi.fn(async () => { controller.abort(); });
+  const deadline = createAcpxSilenceDeadline({
+    admit: async claim => {
+      if (!claim()) return;
+      await new Promise<void>(resolve => { finishCommit = resolve; });
+      marker = { recovery: "explicit_operator_continue_required" };
+    },
+    onStop, onError: error => { throw error; },
+  });
+  await vi.advanceTimersByTimeAsync(1_200_000);
+  expect(controller.signal.aborted).toBe(false);
+  expect(onStop).not.toHaveBeenCalled();
+  deadline.observe({ type: "acpx.text_delta", text: "late output after claim" });
+  finishCommit(); await vi.advanceTimersByTimeAsync(0);
+  expect(completionSnapshot).toEqual({ recovery: "explicit_operator_continue_required" });
+  expect(onStop).toHaveBeenCalledTimes(1);
+  deadline.dispose();
+});
+
+it("starts a fresh deadline when armed after slow workspace preparation", async () => {
+  vi.useFakeTimers(); vi.setSystemTime(1_800_000);
+  const onStop = vi.fn(async () => {});
+  const deadline = createAcpxSilenceDeadline({
+    admit: async claim => { claim(); }, onStop, onError: vi.fn(),
+  });
+  await vi.advanceTimersByTimeAsync(1_199_999);
+  expect(onStop).not.toHaveBeenCalled();
+  await vi.advanceTimersByTimeAsync(1);
+  expect(onStop).toHaveBeenCalledTimes(1);
+  deadline.dispose();
+});

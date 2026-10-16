@@ -993,16 +993,18 @@ The signal reappears in the UI after a snooze or continue window expires. No rev
 
 Claude local runs using the default ACPX engine have a separate 1,200-second
 meaningful-progress deadline at the host controller boundary. It starts from
-run start, covers pending pre-tool hooks, and advances only for nonempty
+arming before adapter dispatch, covers pending pre-tool hooks, and advances only for nonempty
 provider text, new tool calls, changed tool lifecycle status or changed tool
 output. Repeated pending notifications, usage updates, polling and host logs do
 not advance it. Other adapters, native execution and explicit Claude CLI retain
 their existing behavior. The output-silence UI classification above remains
-informational.
+informational. A legitimate tool that emits no progress for 20 minutes is also
+stopped under this policy.
 
 Admission locks the company-scoped run row, rechecks running status and exact
 controller ownership, reads operator suppression and then rechecks the local
-progress generation immediately before aborting. Snooze and continue suppress
+progress generation before claiming the stop. The durable stop marker commits
+before abort can wake adapter completion. Snooze and continue suppress
 the stop until their quiet-until time; dismissal suppresses it for that run.
 Operator decisions serialize against admission on the same run row. A decision
 committed after cancellation admission does not undo an already requested stop.
