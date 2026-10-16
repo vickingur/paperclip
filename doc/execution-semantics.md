@@ -989,6 +989,38 @@ Operators should prefer `snooze` for known time-bounded quiet periods. `continue
 
 The signal reappears in the UI after a snooze or continue window expires. No review work is created when it reappears. The board can record decisions without an evaluation issue. For compatibility, the assigned owner of an open legacy evaluation issue can also record a decision that is bound to that issue and run. Other agents cannot.
 
+### Claude ACPX silence deadline
+
+Claude local runs using the default ACPX engine have a separate 1,200-second
+meaningful-progress deadline at the host controller boundary. It starts from
+arming before adapter dispatch, covers pending pre-tool hooks, and advances only for nonempty
+provider text, new tool calls, changed tool lifecycle status or changed tool
+output. Repeated pending notifications, usage updates, polling and host logs do
+not advance it. Other adapters, native execution and explicit Claude CLI retain
+their existing behavior. The output-silence UI classification above remains
+informational. A legitimate tool that emits no progress for 20 minutes is also
+stopped under this policy.
+
+Admission locks the company-scoped run row, rechecks running status and exact
+controller ownership, reads operator suppression and then rechecks the local
+progress generation before claiming the stop. The durable stop marker commits
+before abort can wake adapter completion. Snooze and continue suppress
+the stop until their quiet-until time; dismissal suppresses it for that run.
+Operator decisions serialize against admission on the same run row. A decision
+committed after cancellation admission does not undo an already requested stop.
+The deadline uses the existing scoped cancellation path and bounded adapter
+shutdown, records the last meaningful progress, threshold, pending tool IDs and
+explicit recovery requirement in `resultJson.acpxSilenceStop`, and suppresses
+immediate recovery. An operator must inspect pending side effects and explicitly
+continue the task; this mechanism never replays a command or starts a provider.
+The run-scoped deadline is disposed when adapter execution settles. A failed
+status/suppression read defers admission for 30 seconds and records an error.
+
+Network commands remain bounded by the separately published network-CLI timeout
+rule. That shell deadline starts after pre-tool hooks; this controller deadline
+covers the hook wait. Deployment and synthetic runtime acceptance are separate
+from source verification.
+
 ### Source-aware watchdog folding
 
 The active-run cleanup scan is source-aware. It re-reads the linked source issue and decides whether a still-running handle represents productive source work or stale run/process bookkeeping. It does not create reviewer work.

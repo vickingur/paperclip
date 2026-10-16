@@ -34,3 +34,7 @@ Image version: `<upstream describe of merge base>+vik.<fork commit count>`, e.g.
 | Codex quota windows named by length (`packages/adapters/codex-local/src/server/quota.ts`) | Upstream labeled the primary window "5h limit" whatever its length; on plans where it is weekly, the panel showed the weekly figure as a 5-hour limit. |
 | Claude quota from agent readings (`server/src/services/observed-claude-quota.ts`) | A `claude setup-token` token cannot read the usage endpoint, so the Anthropic panel only said quota was unavailable. With `PAPERCLIP_CLAUDE_QUOTA_FILE` set, it falls back to the rate-limit windows the agents' Claude Code last reported (usage-guard keeps them in `usage.json`). |
 
+
+Claude ACPX silence deadline: the host controller stops a Claude ACPX run after
+1,200 seconds without meaningful text/tool progress, honors operator watchdog
+decisions and requires explicit recovery. See `doc/execution-semantics.md` §12.

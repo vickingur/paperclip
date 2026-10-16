@@ -1,3 +1,5 @@
+import { ACPX_SILENCE_DEADLINE_MS, createAcpxSilenceDeadline, usesClaudeAcpxSilenceDeadline } from "./acpx-silence-deadline.js";
+import { createPostgresWatchdogAdapter } from "../modules/active-run-watchdog/adapters/postgres.js";
 import { dispositionSuppressionReceipt, settleLegacyDispositionSuppression } from "./legacy-disposition-suppression.js";
 import { selectHeartbeatEnvironment } from "./heartbeat/environment-selection.js";
 import { prepareHeartbeatWorkspace } from "./heartbeat/workspace-preparation.js";
@@ -2086,6 +2088,7 @@ export function heartbeatService(
     executionControl.phases.enter("host_execution");
     const executionPhaseContext = { onExecutionPhase: executionControl.phases.enter };
     const controllerLease = watchLegacyControllerLease(db, run, executionControl.controller);
+    let silenceDeadline: ReturnType<typeof createAcpxSilenceDeadline> | undefined;
     let runScratch: HeartbeatRunScratch | null = null;
     let githubLauncherLocation:
       Parameters<typeof cleanupGitHubOperationLaunchers>[0] | null = null;
@@ -4175,8 +4178,14 @@ export function heartbeatService(
             },
           });
         };
-        const onLog = (stream: "stdout" | "stderr", chunk: string) =>
-          appendIdentityRedactedLog(stream, identityRedactor.chunk(stream, chunk));
+        const onLog = (stream: "stdout" | "stderr", chunk: string) => {
+          // ACPX emits one complete JSON record per callback. Raw stderr,
+          // usage/status records and host bookkeeping cannot reset this clock.
+          if (silenceDeadline && stream === "stdout") {
+            try { silenceDeadline.observe(JSON.parse(chunk)); } catch { /* non-ACP log */ }
+          }
+          return appendIdentityRedactedLog(stream, identityRedactor.chunk(stream, chunk));
+        };
         if (runScopedMentionedSkillKeys.length > 0) {
           await onLog(
             "stdout",
@@ -4494,6 +4503,49 @@ export function heartbeatService(
         if (!runtimeSelection.selected) return;
         const { nativeExecution, nativeRunnerInstanceId, getNativeFreshSessionHandoff } = runtimeSelection;
         nativeWorkspaceSync = runtimeSelection.nativeWorkspaceSync;
+        // Arm at the controller boundary before adapter dispatch, including
+        // pre-tool hooks. Explicit CLI and other providers retain their policy.
+        if (usesClaudeAcpxSilenceDeadline(agent.adapterType, runtimeConfig.engine, Boolean(nativeExecution))) {
+          silenceDeadline = createAcpxSilenceDeadline({
+            admit: async (commit) => {
+              await db.transaction(async tx => {
+                const [current] = await tx.select().from(heartbeatRuns).where(and(
+                  eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId),
+                )).for("update");
+                if (current?.status !== "running" || executionControl.controller.signal.aborted ||
+                    adapterExecutionControls.get(run.id) !== executionControl) return;
+                const decisions = await createPostgresWatchdogAdapter(tx as unknown as Db)
+                  .findLatestDecision(run.companyId, run.id, new Date());
+                if (decisions.dismissedFalsePositive || decisions.quietUntilDecision ||
+                    adapterExecutionControls.get(run.id) !== executionControl ||
+                    executionControl.controller.signal.aborted) return;
+                const snapshot = commit();
+                if (!snapshot) return;
+                // The local claim fences progress while this marker commits.
+                // Operator decisions serialize on this same run row.
+                await tx.update(heartbeatRuns).set({
+                  errorCode: "acpx_silence_timeout",
+                  resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || ${JSON.stringify({
+                    acpxSilenceStop: { ...snapshot, thresholdMs: ACPX_SILENCE_DEADLINE_MS, checkedAt: new Date().toISOString(),
+                      recovery: "explicit_operator_continue_required" },
+                    cancellation: { source: "control_plane", expected: true, initiator: { type: "system" },
+                      reason: "ACPX silence deadline", recordedAt: new Date().toISOString() },
+                  })}::jsonb`,
+                }).where(eq(heartbeatRuns.id, run.id));
+              });
+            },
+            onStop: async () => {
+              // Admission has settled: completion must see the committed marker
+              // before abort can wake the adapter. Also abort on audit failure.
+              executionControl.controller.abort(new Error("ACPX meaningful progress silent for 1,200 seconds"));
+              await cancelRunInternal(run.id, "ACPX meaningful progress silent for 1,200 seconds", {
+                errorCode: "acpx_silence_timeout", suppressImmediateRecovery: true,
+                eventMessage: "ACPX silence deadline stopped run; explicit recovery required",
+              });
+            },
+            onError: error => logger.error({ err: error, runId: run.id }, "ACPX silence stop failed"),
+          });
+        }
         const execution = await executeHeartbeatRuntime(db, {
           run, agent, options,
           task: {
@@ -4591,7 +4643,7 @@ export function heartbeatService(
             onProviderResourceDisposition: (value) => { providerResourceDispositionForRun = value; },
             onWorkspaceRestoreFailure: (evidence) => { requiredWorkspaceRestoreEvidence = evidence; },
           },
-        });
+        }).finally(() => silenceDeadline?.dispose());
         if (!execution.dispatched) return;
         const { adapterResult } = execution;
         // Reconcile the referenced-project set against the real remote staging outcome. A referenced
@@ -5060,6 +5112,7 @@ export function heartbeatService(
           inArray(heartbeatRuns.status, ["succeeded", "failed", "cancelled", "timed_out", "interrupted"])));
 
       } finally {
+        silenceDeadline?.dispose();
         controllerLease.stop();
         activeRunExecutions.delete(run.id);
         // A failed owned Stop remains visible until this exact executor settles,
