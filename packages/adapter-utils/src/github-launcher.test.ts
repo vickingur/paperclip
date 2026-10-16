@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { createServer } from "node:http";
-import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, writeFile, rm, symlink } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -62,6 +62,34 @@ describe("managed GitHub launchers", () => {
       GH_CONFIG_DIR: configRoot, PATH: `${bin}:${process.env.PATH}`,
     } });
   }, 15_000); // broker-offline retries the transport twice per command before it falls back
+
+  it.each(["another run's launcher directory", "a symlink to the launcher", "a shim that execs the launcher"])("terminates instead of fork-looping when PATH holds %s", async (trigger) => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-reentry-"));
+    cleanups.push(() => rm(root, { recursive: true, force: true }));
+    const own = path.join(root, "paperclip-github-runtime", "run-b");
+    await mkdir(own, { recursive: true });
+    await writeFile(path.join(own, "git"), githubLauncherSource(), { mode: 0o700 });
+    const decoy = trigger.startsWith("another")
+      ? path.join(root, "paperclip-github-runtime", "run-a")
+      : path.join(root, "shim");
+    await mkdir(decoy, { recursive: true });
+    if (trigger.includes("symlink")) await symlink(path.join(own, "git"), path.join(decoy, "git"));
+    else await writeFile(path.join(decoy, "git"), trigger.startsWith("another")
+      ? githubLauncherSource()
+      : `#!/bin/sh\nexec ${path.join(own, "git")} "$@"\n`, { mode: 0o700 });
+    const env = { ...process.env, ...githubBrokerEnvironment({}, { url: "", token: "" }),
+      PATH: `${own}:${decoy}:${process.env.PATH}` };
+    const started = Date.now();
+    const result = await exec(path.join(own, "git"), ["--version"], { env, timeout: 10_000 }).catch(error => error);
+    expect(Date.now() - started).toBeLessThan(10_000);
+    if (!trigger.includes("shim")) {
+      // Launcher directories and launcher symlinks are skipped, so the real git answers.
+      expect(result.stdout).toMatch(/git version/);
+    } else {
+      expect(result.code).toBe(126);
+      expect(result.stderr).toContain("re-entered");
+    }
+  }, 15_000);
 
   it("explains unavailable access while allowing local work without credentials", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-diagnostic-"));

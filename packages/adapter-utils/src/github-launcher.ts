@@ -7,11 +7,28 @@ const os = require('node:os');
 const { spawn } = require('node:child_process');
 const directory = path.dirname(fs.realpathSync(process.argv[1]));
 const program = path.basename(process.argv[1]);
-const originalPath = (process.env.PATH || '').split(path.delimiter).filter(p => {
-  try { return fs.realpathSync(p) !== directory; } catch { return true; }
-});
+// A PATH entry that leads back to a launcher (another run's launcher directory,
+// or a shim that execs one) would make launchers spawn each other forever, each
+// fetching credentials and none exiting. Skip every launcher directory, and stop
+// a chain that still re-enters through an unrecognised shim.
+const depth = Number(process.env.PAPERCLIP_GITHUB_LAUNCHER_DEPTH) || 0;
+if (depth >= 4) {
+  process.stderr.write('Paperclip: GitHub launcher re-entered ' + depth + ' times; a PATH entry leads back to the launcher. Stopping.\n');
+  process.exit(126);
+}
+const isLauncherDirectory = (p) => {
+  try {
+    const real = fs.realpathSync(p);
+    return real === directory || real.split(path.sep).includes('paperclip-github-runtime');
+  } catch { return false; }
+};
+const originalPath = (process.env.PATH || '').split(path.delimiter).filter(p => !isLauncherDirectory(p));
 const executable = originalPath.map(p => path.join(p, program)).find(p => {
-  try { fs.accessSync(p, fs.constants.X_OK); return fs.statSync(p).isFile(); } catch { return false; }
+  try {
+    fs.accessSync(p, fs.constants.X_OK);
+    // A symlink elsewhere on PATH that resolves to a launcher is not the real binary.
+    return fs.statSync(p).isFile() && !fs.realpathSync(p).split(path.sep).includes('paperclip-github-runtime');
+  } catch { return false; }
 });
 if (!['git', 'gh'].includes(program) || !executable) {
   process.stderr.write('Paperclip: requested GitHub command is not installed.\n');
@@ -102,6 +119,7 @@ async function main() {
   // Only this invocation and its children inherit the captured credential.
   // Its Git children use the real binary, so steering cannot split a gh operation.
   env.PATH = originalPath.join(path.delimiter);
+  env.PAPERCLIP_GITHUB_LAUNCHER_DEPTH = String(depth + 1);
   // Nested shell aliases must not reload the parent launcher profile and
   // recapture a newer identity. All ordinary descendants stay in this operation.
   env.ZDOTDIR = configDirectory;
