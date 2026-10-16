@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { createServer } from "node:http";
-import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, writeFile, rm, symlink } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -62,6 +62,71 @@ describe("managed GitHub launchers", () => {
       GH_CONFIG_DIR: configRoot, PATH: `${bin}:${process.env.PATH}`,
     } });
   }, 15_000); // broker-offline retries the transport twice per command before it falls back
+
+  it.each(["another run's launcher directory", "a symlink to the launcher", "a shim that execs the launcher"])("terminates instead of fork-looping when PATH holds %s", async (trigger) => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-reentry-"));
+    cleanups.push(() => rm(root, { recursive: true, force: true }));
+    const own = path.join(root, "paperclip-github-runtime", "run-b");
+    await mkdir(own, { recursive: true });
+    await writeFile(path.join(own, "git"), githubLauncherSource(), { mode: 0o700 });
+    const decoy = trigger.startsWith("another")
+      ? path.join(root, "paperclip-github-runtime", "run-a")
+      : path.join(root, "shim");
+    await mkdir(decoy, { recursive: true });
+    if (trigger.includes("symlink")) await symlink(path.join(own, "git"), path.join(decoy, "git"));
+    else await writeFile(path.join(decoy, "git"), trigger.startsWith("another")
+      ? githubLauncherSource()
+      : `#!/bin/sh\nexec ${path.join(own, "git")} "$@"\n`, { mode: 0o700 });
+    const env = { ...process.env, ...githubBrokerEnvironment({}, { url: "", token: "" }),
+      PATH: `${own}:${decoy}:${process.env.PATH}` };
+    const started = Date.now();
+    const result = await exec(path.join(own, "git"), ["--version"], { env, timeout: 10_000 }).catch(error => error);
+    expect(Date.now() - started).toBeLessThan(10_000);
+    if (!trigger.includes("shim")) {
+      // Launcher directories and launcher symlinks are skipped, so the real git answers.
+      expect(result.stdout).toMatch(/git version/);
+    } else {
+      expect(result.code).toBe(126);
+      expect(result.stderr).toContain("re-entered");
+    }
+  }, 15_000);
+
+  it("fetches managed credentials only for git network commands", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-lazy-"));
+    cleanups.push(() => rm(root, { recursive: true, force: true }));
+    const bin = path.join(root, "managed");
+    await mkdir(bin);
+    await exec("git", ["init", path.join(root, "repo")]);
+    await writeFile(path.join(bin, "git"), githubLauncherSource(), { mode: 0o700 });
+    let requests = 0;
+    const server = createServer((_req, res) => { requests += 1; res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ status: "unavailable", reason: "test" })); });
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    cleanups.push(() => new Promise<void>(resolve => server.close(() => resolve())));
+    const { port } = server.address() as { port: number };
+    const env = { ...process.env, ...githubBrokerEnvironment({}, { url: `http://127.0.0.1:${port}`, token: "capability" }),
+      GH_CONFIG_DIR: path.join(root, "config"), PATH: `${bin}:${process.env.PATH}` };
+    const git = (...args: string[]) => exec(path.join(bin, "git"), args, { cwd: path.join(root, "repo"), env });
+    await git("status", "--porcelain");
+    await git("-c", "user.name=T", "-c", "user.email=t@example.test", "commit", "--allow-empty", "-m", "local");
+    await git("log", "-1", "--format=%s");
+    expect(requests).toBe(0);
+    // Network commands against local repositories (test fixtures) stay credential-free.
+    await exec("git", ["init", "--bare", path.join(root, "origin.git")]);
+    await git("ls-remote", path.join(root, "repo"));
+    await git("remote", "add", "local", path.join(root, "origin.git"));
+    await git("fetch", "local");
+    await git("push", "local", "HEAD:refs/heads/main");
+    await git("remote", "-v");
+    await exec(path.join(bin, "git"), ["clone", "-q", path.join(root, "origin.git"), path.join(root, "copy")], { env });
+    expect(requests).toBe(0);
+    // A GitHub remote, named or explicit, still fetches the managed identity.
+    await git("remote", "add", "origin", "https://github.com/example/repo.git");
+    expect(requests).toBe(1);
+    await git("remote", "get-url", "origin");
+    expect(requests).toBe(2);
+    await git("remote", "set-url", "local", "git@github.com:example/repo.git");
+    expect(requests).toBe(3);
+  }, 30_000);
 
   it("explains unavailable access while allowing local work without credentials", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-diagnostic-"));
