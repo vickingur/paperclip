@@ -873,7 +873,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
       );
       const conversationSettled = await settleConversationTurn(db, livenessRun);
       await releaseIssueExecutionAndPromote(livenessRun, {
-        suppressImmediateRecovery: conversationSettled ||
+        suppressImmediateRecovery: Boolean(livenessRun.resultJson?.acpxSilenceStop) || conversationSettled ||
           readNonEmptyString(
             parseObject(livenessRun.contextSnapshot).goalControlRequestId,
           ) !== null ||
@@ -1419,7 +1419,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
         });
       }
       await releaseIssueExecutionAndPromote(livenessRun, {
-        suppressImmediateRecovery:
+        suppressImmediateRecovery: Boolean(livenessRun.resultJson?.acpxSilenceStop) ||
           readNonEmptyString(
             parseObject(livenessRun.contextSnapshot).goalControlRequestId,
           ) !== null ||

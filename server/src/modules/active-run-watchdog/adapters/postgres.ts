@@ -246,7 +246,11 @@ export function createPostgresWatchdogAdapter(db: Db): WatchdogRunReader & Watch
   }
 
   async function recordDecision(companyId: string, input: RecordDecisionInput): Promise<WatchdogDecisionRecord> {
-    const [row] = await db
+    const row = await db.transaction(async tx => {
+      await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.id, input.runId), eq(heartbeatRuns.companyId, companyId),
+      )).for("update");
+      const [saved] = await tx
       .insert(heartbeatRunWatchdogDecisions)
       .values({
         companyId,
@@ -260,6 +264,8 @@ export function createPostgresWatchdogAdapter(db: Db): WatchdogRunReader & Watch
         createdByRunId: input.createdByRunId,
       })
       .returning();
+      return saved;
+    });
 
     await logActivity(db, {
       companyId,

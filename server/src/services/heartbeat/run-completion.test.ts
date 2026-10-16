@@ -111,6 +111,24 @@ describe.skipIf(!support.supported)("heartbeat run completion boundary", () => {
   }
   const read = (id: string) => db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, id)).then(rows => rows[0]!);
 
+  it("preserves silence-stop evidence and requires explicit recovery after adapter cancellation", async () => {
+    const f = await fixture({ resultJson: {
+      acpxSilenceStop: { thresholdMs: 1_200_000, pendingToolIds: ["possibly-side-effecting"] },
+      cancellation: { source: "control_plane", expected: true, initiator: { type: "system" },
+        reason: "ACPX silence deadline", recordedAt: new Date().toISOString() },
+    } });
+    f.controller.abort();
+    f.input.adapterResult.resultJson = { status: "cancelled", acpPendingToolCount: 1 };
+    await f.completion.completeRun(f.input);
+    expect(await read(f.run.id)).toMatchObject({ status: "cancelled", resultJson: {
+      acpxSilenceStop: { pendingToolIds: ["possibly-side-effecting"] },
+      cancellation: { expected: true, source: "control_plane" },
+    } });
+    expect(f.deps.releaseIssueExecutionAndPromote).toHaveBeenCalledWith(
+      expect.objectContaining({ id: f.run.id }), { suppressImmediateRecovery: true },
+    );
+  });
+
   it("persists usage, accounting, final logs, presentation and the next task session", async () => {
     const f = await fixture();
     await f.completion.completeRun(f.input);
