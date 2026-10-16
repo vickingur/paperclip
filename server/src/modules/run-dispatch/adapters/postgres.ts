@@ -1,3 +1,4 @@
+import { isCurrentPendingInteractionAddressee } from "../../../services/pending-interaction-wake.js";
 import { hasConversationContinuationPolicy } from "../../../services/conversation-continuation.js";
 import { getExecutionBlocker } from "../../../services/execution-blocker.js";
 import { getNativeReviewAssignment } from "../../../services/native-runtime/native-review-participant.js";
@@ -532,7 +533,10 @@ export function createPostgresRunDispatchAdapter(
     );
 
     const wakeCommentId = deriveCommentId(context);
-    const isInteractionWake = allowsIssueInteractionWake(
+    const pendingInteractionAddressee = await isCurrentPendingInteractionAddressee(
+      dbOrTx, input.companyId, issueId, input.agentId, context,
+    );
+    const isInteractionWake = pendingInteractionAddressee || allowsIssueInteractionWake(
       context,
       ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS,
     );
@@ -592,6 +596,7 @@ export function createPostgresRunDispatchAdapter(
       ? (await issueService(dbOrTx).listDependencyReadiness(input.companyId, [issueId])).get(issueId)
       : null;
     return {
+      pendingInteractionObsolete: context.wakeReason === "interaction_pending" && !pendingInteractionAddressee,
       runId: input.runId,
       runAgentId: input.agentId,
       issueId,
@@ -892,6 +897,10 @@ export function createPostgresRunDispatchAdapter(
           resultJson: {
             ...parseObject(run.resultJson),
             stopReason: decision.errorCode,
+            // Both callers hold dispatch before the provider callback starts.
+            ...(run.contextSnapshot?.wakeReason === "interaction_pending" ? {
+              executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
+            } : {}),
             ...(decision.errorCode === "execution_reconciliation_required"
               ? { executionWait: decision.details }
               : {}),

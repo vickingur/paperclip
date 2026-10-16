@@ -3554,6 +3554,7 @@ export function heartbeatService(
         if (
           !issueId ||
           (!isResolvedInteractionContinuationWakeContext(context) &&
+            context.wakeReason !== "interaction_pending" &&
             !["native_safe_replacement", "native_provider_overloaded"].includes(run.scheduledRetryReason ?? ""))
         ) {
           return { dispatched: true, resultPromise: dispatch(() => {}) };

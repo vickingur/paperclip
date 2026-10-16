@@ -1,3 +1,4 @@
+import { isCurrentPendingInteractionAddressee, retainSupersededPendingInteractionWake } from "../pending-interaction-wake.js";
 import { DEPENDENCY_CLOSURE_RECEIPT_KEY, verifyDependencyClosureProof } from "../dependency-closure-proof.js";
 import { commitExecutionReset } from "../execution-reset-producer.js";
 import { deliverExecutionReset } from "../execution-reset-delivery.js";
@@ -1090,6 +1091,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       const unresolvedBlockerCount = readiness?.unresolvedBlockerCount ?? 0;
       if (
         unresolvedBlockerCount > 0 &&
+        !await isCurrentPendingInteractionAddressee(db, run.companyId, issueId, run.agentId, context) &&
         !allowsIssueInteractionWake(
           context,
           ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS,
@@ -1114,6 +1116,9 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       });
       if (staleness.outcome === "cancelled" || staleness.outcome === "deferred") {
         applyRunDispatchPostCommitEffects(staleness.postCommitEffects);
+        if (staleness.outcome === "cancelled" && context.wakeReason === "interaction_pending") {
+          await releaseIssueExecutionAndPromote(run, { suppressImmediateRecovery: true, deferredPostCommitEffects });
+        }
         logger.info(
           {
             runId: run.id,
@@ -1150,7 +1155,8 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       }).from(issues).where(and(
         eq(issues.id, issueId), eq(issues.companyId, run.companyId),
       )).for("update") : [];
-      const ownsIssue = owner?.assigneeAgentId === run.agentId &&
+      const ownsIssue = (owner?.assigneeAgentId === run.agentId ||
+        await isCurrentPendingInteractionAddressee(tx, run.companyId, issueId!, run.agentId, context)) &&
         context.wakeReason !== "source_scoped_recovery_action";
       if (ownsIssue && ["native_safe_replacement", "native_provider_overloaded"].includes(run.scheduledRetryReason ?? "") &&
           owner.checkoutRunId && owner.checkoutRunId !== run.id) {
@@ -1779,7 +1785,8 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       .from(agentWakeupRequests)
       .innerJoin(issues, and(eq(issues.companyId, agentWakeupRequests.companyId),
         sql`${issues.id}::text = ${agentWakeupRequests.payload}->>'issueId'`,
-        eq(issues.assigneeAgentId, agentWakeupRequests.agentId)))
+        or(eq(issues.assigneeAgentId, agentWakeupRequests.agentId),
+          sql`${agentWakeupRequests.payload} #>> '{_paperclipWakeContext,wakeReason}' = 'interaction_pending'`)))
       .innerJoin(companies, and(eq(companies.id, issues.companyId), eq(companies.status, "active")))
       .where(and(eq(agentWakeupRequests.status, "deferred_issue_execution"),
         isNull(issues.executionRunId),
@@ -1791,10 +1798,13 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         cutoff ? gte(agentWakeupRequests.requestedAt, cutoff) : undefined))
       .orderBy(asc(agentWakeupRequests.updatedAt)).limit(50);
     for (const { wake } of strandedQueues) {
-      if (!queuedCommentIdsFromWakePayload(wake.payload).length &&
+      const pendingAttention = await isCurrentPendingInteractionAddressee(db, wake.companyId,
+        String(wake.payload?.issueId), wake.agentId,
+        parseObject(wake.payload?._paperclipWakeContext));
+      if (!pendingAttention && !queuedCommentIdsFromWakePayload(wake.payload).length &&
           !await readQueuedInteractionResponse(db, wake.companyId, String(wake.payload?.issueId), wake.payload)) continue;
       const [latest] = await db.select().from(heartbeatRuns).where(and(
-        eq(heartbeatRuns.companyId, wake.companyId), eq(heartbeatRuns.agentId, wake.agentId),
+        eq(heartbeatRuns.companyId, wake.companyId), pendingAttention ? undefined : eq(heartbeatRuns.agentId, wake.agentId),
         sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${String(wake.payload?.issueId)}`,
       )).orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1);
       await db.update(agentWakeupRequests).set({ updatedAt: new Date() }).where(and(
@@ -2891,6 +2901,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               conversationState: issues.conversationState,
               status: issues.status,
               statusVersion: issues.statusVersion,
+              hiddenAt: issues.hiddenAt,
               projectId: issues.projectId,
               projectWorkspaceId: issues.projectWorkspaceId,
               executionWorkspaceId: issues.executionWorkspaceId,
@@ -3339,6 +3350,32 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             return true;
           };
 
+          const pendingInteractionAddressee = await isCurrentPendingInteractionAddressee(
+            tx as unknown as Db, agent.companyId, issue.id, agentId, enrichedContextSnapshot,
+          );
+          if (enrichedContextSnapshot.wakeReason === "interaction_pending") {
+            if (!pendingInteractionAddressee || issue.hiddenAt || ["done", "cancelled"].includes(issue.status)) {
+              return { kind: "skipped" as const };
+            }
+            // The issue lock serializes duplicate events for this exact card and recipient.
+            const [existing] = await tx.select().from(agentWakeupRequests).where(and(
+              eq(agentWakeupRequests.companyId, agent.companyId),
+              eq(agentWakeupRequests.agentId, agentId),
+              sql`${agentWakeupRequests.payload}->>'interactionId' = ${String(enrichedContextSnapshot.interactionId)}`,
+            )).orderBy(asc(agentWakeupRequests.requestedAt)).limit(1);
+            if (existing) {
+              const existingRun = existing.runId ? await tx.select().from(heartbeatRuns)
+                .where(eq(heartbeatRuns.id, existing.runId)).then(rows => rows[0] ?? null) : null;
+              if (existingRun && ["queued", "running", "scheduled_retry"].includes(existingRun.status)) {
+                return { kind: "replayed" as const, run: existingRun };
+              }
+              if (!existing.runId && ["queued", "claimed", "deferred_issue_execution"].includes(existing.status)) {
+                return { kind: "deferred" as const };
+              }
+              return { kind: "skipped" as const };
+            }
+          }
+
           let activeExecutionRun = issue.executionRunId
             ? await tx
                 .select()
@@ -3382,7 +3419,9 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             activeExecutionRun &&
             activeExecutionRun.status !== "running" &&
             issue.assigneeAgentId &&
-            activeExecutionRun.agentId !== issue.assigneeAgentId
+            activeExecutionRun.agentId !== issue.assigneeAgentId &&
+            !await isCurrentPendingInteractionAddressee(tx as unknown as Db, agent.companyId,
+              issue.id, activeExecutionRun.agentId, activeExecutionRun.contextSnapshot)
           ) {
             const cancelled = await tx
               .update(heartbeatRuns)
@@ -3392,6 +3431,10 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                 error:
                   "Execution lock released after issue reassigned to a different agent",
                 errorCode: "lock_released_on_reassignment",
+                ...(activeExecutionRun.contextSnapshot?.wakeReason === "interaction_pending" ? {
+                  resultJson: { ...activeExecutionRun.resultJson,
+                    executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
+                } : {}),
                 updatedAt: new Date(),
               })
               .where(
@@ -3420,6 +3463,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                     ),
                   );
               }
+              await retainSupersededPendingInteractionWake(tx as unknown as Db, cancelled[0], issue, new Date());
               activeExecutionRun = null;
             }
           }
@@ -3491,10 +3535,10 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           const blockedInteractionWake =
             dependencyReadiness &&
             !dependencyReadiness.isDependencyReady &&
-            allowsIssueInteractionWake(
+            (pendingInteractionAddressee || allowsIssueInteractionWake(
               enrichedContextSnapshot,
               ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS,
-            );
+            ));
 
           if (blockedInteractionWake) {
             enrichedContextSnapshot.dependencyBlockedInteraction = true;

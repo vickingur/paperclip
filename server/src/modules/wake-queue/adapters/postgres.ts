@@ -1,3 +1,4 @@
+import { readPendingInteractionWake, retainSupersededPendingInteractionWake } from "../../../services/pending-interaction-wake.js";
 import { isAcknowledgedNativeReassignmentStop, isAcknowledgedNativeStop } from "../../../services/acknowledged-native-stop.js";
 import { isCompletedOnboardingHandoffWake } from "../../../services/chat-completion-delivery.js";
 import { instanceSettingsService } from "../../../services/instance-settings.js";
@@ -182,7 +183,7 @@ function buildHost(_tx: Db, deps: WakeQueuePostgresAdapterDeps): WakeQueueHost {
   };
 }
 
-function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, run: HeartbeatRunRow): WakeQueueTransaction {
+function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, run: HeartbeatRunRow, pendingRecoveryWakeId: string | null = null): WakeQueueTransaction {
   const treeControlSvc = issueTreeControlService(tx);
   const issuesSvc = issueService(tx);
   const interruptQueueId = run.runtimeMode !== "native" && run.status === "cancelled"
@@ -212,6 +213,7 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
               eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS),
               excludedWakeIds?.length ? notInArray(agentWakeupRequests.id, excludedWakeIds) : undefined,
               sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,
+              pendingRecoveryWakeId ? eq(agentWakeupRequests.id, pendingRecoveryWakeId) : undefined,
               interruptQueueId ? eq(agentWakeupRequests.id, interruptQueueId) : undefined,
               interruptQueueId ? eq(agentWakeupRequests.agentId, run.agentId) : undefined,
             ),
@@ -220,7 +222,22 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
           .limit(1)
           .then((rows) => rows[0] ?? null);
         if (!row) return null;
-        const candidate = toDeferredWakeCandidate(row);
+        let candidate = toDeferredWakeCandidate(row);
+        if (candidate.deferredContextSeed.wakeReason === "interaction_pending") {
+          const card = await readPendingInteractionWake(tx, companyId, issueId, candidate.deferredContextSeed);
+          if (!card) {
+            await tx.update(agentWakeupRequests).set({ status: "cancelled", finishedAt: new Date(),
+              error: "Interaction no longer pending for an agent", updatedAt: new Date() })
+              .where(eq(agentWakeupRequests.id, row.id));
+            continue;
+          }
+          if (row.agentId !== card.addresseeAgentId) {
+            const [retargeted] = await tx.update(agentWakeupRequests).set({
+              agentId: card.addresseeAgentId!, updatedAt: new Date(),
+            }).where(eq(agentWakeupRequests.id, row.id)).returning();
+            candidate = toDeferredWakeCandidate(retargeted!);
+          }
+        }
         try {
           const authorizedFailedChatRetry = await authorizeFailedChatRunRetryWake(
             db,
@@ -1082,6 +1099,9 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
         const issueRow =
           (contextIssueId ? candidateIssues.find((candidate) => candidate.id === contextIssueId) : candidateIssues[0]) ?? null;
 
+        const retainedPendingInteraction = issueRow
+          ? await retainSupersededPendingInteractionWake(tx, run, issueRow, input.now) : false;
+
         // A queue interrupt authorizes only its original pending queue. Replays
         // after dispatch or deleting the final message cannot launch other work.
         const interruptQueueId = run.runtimeMode !== "native"
@@ -1109,10 +1129,10 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
           // next explicit wake adopts those messages atomically when it
           // queues a run.
           executionCancellationAcknowledged:
-            isAcknowledgedNativeReassignmentStop(run) ||
+            !retainedPendingInteraction && (isAcknowledgedNativeReassignmentStop(run) ||
             (run.status === "cancelled" &&
             (parseObject(run.resultJson?.executionCancellation).state === "acknowledged" || isAcknowledgedNativeStop(run)) &&
-            !interruptedQueue),
+            !interruptedQueue)),
         };
         const preDrain = decidePreDrain(preDrainFacts);
 
@@ -1195,7 +1215,7 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
         }
 
         const locked: LockedIssueExecution = { primaryIssue: toIssueSnapshot(issueRow), run: runSnapshot, recoveryOnly };
-        const result = await fn(locked, { host: buildHost(tx, deps), transaction: buildTransaction(tx, deps, db, run) });
+        const result = await fn(locked, { host: buildHost(tx, deps), transaction: buildTransaction(tx, deps, db, run, retainedPendingInteraction ? run.wakeupRequestId : null) });
         // Explicit retry admission requires the exact source's task claim.
         // Preserve it only when the existing queue-first recovery policy
         // requests that retry. The clear/restore stays inside this task lock.
