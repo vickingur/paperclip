@@ -8,6 +8,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { agents, companies, createDb, heartbeatRuns } from "@paperclipai/db";
 import { companySkillRoutes } from "../routes/company-skills.js";
 import { agentRoutes } from "../routes/agents.js";
+import { instanceSettingsRoutes } from "../routes/instance-settings.js";
 import { errorHandler } from "../middleware/error-handler.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { preparePlanSkills, selectPlanSkills, verifyPlanSkills, verifyPlanSelection } from "../../../tests/runner-e2e/plan-task-skills.js";
@@ -25,7 +26,7 @@ if (!support.supported) console.warn(`Planning fixture API calibration skipped: 
   let db: ReturnType<typeof createDb>;
   let root: string;
   const savedHome = process.env.PAPERCLIP_HOME, savedInstance = process.env.PAPERCLIP_INSTANCE_ID;
-  let api: Pick<RunnerApi, "get" | "post">;
+  let api: Pick<RunnerApi, "get" | "post" | "patch">;
   let app: express.Express;
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-plan-fixture-");
@@ -38,8 +39,14 @@ if (!support.supported) console.warn(`Planning fixture API calibration skipped: 
     app.use((req, _res, next) => { (req as any).actor = { type: "board", source: "local_implicit", isInstanceAdmin: true, userId: "local-board" }; next(); });
     app.use("/api", companySkillRoutes(db));
     app.use("/api", agentRoutes(db));
+    app.use("/api", instanceSettingsRoutes(db));
     app.use(errorHandler);
     api = {
+      async patch<T>(url: string, body?: unknown): Promise<T> {
+        const response = await request(app).patch(url).send(body as object);
+        if (response.status !== 200) throw new Error(`PATCH ${url}: ${response.status} ${JSON.stringify(response.body)}`);
+        return response.body;
+      },
       async get<T>(url: string): Promise<T> {
         const response = await request(app).get(url);
         if (response.status !== 200) throw new Error(`GET ${url}: ${response.status} ${JSON.stringify(response.body)}`);
@@ -73,9 +80,12 @@ if (!support.supported) console.warn(`Planning fixture API calibration skipped: 
     const contextSkills = [];
     for (const source of sources.filter(s => s.selected)) {
       const entry = (selected as any).entries.find((e: any) => e.key === source.key && e.desired);
+      expect(entry.currentVersionId).toBe(source.versionId);
+      expect(entry.sourcePath).toContain(`${path.sep}__versions__${path.sep}`);
+      expect(path.basename(entry.sourcePath)).toBe(entry.currentVersionId);
       const bytes = await readFile(path.join(entry.sourcePath, "SKILL.md"));
       expect(planHash(bytes)).toBe(source.sha256);
-      const mode = (await stat(path.join(entry.sourcePath, "SKILL.md"))).mode & 0o555;
+      const mode = (await stat(path.join(entry.sourcePath, "SKILL.md"))).mode & 0o7777;
       expect(mode).toBe(0o444);
       const digest = planHash(JSON.stringify([{ path: "SKILL.md", sha256: planHash(bytes), mode, size: bytes.length }]));
       expect(invocations.find(i => i.name === entry.runtimeName)?.assetDigest).toBe(digest);
@@ -92,6 +102,13 @@ if (!support.supported) console.warn(`Planning fixture API calibration skipped: 
     })));
     await verifyPlanSelection(api, companyId, agentId, sources);
     await verifyPlanSkills(api, companyId, sources);
+    if (variant !== "disabled") {
+      // Bare keys retain the same desired names but lose the frozen-version contract.
+      await api.post(`/api/agents/${agentId}/skills/sync?companyId=${companyId}`, {
+        desiredSkills: sources.map(s => s.key), mode: "replace",
+      });
+      await expect(verifyPlanSelection(api, companyId, agentId, sources)).rejects.toThrow("version selection differs");
+    }
     const after = await api.get<any[]>(`/api/companies/${companyId}/skills`);
     expect(after.find(s => s.key === bundled.key)?.id).toBe(bundled.id);
     expect(after.find(s => s.key === bundled.key)?.markdown).toBe(bundled.markdown);
