@@ -129,6 +129,7 @@ export type StalenessDecision =
     };
 
 export type QueuedRunFacts = {
+  pendingInteractionObsolete?: boolean;
   /** Rechecked for automatic native replacements immediately before dispatch. */
   dependenciesBlocked?: DependencyBlockFacts | null;
   runId: string;
@@ -505,6 +506,12 @@ export function decideQueuedRunStaleness(
       reason: "Cancelled because the target issue no longer exists",
       details: { issueId: facts.issueId },
     };
+  }
+
+  if (facts.pendingInteractionObsolete) {
+    return { stale: true, errorCode: "issue_assignee_changed",
+      reason: "Pending interaction resolved or changed recipient before dispatch",
+      details: { issueId: facts.issueId } };
   }
 
   if (facts.isResolvedInteractionContinuation || facts.isConnectionContinuation) {

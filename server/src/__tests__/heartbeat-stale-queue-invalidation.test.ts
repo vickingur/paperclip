@@ -279,6 +279,52 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     return { runId, wakeupRequestId };
   }
 
+  it.each(["duplicate", "recipient_changed", "answered", "withdrawn"])(
+    "delivers pending-card attention through the heartbeat path (%s)", async scenario => {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      const ownerId = randomUUID();
+      await db.insert(agents).values({ id: ownerId, companyId, name: "Question owner", role: "engineer",
+        status: "active", adapterType: "codex_local", adapterConfig: {}, runtimeConfig: {}, permissions: {} });
+      const [issue] = await db.insert(issues).values({ companyId, title: "Synthetic pending question",
+        status: "blocked", assigneeAgentId: ownerId, responsibleUserId: "responsible-user" }).returning();
+      const [card] = await db.insert(issueThreadInteractions).values({ companyId, issueId: issue.id,
+        kind: "ask_user_questions", status: "pending", addresseeAgentId: agentId,
+        createdByAgentId: ownerId, payload: { version: 1, questions: [{ id: "input", prompt: "Synthetic input?", selectionMode: "single", options: [] }] },
+      }).returning();
+      const wake = () => heartbeat.wakeup(agentId, { source: "automation", triggerDetail: "system",
+        reason: "interaction_pending", requestedByActorType: "system",
+        idempotencyKey: `interaction-pending:${card.id}`,
+        payload: { issueId: issue.id, interactionId: card.id, mutation: "interaction" },
+        contextSnapshot: { issueId: issue.id, interactionId: card.id, interactionKind: card.kind,
+          wakeReason: "interaction_pending" },
+      });
+      if (scenario === "duplicate") {
+        const first = await wake();
+        expect(first).not.toBeNull();
+        await drainHeartbeatRunsToQuiescence(db, heartbeat);
+        await wake();
+        expect(mockAdapterExecute).toHaveBeenCalledTimes(1);
+        expect(await db.select().from(heartbeatRuns)).toHaveLength(1);
+      } else {
+        const { runId, wakeupRequestId } = await seedQueuedRun({ companyId, agentId, issueId: issue.id,
+          invocationSource: "automation", wakeReason: "interaction_pending", contextExtras: { interactionId: card.id } });
+        await db.update(agentWakeupRequests).set({ payload: { issueId: issue.id, interactionId: card.id, mutation: "interaction" } })
+          .where(eq(agentWakeupRequests.id, wakeupRequestId));
+        await db.update(issueThreadInteractions).set(scenario === "recipient_changed"
+          ? { addresseeAgentId: ownerId } : { status: scenario }).where(eq(issueThreadInteractions.id, card.id));
+        await heartbeat.resumeQueuedRuns();
+        await drainHeartbeatRunsToQuiescence(db, heartbeat);
+        expect(countExecuteCallsForRun(runId)).toBe(0);
+        if (scenario === "recipient_changed") {
+          expect(mockAdapterExecute).toHaveBeenCalledTimes(1);
+          const [receipt] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wakeupRequestId));
+          expect(receipt.agentId).toBe(ownerId);
+          expect(receipt.runId).not.toBe(runId);
+        } else expect(mockAdapterExecute).not.toHaveBeenCalled();
+      }
+    },
+  );
+
   async function seedContinuationSummary(input: {
     companyId: string;
     issueId: string;
