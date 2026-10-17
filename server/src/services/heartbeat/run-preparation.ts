@@ -1857,6 +1857,11 @@ export function mergeCoalescedContextSnapshot(
     ...existing,
     ...incoming,
   };
+  // Keep the union through deferred promotion and repeated card delivery.
+  const wakeReasons = [...new Set([existing, incoming].flatMap(context => [
+    ...(Array.isArray(context.wakeReasons) ? context.wakeReasons : []), context.wakeReason,
+  ]).filter((value): value is string => typeof value === "string" && value.length > 0))];
+  if (wakeReasons.length) merged.wakeReasons = wakeReasons;
   // Only executeRun can mint this proof. Coalescence may retain an unchanged
   // admitted proof, but must never accept a new marker from an incoming wake.
   delete merged[PAPERCLIP_EXTERNAL_CHAT_EXECUTION_BOUND_KEY];
@@ -2634,6 +2639,7 @@ export async function buildPaperclipWakePayload(input: {
     : [];
   const payload = {
     reason: readNonEmptyString(input.contextSnapshot.wakeReason),
+    reasons: input.contextSnapshot.wakeReasons,
     executionContinuation: input.contextSnapshot.executionContinuation ?? null,
     chatCompletionUpdates: input.contextSnapshot.chatCompletionUpdates ?? null,
     attachmentOmissions,
