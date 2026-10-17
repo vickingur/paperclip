@@ -262,6 +262,22 @@ describeEmbeddedPostgres("heartbeat issue rewake throttle", () => {
     } finally { release(); }
   });
 
+  it("admits an unblock owner who is not the assignee after their recent successful run", async () => {
+    const { companyId, agentId, issueId } = await seedCompanyAgentIssue();
+    await seedTerminalRun({ companyId, agentId, issueId, finishedSecondsAgo: 10 });
+    // The recent reviewer is now the unblock owner, not the issue assignee.
+    const assigneeAgentId = randomUUID();
+    await db.insert(agents).values({ id: assigneeAgentId, companyId, name: "Author", role: "engineer",
+      status: "active", adapterType: "codex_local", adapterConfig: {}, runtimeConfig: {}, permissions: {} });
+    await db.update(issues).set({ status: "blocked", assigneeAgentId,
+      unblockDescriptor: { owner: { agentId }, action: "Review the finding" } }).where(eq(issues.id, issueId));
+    const result = await heartbeat.wakeup(agentId, { source: "automation", triggerDetail: "system",
+      reason: "issue_unblock_requested", payload: { issueId }, requestedByActorType: "system",
+      contextSnapshot: { issueId, wakeReason: "issue_unblock_requested" } });
+    expect(result).not.toBeNull();
+    expect((await latestWakeRequest(agentId))?.reason).not.toBe("issue_bookkeeping_backoff");
+  });
+
   it("backs off bare blocked re-wakes after one completed notification despite restating comments", async () => {
     const { companyId, agentId, issueId } = await seedCompanyAgentIssue();
     await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, issueId));

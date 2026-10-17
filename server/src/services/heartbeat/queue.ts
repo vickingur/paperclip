@@ -3844,6 +3844,8 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           // Server-side recovery retries insert runs directly and never reach
           // this gate.
           if (
+            // A different unblock owner has new work even after reviewing this issue.
+            (reason !== "issue_unblock_requested" || issue.assigneeAgentId === agentId) &&
             isThrottleCandidateIssueRewake({
               reason,
               wakeCommentId: wakeCommentId ?? null,

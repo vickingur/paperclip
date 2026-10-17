@@ -244,6 +244,11 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       fingerprint: "genuine-new-state" })).toBe(0);
     expect(await readDispositionRepairHighWater(db, { companyId: randomUUID(), issueId: sourceIssueId,
       fingerprint: "unchanged-state" })).toBe(0);
+    const durable = await create("durable-state", 5);
+    await svc.resolveActiveForIssue({ companyId, sourceIssueId, actionId: durable.id,
+      status: "resolved", outcome: "restored", resolutionNote: "durable_path_restored:monitor" });
+    expect(await readDispositionRepairHighWater(db, { companyId, issueId: sourceIssueId,
+      fingerprint: "durable-state" })).toBe(0);
   });
 
   async function seedHeartbeatRun(input: {

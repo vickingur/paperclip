@@ -252,7 +252,7 @@ export async function readDispositionRepairHighWater(db: Db, input: {
       eq(issueRecoveryActions.sourceIssueId, input.issueId),
       eq(issueRecoveryActions.kind, "deliberate_wait_without_target"),
       eq(issueRecoveryActions.fingerprint, input.fingerprint),
-      sql`(${issueRecoveryActions.status} in ('active', 'escalated') or ${issueRecoveryActions.outcome} = 'restored')`,
+      sql`(${issueRecoveryActions.status} in ('active', 'escalated') or (${issueRecoveryActions.outcome} = 'restored' and ${issueRecoveryActions.resolutionNote} = 'new_source_execution_path'))`,
     ));
   return row?.attempts ?? 0;
 }
