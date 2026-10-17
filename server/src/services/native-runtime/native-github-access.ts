@@ -67,7 +67,7 @@ export async function createNativeGitHubAccess(input: {
     } catch (error) {
       const status = (error as { status?: number })?.status;
       // Never leak secret-store/provider errors. Preserve steering's retry signal.
-      reply(status === 409 ? 409 : status === 403 ? 403 : 503,
+      reply(status === 429 ? 429 : status === 409 ? 409 : status === 403 ? 403 : 503,
         { error: "GitHub credentials unavailable" });
     }
   });

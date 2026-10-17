@@ -126,3 +126,12 @@ it.each([false, true])("keeps anonymous launchers usable when the remote broker 
   expect(result.stdout).toBe("anonymous");
   expect(b.resolveCredentials).not.toHaveBeenCalled();
 });
+
+it("preserves the credential cap as HTTP 429 without exposing resolver details", async () => {
+  const resolver = vi.fn(async () => { throw Object.assign(new Error("sensitive fixture"), { status: 429 }); });
+  const b = await broker(resolver);
+  b.activate(run("limited"));
+  const response = await request(b);
+  expect(response.status).toBe(429);
+  expect(await response.text()).toBe(JSON.stringify({ error: "GitHub credentials unavailable" }));
+});
