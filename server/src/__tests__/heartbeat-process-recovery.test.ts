@@ -7330,6 +7330,51 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     );
   });
 
+  it("does not call a transient restored run a repaired disposition", async () => {
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress", runStatus: "cancelled", retryReason: "issue_continuation_needed",
+      runErrorCode: "issue_continuation_waiting_on_review",
+    });
+    const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    const state = await collectDispositionRepairSourceState(db, { issue });
+    const [action] = await db.insert(issueRecoveryActions).values({ companyId, sourceIssueId: issueId,
+      kind: "deliberate_wait_without_target", status: "active", ownerType: "agent", ownerAgentId: agentId,
+      cause: "deliberate_wait_without_target", fingerprint: state.fingerprint,
+      nextAction: "Choose a durable wait", attemptCount: 2, maxAttempts: 5,
+      wakePolicy: { type: "bounded_owner_disposition_repair" },
+    }).returning();
+    await db.insert(heartbeatRuns).values({ companyId, agentId, status: "running",
+      invocationSource: "automation", startedAt: new Date(),
+      contextSnapshot: { issueId, wakeReason: "issue_recovery_action_restored" } });
+    await heartbeatService(db).reconcileStrandedAssignedIssues();
+    const [retained] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id));
+    expect(retained).toMatchObject({ status: "active", attemptCount: 2, outcome: null });
+  });
+
+  it("does not grant a new repair budget after bookkeeping restored the same source state", async () => {
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress", runStatus: "cancelled", retryReason: "issue_continuation_needed",
+      runErrorCode: "issue_continuation_waiting_on_review",
+      runError: "Continuation parked: issue is waiting on review/approval",
+    });
+    const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    const state = await collectDispositionRepairSourceState(db, { issue });
+    await db.insert(issueRecoveryActions).values({ companyId, sourceIssueId: issueId,
+      kind: "deliberate_wait_without_target", status: "resolved", outcome: "restored",
+      ownerType: "agent", ownerAgentId: agentId, returnOwnerAgentId: agentId,
+      cause: "deliberate_wait_without_target", fingerprint: state.fingerprint,
+      nextAction: "Record a durable disposition", attemptCount: 5, maxAttempts: 5,
+      resolutionNote: "new_source_execution_path", resolvedAt: new Date(Date.now() - 90_000),
+    });
+    const result = await heartbeatService(db).reconcileStrandedAssignedIssues();
+    expect(result.dispositionRepairRequeued).toBe(0);
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId));
+    expect(runs.filter(run => run.contextSnapshot?.retryReason === "issue_disposition_repair")).toHaveLength(0);
+    const active = await db.select().from(issueRecoveryActions).where(and(
+      eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.status, "active")));
+    expect(active.every(action => action.ownerType === "board")).toBe(true);
+  });
+
   it("repairs the PAP-16986 deliberate wait through the original owner when no target exists", async () => {
     const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
       status: "in_progress",

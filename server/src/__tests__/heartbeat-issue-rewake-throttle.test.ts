@@ -209,6 +209,80 @@ describeEmbeddedPostgres("heartbeat issue rewake throttle", () => {
       .then((rows) => rows[0] ?? null);
   }
 
+  it("keeps a fixed durable queued batch and releases it immediately for human input", async () => {
+    const { agentId, issueId } = await seedCompanyAgentIssue();
+    const first = await heartbeat.wakeup(agentId, { source: "automation", triggerDetail: "system",
+      reason: "issue_children_completed", payload: { issueId }, requestedByActorType: "system",
+      contextSnapshot: { issueId, wakeReason: "issue_children_completed" } });
+    expect(first?.status).toBe("queued");
+    const deadline = first?.contextSnapshot?.wakeBatchNotBefore;
+    expect(typeof deadline).toBe("string");
+    heartbeat = heartbeatService(db);
+    const second = await heartbeat.wakeup(agentId, { source: "automation", triggerDetail: "system",
+      reason: "issue_children_completed", payload: { issueId }, requestedByActorType: "system",
+      contextSnapshot: { issueId, wakeReason: "issue_children_completed" } });
+    expect(second?.id).toBe(first?.id);
+    expect(second?.contextSnapshot?.wakeBatchNotBefore).toBe(deadline);
+    const human = await heartbeat.wakeup(agentId, { source: "on_demand", reason: "issue_commented",
+      payload: { issueId }, requestedByActorType: "user", requestedByActorId: "board-user",
+      contextSnapshot: { issueId, wakeReason: "issue_commented" } });
+    expect(human?.id).toBe(first?.id);
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, first!.id));
+    expect(run.contextSnapshot?.wakeBatchNotBefore).toBeNull();
+  });
+
+  it("coalesces concurrent comment/child/replay fan-out behind an active turn without losing reasons", async () => {
+    const { companyId, agentId, issueId } = await seedCompanyAgentIssue();
+    let release!: () => void;
+    let entered!: () => void;
+    const ready = new Promise<void>(resolve => { entered = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    mockAdapterExecute.mockImplementationOnce(async () => {
+      entered(); await gate;
+      return { exitCode: 0, signal: null, timedOut: false, errorMessage: null,
+        summary: "Waiting on CI", provider: "test", model: "test-model" };
+    });
+    try {
+      await assignmentWake(agentId, issueId);
+      await ready;
+      const [comment] = await db.insert(issueComments).values({ companyId, issueId,
+        authorUserId: "board-user", body: "Review answer" }).returning();
+      const request = (reason: string) => heartbeat.wakeup(agentId, {
+        source: "automation", triggerDetail: "system", reason,
+        payload: { issueId, ...(reason === "issue_commented" ? { commentId: comment.id } : {}) },
+        contextSnapshot: { issueId, wakeReason: reason }, requestedByActorType: "system",
+      });
+      await Promise.all([request("issue_commented"), request("issue_children_completed"), request("issue_commented")]);
+      const pending = await db.select().from(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.status, "deferred_issue_execution")));
+      expect(pending).toHaveLength(1);
+      const context = pending[0].payload?._paperclipWakeContext as Record<string, unknown>;
+      expect(context.wakeReasons).toEqual(expect.arrayContaining(["issue_commented", "issue_children_completed"]));
+      expect(context.wakeCommentIds).toEqual([comment.id]);
+    } finally { release(); }
+  });
+
+  it("backs off bare blocked re-wakes after one completed notification despite restating comments", async () => {
+    const { companyId, agentId, issueId } = await seedCompanyAgentIssue();
+    await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, issueId));
+    const runId = await seedTerminalRun({ companyId, agentId, issueId, finishedSecondsAgo: 10 });
+    await db.update(heartbeatRuns).set({ contextSnapshot: { issueId, wakeReason: "issue_unblock_requested" } })
+      .where(eq(heartbeatRuns.id, runId));
+    await db.insert(activityLog).values({ companyId, actorType: "agent", actorId: agentId,
+      runId, action: "issue.comment_added", entityType: "issue", entityId: issueId });
+    const wake = () => heartbeat.wakeup(agentId, { source: "automation", triggerDetail: "system",
+      reason: "issue_unblock_requested", payload: { issueId }, requestedByActorType: "system",
+      contextSnapshot: { issueId, wakeReason: "issue_unblock_requested" } });
+    expect(await wake()).toBeNull();
+    expect((await latestWakeRequest(agentId))?.reason).toBe("issue_bookkeeping_backoff");
+    // A new service instance shares the same durable backoff, not process memory.
+    heartbeat = heartbeatService(db);
+    expect(await wake()).toBeNull();
+    await db.insert(activityLog).values({ companyId, actorType: "user", actorId: "board-user",
+      action: "issue.comment_added", entityType: "issue", entityId: issueId });
+    expect(await wake()).not.toBeNull();
+  });
+
   it("skips event-free re-wakes after consecutive no-progress runs and admits them again on new input", async () => {
     const { companyId, agentId, issueId } = await seedCompanyAgentIssue();
 

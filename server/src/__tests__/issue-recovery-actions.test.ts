@@ -37,6 +37,7 @@ import { buildPaperclipWakePayload, heartbeatService } from "../services/heartbe
 import { deliverReconciledExecutions } from "../services/execution-recovery-resolution.js";
 import { workspaceOperationService, isNativeWorkspaceFinalizationOperationActive } from "../services/workspace-operations.js";
 import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
+import { readDispositionRepairHighWater } from "../services/recovery/disposition-repair.js";
 import { recoveryService } from "../services/recovery/service.js";
 import { noticeMetadataReferencesRecoveryAction } from "../services/recovery/successful-run-handoff.js";
 
@@ -225,6 +226,25 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     const [sourceIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
     return { companyId, managerId, coderId, sourceIssueId, prefix, sourceIssue: sourceIssue! };
   }
+
+  it("retains repair attempts across restored ping-pong and service restarts", async () => {
+    const { companyId, coderId, sourceIssueId } = await seedCompany();
+    const svc = issueRecoveryActionService(db);
+    const create = (fingerprint: string, attemptCount: number) => svc.upsertSourceScoped({
+      companyId, sourceIssueId, kind: "deliberate_wait_without_target", ownerType: "agent",
+      ownerAgentId: coderId, cause: "deliberate_wait_without_target", fingerprint,
+      attemptCount, maxAttempts: 5, nextAction: "Choose a durable wait",
+    });
+    const action = await create("unchanged-state", 2);
+    await svc.resolveActiveForIssue({ companyId, sourceIssueId, actionId: action.id,
+      status: "resolved", outcome: "restored", resolutionNote: "new_source_execution_path" });
+    expect(await readDispositionRepairHighWater(db, { companyId, issueId: sourceIssueId,
+      fingerprint: "unchanged-state" })).toBe(2);
+    expect(await readDispositionRepairHighWater(db, { companyId, issueId: sourceIssueId,
+      fingerprint: "genuine-new-state" })).toBe(0);
+    expect(await readDispositionRepairHighWater(db, { companyId: randomUUID(), issueId: sourceIssueId,
+      fingerprint: "unchanged-state" })).toBe(0);
+  });
 
   async function seedHeartbeatRun(input: {
     companyId: string;

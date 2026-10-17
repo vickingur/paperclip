@@ -7,6 +7,7 @@ import {
   heartbeatRuns,
   issueApprovals,
   issueRelations,
+  issueRecoveryActions,
   issueThreadInteractions,
   issueWorkProducts,
   issues,
@@ -237,4 +238,21 @@ export async function collectDispositionRepairSourceState(
     hasDurableWaitingPath: durablePathReason !== null,
     durablePathReason,
   };
+}
+
+/** Bookkeeping restoration is not a new attempt budget. Keep the high-water
+ * mark in the existing audit rows, including after restart. A different source
+ * fingerprint starts a new episode; explicit hand-backs retain their own lane. */
+export async function readDispositionRepairHighWater(db: Db, input: {
+  companyId: string; issueId: string; fingerprint: string;
+}): Promise<number> {
+  const [row] = await db.select({ attempts: sql<number>`coalesce(max(${issueRecoveryActions.attemptCount}), 0)::int` })
+    .from(issueRecoveryActions).where(and(
+      eq(issueRecoveryActions.companyId, input.companyId),
+      eq(issueRecoveryActions.sourceIssueId, input.issueId),
+      eq(issueRecoveryActions.kind, "deliberate_wait_without_target"),
+      eq(issueRecoveryActions.fingerprint, input.fingerprint),
+      sql`(${issueRecoveryActions.status} in ('active', 'escalated') or ${issueRecoveryActions.outcome} = 'restored')`,
+    ));
+  return row?.attempts ?? 0;
 }
