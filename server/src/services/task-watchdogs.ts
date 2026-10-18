@@ -471,6 +471,16 @@ export function classifyTaskWatchdogSubtree(input: TaskWatchdogClassifierInput):
   const nonTerminalIssues = included
     .filter((issue) => !isTerminalIssueStatus(issue.status))
     .sort((left, right) => left.id.localeCompare(right.id));
+  // A completed or cancelled subtree has no work to verify. Do not turn its
+  // empty leaf list into a new stop fingerprint and reopen a completed review.
+  // Keep scanning terminal roots above: they may still have unfinished children.
+  if (nonTerminalIssues.length === 0) {
+    return {
+      state: "not_applicable",
+      reason: "Watched subtree has no non-terminal issues.",
+      includedIssueIds: includedIds,
+    };
+  }
   const waitsByIssueId = Object.fromEntries(nonTerminalIssues
     .map((issue) => [issue.id, {
       pendingInteractionIds: waitingPathIds(input.pendingInteractions, input.watchdog.companyId, issue.id),

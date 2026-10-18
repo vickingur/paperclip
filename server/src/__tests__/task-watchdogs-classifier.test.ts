@@ -35,6 +35,31 @@ function classify(overrides: Partial<Parameters<typeof classifyTaskWatchdogSubtr
 }
 
 describe("task watchdog subtree classifier", () => {
+  it.each(["done", "cancelled"])("ignores an all-terminal subtree with a %s source", (status) => {
+    expect(classify({
+      issues: [
+        issue({ status }),
+        issue({ id: childId, parentId: sourceId, status: "done" }),
+      ],
+      // A legacy review can have a fingerprint without a material snapshot.
+      watchdog: { companyId, issueId: sourceId, lastReviewedFingerprint: "legacy-reviewed" },
+    })).toMatchObject({ state: "not_applicable", includedIssueIds: [sourceId, childId] });
+  });
+
+  it("still verifies an unfinished parent after all children finish", () => {
+    expect(classify({ issues: [
+      issue({ status: "blocked" }),
+      issue({ id: childId, parentId: sourceId, status: "done" }),
+    ] }).state).toBe("stopped");
+  });
+
+  it("still verifies unfinished work below a cancelled source", () => {
+    expect(classify({ issues: [
+      issue({ status: "cancelled" }),
+      issue({ id: childId, parentId: sourceId, status: "blocked" }),
+    ] }).state).toBe("stopped");
+  });
+
   it("suppresses watchdog wakeups while watched subtree work has a live path", () => {
     const result = classify({
       issues: [
@@ -281,7 +306,7 @@ describe("task watchdog subtree classifier", () => {
   it("excludes task-watchdog issues and their descendants from watched subtree scans", () => {
     const result = classify({
       issues: [
-        issue({ status: "done" }),
+        issue({ status: "blocked" }),
         issue({
           id: watchdogId,
           identifier: "PAP-3",

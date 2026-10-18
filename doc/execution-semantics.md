@@ -887,6 +887,8 @@ The reusable watchdog issue is a child of the watched source issue for audit and
 
 ### Stopped-subtree evaluation
 
+A watched subtree with only `done` or `cancelled` issues does not create or reopen a watchdog review. A terminal source can still have unfinished descendants; those descendants remain eligible for verification. An unfinished parent remains eligible even when all its children are terminal.
+
 Task watchdog evaluation is conservative. If any included issue has a live run, queued wake, or scheduled retry that should fire without intervention, the subtree is live and the task watchdog does not run.
 
 If no included issue has a live path, Paperclip computes a stop fingerprint from durable subtree state, including at least:
