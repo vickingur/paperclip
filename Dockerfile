@@ -205,6 +205,12 @@ RUN apt-get update \
     && ln -s "/opt/blender-${BLENDER_VERSION}-linux-x64/blender" /usr/local/bin/blender; \
   fi
 
+# Chromium system dependencies must live in the image, not the app-home volume.
+# Pin the package that owns the Debian/architecture-specific dependency list.
+# Browser binaries and the runtime JS package remain in persistent tooling.
+RUN npx --yes playwright@1.58.2 install-deps chromium \
+  && rm -rf /var/lib/apt/lists/*
+
 # Fork qualification tools: cached independently of the application copy.
 # Reuse the runner-owned compiler pin; exclude cargo-chef, caches and targets.
 RUN apt-get update \
