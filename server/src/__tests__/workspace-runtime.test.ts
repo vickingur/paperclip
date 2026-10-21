@@ -8,7 +8,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { parse as parseEnvContents } from "dotenv";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
   agents,
@@ -58,6 +58,7 @@ import {
   WORKSPACE_RUNTIME_PORT_ALLOCATION_ATTEMPTS,
   type RealizedExecutionWorkspace,
 } from "../services/workspace-runtime.ts";
+import * as localServiceSupervisor from "../services/local-service-supervisor.ts";
 import {
   findAdoptableLocalService,
   isLocalServiceRegistryCwdCompatible,
@@ -7556,6 +7557,10 @@ describeEmbeddedPostgres("workspace runtime service control persistence", () => 
     const previousPath = process.env.PATH;
     await fs.writeFile(fakeLsof, "#!/bin/sh\nexit 1\n", { mode: 0o755 });
     process.env.PATH = `${fakeBin}${path.delimiter}${previousPath ?? ""}`;
+    // Model unavailable ownership at the discovery boundary: Linux can now
+    // recover ownership through procfs even when lsof is missing.
+    const ownershipRead = vi.spyOn(localServiceSupervisor, "readLocalServicePortOwner")
+      .mockResolvedValue(null);
 
     try {
       await expect(startRuntimeServicesForWorkspaceControl({
@@ -7574,7 +7579,9 @@ describeEmbeddedPostgres("workspace runtime service control persistence", () => 
           attemptedPortCount: WORKSPACE_RUNTIME_PORT_ALLOCATION_ATTEMPTS,
         },
       });
+      expect(ownershipRead).toHaveBeenCalledWith(basePort);
     } finally {
+      ownershipRead.mockRestore();
       if (previousPath === undefined) delete process.env.PATH;
       else process.env.PATH = previousPath;
       await stopRuntimeServicesForExecutionWorkspace({

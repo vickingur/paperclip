@@ -388,8 +388,9 @@ async function isLikelyMatchingCommand(record: LocalServiceRegistryRecord) {
   if (process.platform === "win32") return true;
   if (!isLocalServiceCommandLineComparable(record.command)) return true;
   try {
-    const { stdout } = await execFileAsync("ps", ["-o", "command=", "-p", String(record.pid)]);
-    const commandLine = stdout.trim();
+    const commandLine = process.platform === "linux"
+      ? (await fs.readFile(`/proc/${record.pid}/cmdline`, "utf8")).replace(/\0/g, " ").trim()
+      : (await execFileAsync("ps", ["-o", "command=", "-p", String(record.pid)])).stdout.trim();
     if (!commandLine) return false;
     return doesLocalServiceCommandLineMatch({
       commandLine,
@@ -397,7 +398,8 @@ async function isLikelyMatchingCommand(record: LocalServiceRegistryRecord) {
       serviceName: record.serviceName,
     });
   } catch {
-    return true;
+    // Missing Linux process evidence must not authorize adoption.
+    return process.platform !== "linux";
   }
 }
 
@@ -438,6 +440,12 @@ export async function findAdoptableLocalService(input: {
 export async function readLocalServiceProcessGroupId(pid: number) {
   if (process.platform === "win32") return null;
   try {
+    if (process.platform === "linux") {
+      const stat = await fs.readFile(`/proc/${pid}/stat`, "utf8");
+      const fields = stat.slice(stat.lastIndexOf(")") + 1).trim().split(/\s+/);
+      const pgid = Number.parseInt(fields[2] ?? "", 10);
+      return Number.isInteger(pgid) && pgid > 0 ? pgid : null;
+    }
     const { stdout } = await execFileAsync("ps", ["-o", "pgid=", "-p", String(pid)]);
     const parsed = Number.parseInt(stdout.trim(), 10);
     return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
@@ -604,9 +612,51 @@ export async function terminateLocalService(
   throw new Error(`Failed to terminate local service ${target}${listener}`);
 }
 
+// Minimal Linux images need not contain lsof or ps. Resolve the listening
+// socket inode first, then its PID; cwd/group checks still gate adoption.
+async function readLinuxListeningPortOwner(port: number) {
+  // An ancestor namespace's procfs exposes PIDs that process.kill cannot use.
+  // Refuse ownership evidence rather than signal an unrelated local PID.
+  if (path.basename(await fs.realpath("/proc/self")) !== String(process.pid)) return null;
+  const inodes = new Set<string>();
+  for (const table of ["tcp", "tcp6"]) {
+    try {
+      const content = await fs.readFile(`/proc/net/${table}`, "utf8");
+      for (const line of content.trim().split("\n").slice(1)) {
+        const fields = line.trim().split(/\s+/);
+        const localPort = Number.parseInt(fields[1]?.split(":")[1] ?? "", 16);
+        if (fields[3] === "0A" && localPort === port && fields[9]) inodes.add(fields[9]);
+      }
+    } catch {
+      // IPv6 can be disabled; an unreadable table provides no ownership proof.
+    }
+  }
+  if (inodes.size === 0) return null;
+  const owners = new Set<number>();
+  for (const entry of await fs.readdir("/proc")) {
+    if (!/^\d+$/.test(entry)) continue;
+    try {
+      for (const fd of await fs.readdir(`/proc/${entry}/fd`)) {
+        try {
+          const target = await fs.readlink(`/proc/${entry}/fd/${fd}`);
+          const inode = /^socket:\[(\d+)\]$/.exec(target)?.[1];
+          if (inode && inodes.has(inode)) owners.add(Number(entry));
+        } catch {
+          // Descriptors can close while scanning.
+        }
+      }
+    } catch {
+      // Processes can exit or belong to another user.
+    }
+  }
+  // Multiple PIDs may share a socket. Do not guess which group to terminate.
+  return owners.size === 1 ? [...owners][0]! : null;
+}
+
 export async function readLocalServicePortOwner(port: number) {
   if (!Number.isInteger(port) || port <= 0) return null;
   try {
+    if (process.platform === "linux") return await readLinuxListeningPortOwner(port);
     if (process.platform === "win32") {
       const { stdout } = await execFileAsync("netstat", ["-ano", "-p", "tcp"]);
       for (const line of stdout.split(/\r?\n/)) {
