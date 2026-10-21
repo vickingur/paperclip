@@ -2113,3 +2113,5 @@ Chromium. The test starts its own loopback Vite server and mocks API responses;
 it needs no running Paperclip instance or provider credentials. The same spec lives
 in the default `test:e2e` discovery tree, so the existing Chrome CI shards run it
 on pull requests.
+
+For image updates and the non-root Chromium check, see the [container update runbook](container-update-runbook.md).
