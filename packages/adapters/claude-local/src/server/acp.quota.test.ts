@@ -100,10 +100,13 @@ it.each([
     title, "service", mode, version === "0.13.1" ? runnerAcpx.createAcpRuntime : undefined,
     { PROVIDER_SETTING: secret }, details,
   );
+  // A provider overload takes the bounded transient retry (VIK-1854).
   expect(result).toMatchObject({
     exitCode: 1,
-    errorCode: "acpx_turn_failed",
+    errorCode: "claude_transient_upstream",
+    errorFamily: "transient_upstream",
     resultJson: {
+      errorFamily: "transient_upstream",
       terminalSessionFailure: {
         category: "service",
         title,
@@ -199,4 +202,19 @@ it.each([
   "Tool authorization denied.",
 ])("does not treat a tool or workspace request failure as a login rejection: %s", (title) => {
   expect(classifyClaudeTerminalSessionFailure({ category: "request", title }, now)).toBeNull();
+});
+
+it.each([
+  ["Overloaded", "service", true],
+  ["API Error: 529 {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}", "service", true],
+  ["Selected model is at capacity. Please try a different model.", "service", true],
+  ["Overloaded", "request", false],
+  ["Internal server error", "service", false],
+])("classifies provider overload only for typed service failures: %s (%s)", (title, category, transient) => {
+  const classified = classifyClaudeTerminalSessionFailure({ category, title }, now);
+  if (transient) {
+    expect(classified).toEqual({ errorCode: "claude_transient_upstream", errorFamily: "transient_upstream" });
+  } else {
+    expect(classified?.errorFamily).not.toBe("transient_upstream");
+  }
 });

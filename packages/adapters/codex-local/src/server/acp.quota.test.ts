@@ -105,6 +105,34 @@ it.each([
   expect(logs).not.toContain(title);
 });
 
+it("classifies a model-capacity service failure as transient upstream, not quota", async () => {
+  // Exact provider text from VIK-1854 (SE3 run cffad0fd, Platform Engineer run a5334334).
+  const { result } = await executeFailure("Selected model is at capacity. Please try a different model.", "service");
+  expect(result).toMatchObject({
+    exitCode: 1,
+    errorCode: "codex_transient_upstream",
+    errorFamily: "transient_upstream",
+    resultJson: { errorFamily: "transient_upstream" },
+  });
+  expect(result.retryNotBefore).toBeUndefined();
+});
+
+it.each([
+  ["Selected model is at capacity. Please try a different model.", "service", true],
+  ["Server overloaded", "service", true],
+  ["We're currently experiencing high demand, which may cause temporary errors.", "service", true],
+  ["Selected model is at capacity. Please try a different model.", "limit", false],
+  ["Context window capacity limit reached", "service", false],
+  ["Internal server error", "service", false],
+])("classifies provider overload only for typed service failures: %s (%s)", (title, category, transient) => {
+  const classified = classifyCodexTerminalSessionFailure({ category, title }, now);
+  if (transient) {
+    expect(classified).toEqual({ errorCode: "codex_transient_upstream", errorFamily: "transient_upstream" });
+  } else {
+    expect(classified?.errorFamily).not.toBe("transient_upstream");
+  }
+});
+
 it("does not infer quota from the historical generic terminal-limit error", () => {
   expect(classifyCodexTerminalSessionFailure({
     category: "limit",
