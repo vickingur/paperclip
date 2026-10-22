@@ -29,7 +29,11 @@ console.log(JSON.stringify({
 }
 
 async function writeFakeCursorAgentCommand(commandPath: string): Promise<void> {
-  const script = `#!/usr/bin/env node
+  // Use the test process's interpreter even when the sandbox PATH has no Node.
+  // This shell/JavaScript launcher also supports spaces and quotes in its path.
+  const nodeCommand = "'" + process.execPath.replaceAll("'", "'\"'\"'") + "'";
+  const script = `#!/bin/sh
+':' //; exec ${nodeCommand} "$0" "$@"
 const fs = require("node:fs");
 const outPath = process.env.PAPERCLIP_TEST_ARGS_PATH;
 if (outPath) {
