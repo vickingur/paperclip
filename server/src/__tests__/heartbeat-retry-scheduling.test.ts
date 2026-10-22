@@ -56,6 +56,7 @@ vi.mock("../services/heartbeat-run-events.js", async (importOriginal) => {
 });
 
 import { appendHeartbeatRunEvent } from "../services/heartbeat-run-events.js";
+import { CONVERSATION_CONTINUATION_POLICY } from "../services/conversation-continuation.js";
 import { subscribeCompanyLiveEvents } from "../services/live-events.js";
 import {
   BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS,
@@ -75,6 +76,7 @@ const PROVIDER_CAPACITY_TEST_ADAPTER = "provider_capacity_test";
 // Exact terminal text from VIK-1854 (SE3 run cffad0fd, Platform Engineer run a5334334).
 const PROVIDER_CAPACITY_MESSAGE =
   "ACP agent reported a terminal service failure.\nSelected model is at capacity. Please try a different model.";
+let capacityRunContinuesConversation = true;
 
 if (!embeddedPostgresSupport.supported) {
   console.warn(
@@ -139,9 +141,13 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
         errorMessage: PROVIDER_CAPACITY_MESSAGE,
         errorCode: "codex_transient_upstream",
         errorFamily: "transient_upstream",
-        executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
         resultJson: {
-          executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
+          // A real Codex/Claude run persists the conversation-continuation
+          // policy (run-lifecycle); it carries no bootstrap evidence. Without
+          // it, the retry is refused pending reconciliation.
+          ...(capacityRunContinuesConversation
+            ? { conversationContinuation: CONVERSATION_CONTINUATION_POLICY }
+            : {}),
           errorFamily: "transient_upstream",
           terminalSessionFailure: {
             category: "service",
@@ -166,6 +172,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     // when teardown starts. The cleanup deletes issues before heartbeat_runs, so
     // a late write races the deletes and can deadlock or break a foreign key.
     await drainHeartbeatRunsToQuiescence(db, heartbeat);
+    capacityRunContinuesConversation = true;
     await cleanupRetryFixture();
     vi.clearAllMocks();
   });
@@ -432,7 +439,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       .toEqual({ status: "idle", errorReason: null });
   });
 
-  it("keeps the agent idle through transient model-capacity retries and errors only when the budget is spent", async () => {
+  async function seedCapacityAgent() {
     const companyId = randomUUID();
     const agentId = randomUUID();
     await db.insert(companies).values({
@@ -465,6 +472,11 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
         .from(heartbeatRuns)
         .where(eq(heartbeatRuns.retryOfRunId, runId))
         .then((rows) => rows[0] ?? null);
+    return { agentId, readAgent, readRetryOf };
+  }
+
+  it("keeps the agent idle through transient model-capacity retries and errors only when the budget is spent", async () => {
+    const { agentId, readAgent, readRetryOf } = await seedCapacityAgent();
     const runRetryNow = async (retryId: string) => {
       await db.update(heartbeatRuns).set({ scheduledRetryAt: new Date(Date.now() - 1000) }).where(eq(heartbeatRuns.id, retryId));
       await heartbeat.promoteDueScheduledRetries();
@@ -497,6 +509,22 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     // Third consecutive failure exhausts the budget: now the agent needs attention.
     expect(await runRetryNow(secondRetry!.id)).toMatchObject({ status: "failed", errorCode: "codex_transient_upstream" });
     expect(await readRetryOf(secondRetry!.id)).toBeNull();
+    expect(await readAgent()).toEqual({ status: "error", errorReason: PROVIDER_CAPACITY_MESSAGE });
+  });
+
+  it("errors on a transient model-capacity failure whose retry is refused", async () => {
+    // No conversation policy and no bootstrap evidence: the previous execution
+    // must be reconciled, so no retry is queued and idle would hide the stall.
+    capacityRunContinuesConversation = false;
+    const { agentId, readAgent, readRetryOf } = await seedCapacityAgent();
+
+    const run = await heartbeat.invoke(agentId, "on_demand", {}, "manual");
+    expect(run).not.toBeNull();
+    expect(await waitForRunToFinish(heartbeat, run!.id))
+      .toMatchObject({ status: "failed", errorCode: "codex_transient_upstream" });
+    await heartbeat.drainActiveRunExecutions();
+
+    expect(await readRetryOf(run!.id)).toBeNull();
     expect(await readAgent()).toEqual({ status: "error", errorReason: PROVIDER_CAPACITY_MESSAGE });
   });
 

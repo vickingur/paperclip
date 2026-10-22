@@ -657,7 +657,10 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
     );
 
     const finalizedRun = persistedRun ?? (await getRun(run.id));
-    let transientRetryOutcome: string | null = null;
+    // Whether a transient failure's retry is owned by a live retry path.
+    // Only then may the agent stay idle; a refused or exhausted retry keeps
+    // the existing error status so the board sees the stall.
+    let transientRetryOwned = false;
     if (finalizedRun) {
       await appendRunEvent(finalizedRun, {
         eventType: "lifecycle",
@@ -857,9 +860,14 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
         outcome === "failed" &&
         readTransientRecoveryContractFromRun(livenessRun)
       ) {
-        transientRetryOutcome = (
-          await scheduleBoundedRetryForRun(livenessRun, agent)
-        ).outcome;
+        const transientRetry = await scheduleBoundedRetryForRun(
+          livenessRun,
+          agent,
+        );
+        transientRetryOwned =
+          transientRetry.outcome === "scheduled" ||
+          (transientRetry.outcome === "not_scheduled" &&
+            transientRetry.errorCode === "chat_completion_outbox_owns_retry");
       } else if (
         outcome === "failed" &&
         !(await legacyExecutionNeedsReconciliationWithEvidence(db, livenessRun))
@@ -1007,11 +1015,11 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
           : runErrorCode === "provider_quota") ||
           // A transient provider failure (model capacity, overload) is not an
           // agent fault. Stay idle while the bounded retry budget lasts; the
-          // failure that exhausts it flips the agent to error.
+          // failure that exhausts it, or a refused retry (reconciliation,
+          // closed gate, agent not invokable), flips the agent to error.
           (!!finalizedRun &&
             readHeartbeatRunErrorFamily(finalizedRun) === "transient_upstream" &&
-            transientRetryOutcome !== null &&
-            transientRetryOutcome !== "retry_exhausted") ||
+            transientRetryOwned) ||
           isWorkspaceSyncConflictFailure(adapterResult.errorMessage)),
       wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
     });
