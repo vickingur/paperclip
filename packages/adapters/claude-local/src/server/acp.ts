@@ -316,6 +316,11 @@ async function prepareClaudeRemoteManagedHome(
   return { stagedRuntime, teardown: registerWorkspaceSyncBack(stagedRuntime) };
 }
 
+// Provider-side overload (Anthropic `overloaded_error`, HTTP 529) and model
+// capacity. These clear on their own, so the run takes the bounded transient
+// retry and the agent stays idle.
+const CLAUDE_ACP_SERVICE_OVERLOAD_RE = /\b(?:overloaded(?:_error)?|model is at capacity)\b/i;
+
 export function classifyClaudeTerminalSessionFailure(
   failure: AcpxTerminalSessionFailure,
   now: Date,
@@ -324,10 +329,13 @@ export function classifyClaudeTerminalSessionFailure(
   // a provider signal, including its generic fallback, not a tool permission
   // error inferred from text. Keep it on the existing sign-in recovery path.
   if (failure.category === "access") return { errorCode: "acpx_auth_required" };
+  const surface = { errorMessage: [failure.title, failure.details].filter(Boolean).join("\n") };
+  if (failure.category === "service" && CLAUDE_ACP_SERVICE_OVERLOAD_RE.test(surface.errorMessage)) {
+    return { errorCode: "claude_transient_upstream", errorFamily: "transient_upstream" };
+  }
   // `limit` also includes context, turn, rate and configured budget limits.
   // Only the provider's quota wording qualifies for a quota wait.
   if (failure.category !== "limit") return null;
-  const surface = { errorMessage: [failure.title, failure.details].filter(Boolean).join("\n") };
   // claude-agent-acp uses this exact quota_exhausted fallback when no provider
   // title is available. It does not match the CLI's usage-limit wording.
   const isQuotaFallback = failure.title === "The Claude account has no available quota.";

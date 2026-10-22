@@ -71,6 +71,10 @@ const mockedAppendHeartbeatRunEvent = vi.mocked(appendHeartbeatRunEvent);
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 const PROVIDER_QUOTA_TEST_ADAPTER = "provider_quota_test";
+const PROVIDER_CAPACITY_TEST_ADAPTER = "provider_capacity_test";
+// Exact terminal text from VIK-1854 (SE3 run cffad0fd, Platform Engineer run a5334334).
+const PROVIDER_CAPACITY_MESSAGE =
+  "ACP agent reported a terminal service failure.\nSelected model is at capacity. Please try a different model.";
 
 if (!embeddedPostgresSupport.supported) {
   console.warn(
@@ -125,6 +129,33 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
         testedAt: new Date().toISOString(),
       }),
     });
+    registerServerAdapter({
+      type: PROVIDER_CAPACITY_TEST_ADAPTER,
+      // The Codex ACPX classifier's result for a typed `service` capacity failure.
+      execute: async () => ({
+        exitCode: 1,
+        signal: null,
+        timedOut: false,
+        errorMessage: PROVIDER_CAPACITY_MESSAGE,
+        errorCode: "codex_transient_upstream",
+        errorFamily: "transient_upstream",
+        executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
+        resultJson: {
+          executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
+          errorFamily: "transient_upstream",
+          terminalSessionFailure: {
+            category: "service",
+            title: "Selected model is at capacity. Please try a different model.",
+          },
+        },
+      }),
+      testEnvironment: async () => ({
+        adapterType: PROVIDER_CAPACITY_TEST_ADAPTER,
+        status: "pass",
+        checks: [],
+        testedAt: new Date().toISOString(),
+      }),
+    });
   }, 20_000);
 
   afterEach(async () => {
@@ -141,6 +172,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
 
   afterAll(async () => {
     unregisterServerAdapter(PROVIDER_QUOTA_TEST_ADAPTER);
+    unregisterServerAdapter(PROVIDER_CAPACITY_TEST_ADAPTER);
     await tempDb?.cleanup();
   });
 
@@ -398,6 +430,74 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
         { timeout: 5_000, interval: 50 },
       )
       .toEqual({ status: "idle", errorReason: null });
+  });
+
+  it("keeps the agent idle through transient model-capacity retries and errors only when the budget is spent", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Capacity Test",
+      role: "engineer",
+      status: "idle",
+      adapterType: PROVIDER_CAPACITY_TEST_ADAPTER,
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+    const readAgent = () =>
+      db
+        .select({ status: agents.status, errorReason: agents.errorReason })
+        .from(agents)
+        .where(eq(agents.id, agentId))
+        .then((rows) => rows[0] ?? null);
+    const readRetryOf = (runId: string) =>
+      db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.retryOfRunId, runId))
+        .then((rows) => rows[0] ?? null);
+    const runRetryNow = async (retryId: string) => {
+      await db.update(heartbeatRuns).set({ scheduledRetryAt: new Date(Date.now() - 1000) }).where(eq(heartbeatRuns.id, retryId));
+      await heartbeat.promoteDueScheduledRetries();
+      await heartbeat.resumeQueuedRuns();
+      await heartbeat.drainActiveRunExecutions();
+      return waitForRunToFinish(heartbeat, retryId);
+    };
+
+    const run = await heartbeat.invoke(agentId, "on_demand", {}, "manual");
+    expect(run).not.toBeNull();
+    const failedRun = await waitForRunToFinish(heartbeat, run!.id);
+    expect(failedRun).toMatchObject({ status: "failed", errorCode: "codex_transient_upstream" });
+    await heartbeat.drainActiveRunExecutions();
+
+    // First failure: a retry is queued and the agent stays idle.
+    const firstRetry = await readRetryOf(run!.id);
+    expect(firstRetry).toMatchObject({
+      status: "scheduled_retry",
+      scheduledRetryReason: "transient_failure",
+      scheduledRetryAttempt: 1,
+    });
+    expect(await readAgent()).toEqual({ status: "idle", errorReason: null });
+
+    // Second consecutive failure: the last retry is queued, still idle.
+    expect(await runRetryNow(firstRetry!.id)).toMatchObject({ status: "failed", errorCode: "codex_transient_upstream" });
+    const secondRetry = await readRetryOf(firstRetry!.id);
+    expect(secondRetry).toMatchObject({ status: "scheduled_retry", scheduledRetryAttempt: 2 });
+    expect(await readAgent()).toEqual({ status: "idle", errorReason: null });
+
+    // Third consecutive failure exhausts the budget: now the agent needs attention.
+    expect(await runRetryNow(secondRetry!.id)).toMatchObject({ status: "failed", errorCode: "codex_transient_upstream" });
+    expect(await readRetryOf(secondRetry!.id)).toBeNull();
+    expect(await readAgent()).toEqual({ status: "error", errorReason: PROVIDER_CAPACITY_MESSAGE });
   });
 
   async function seedMaxTurnFixture(input?: {

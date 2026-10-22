@@ -657,6 +657,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
     );
 
     const finalizedRun = persistedRun ?? (await getRun(run.id));
+    let transientRetryOutcome: string | null = null;
     if (finalizedRun) {
       await appendRunEvent(finalizedRun, {
         eventType: "lifecycle",
@@ -856,7 +857,9 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
         outcome === "failed" &&
         readTransientRecoveryContractFromRun(livenessRun)
       ) {
-        await scheduleBoundedRetryForRun(livenessRun, agent);
+        transientRetryOutcome = (
+          await scheduleBoundedRetryForRun(livenessRun, agent)
+        ).outcome;
       } else if (
         outcome === "failed" &&
         !(await legacyExecutionNeedsReconciliationWithEvidence(db, livenessRun))
@@ -1002,6 +1005,13 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
         ((finalizedRun
           ? readHeartbeatRunErrorFamily(finalizedRun) === "provider_quota"
           : runErrorCode === "provider_quota") ||
+          // A transient provider failure (model capacity, overload) is not an
+          // agent fault. Stay idle while the bounded retry budget lasts; the
+          // failure that exhausts it flips the agent to error.
+          (!!finalizedRun &&
+            readHeartbeatRunErrorFamily(finalizedRun) === "transient_upstream" &&
+            transientRetryOutcome !== null &&
+            transientRetryOutcome !== "retry_exhausted") ||
           isWorkspaceSyncConflictFailure(adapterResult.errorMessage)),
       wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
     });
