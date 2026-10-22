@@ -5934,7 +5934,7 @@ export function companySkillService(db: Db) {
       const target = path.resolve(skillDir, relativePath);
       const existingContent = await fs.readFile(target).catch(() => null);
       if (!existingContent?.equals(skillFileBytes(content))) return false;
-      if (Boolean((await fs.stat(target)).mode & 0o111) !== Boolean(content.executable)) return false;
+      if (((await fs.stat(target)).mode & 0o7777) !== (content.executable ? 0o555 : 0o444)) return false;
     }
     return true;
   }
@@ -5955,7 +5955,10 @@ export function companySkillService(db: Db) {
           if (!resolved) continue;
           const { normalizedPath, targetPath } = resolved;
           await fs.mkdir(path.dirname(targetPath), { recursive: true });
-          await fs.writeFile(targetPath, skillFileBytes(entry), { mode: entry.executable ? 0o555 : 0o444 });
+          const mode = entry.executable ? 0o555 : 0o444;
+          await fs.writeFile(targetPath, skillFileBytes(entry), { mode });
+          // Creation modes are filtered by umask; immutable snapshots have canonical modes.
+          await fs.chmod(targetPath, mode);
           if (normalizedPath === "SKILL.md") wroteSkillFile = true;
         }
         if (!wroteSkillFile) throw unprocessable("Company skill version could not be materialized because its SKILL.md snapshot is missing.");

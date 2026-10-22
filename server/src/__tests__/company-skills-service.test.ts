@@ -2530,6 +2530,42 @@ describeEmbeddedPostgres("companySkillService.list", () => {
     }
   });
 
+  it("normalizes version snapshot modes and repairs cached permissions without changing bytes", async () => {
+    const companyId = randomUUID();
+    await db.insert(companies).values({ id: companyId, name: "Snapshot modes", issuePrefix: `M${companyId.slice(0, 6)}` });
+    const actor = { type: "user" as const, userId: "board" };
+    const skill = await svc.createLocalSkill(companyId, { name: "Snapshot modes", description: "Synthetic fixture" }, actor);
+    await svc.updateFile(companyId, skill.id, "scripts/probe.sh", "#!/bin/sh\necho synthetic\n", actor, { executable: true });
+    const version = (await svc.listVersions(companyId, skill.id))[0]!;
+    const materialize = async () => {
+      const entries = await companySkillService(db).listRuntimeSkillEntries(companyId, {
+        versionSelections: new Map([[skill.key, version.id]]),
+      });
+      const entry = entries.find(entry => entry.key === skill.key)!;
+      expect(entry.sourceStatus).toBe("available");
+      return entry.source;
+    };
+    const source = await materialize();
+    const markdown = path.join(source, "SKILL.md"), script = path.join(source, "scripts/probe.sh");
+    const markdownBytes = await fs.readFile(markdown), scriptBytes = await fs.readFile(script);
+    const check = async () => {
+      expect((await fs.stat(markdown)).mode & 0o7777).toBe(0o444);
+      expect((await fs.stat(script)).mode & 0o7777).toBe(0o555);
+      expect(await fs.readFile(markdown)).toEqual(markdownBytes);
+      expect(await fs.readFile(script)).toEqual(scriptBytes);
+    };
+    await check();
+    for (const [readMode, executeMode] of [[0o400, 0o500], [0o644, 0o755], [0o544, 0o554]]) {
+      await fs.chmod(markdown, readMode!);
+      await fs.chmod(script, executeMode!);
+      expect(await materialize()).toBe(source);
+      await check();
+    }
+    const before = await fs.stat(markdown);
+    expect(await materialize()).toBe(source);
+    expect((await fs.stat(markdown)).mtimeMs).toBe(before.mtimeMs);
+  });
+
   it("seeds an initial version on create and snapshots a version on each changed save", async () => {
     const companyId = randomUUID();
     await db.insert(companies).values({
