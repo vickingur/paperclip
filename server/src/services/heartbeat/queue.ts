@@ -38,6 +38,12 @@ import {
 } from "../explicit-native-continuation.js";
 import { canRetryStoppedRun } from "../cancelled-native-startup.js";
 import { getExecutionBlocker } from "../execution-blocker.js";
+import {
+  findRoutineExecutionLockHolder,
+  isRoutineExecutionLockConflict,
+  noOtherRoutineExecutionLockHolder,
+  ROUTINE_EXECUTION_SUPERSEDED_ERROR_CODE,
+} from "../routine-execution-lock.js";
 import { isConversationAdapter } from "../conversation-continuation.js";
 import { recordExecutionWait } from "../execution-wait.js";
 import {
@@ -1130,6 +1136,19 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         );
         return null;
       }
+
+      // Another open execution issue of the same routine already holds the
+      // routine's execution lock, so binding this run would violate
+      // issues_open_routine_execution_uq. Supersede the run instead.
+      const routineLockHolder = await findRoutineExecutionLockHolder(db, run.companyId, issueId);
+      if (routineLockHolder) {
+        const [issueOwner] = await db.select({ assigneeAgentId: issues.assigneeAgentId })
+          .from(issues).where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)));
+        if (issueOwner?.assigneeAgentId === run.agentId) {
+          await cancelQueuedRunForRoutineExecutionConflict(run, issueId, routineLockHolder);
+          return null;
+        }
+      }
     }
 
     const claimedAt = new Date();
@@ -1628,6 +1647,8 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               isNull(issues.executionRunId),
               eq(issues.executionRunId, claimed.id),
             ),
+            // The run is already running; never fail it on the routine lock.
+            noOtherRoutineExecutionLockHolder(),
           ),
         );
     }
@@ -1755,6 +1776,41 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       },
     });
 
+    return cancelled;
+  }
+
+  function routineExecutionConflictReason(holder: { identifier: string | null; id: string } | null) {
+    const holderLabel = holder ? ` ${holder.identifier ?? holder.id}` : "";
+    return `Cancelled because another open execution issue${holderLabel} of this routine already holds its execution lock`;
+  }
+
+  // Runs under the agent start lock. Do not use cancelRunInternal, which
+  // recursively starts the next run and reacquires that lock.
+  async function cancelQueuedRunForRoutineExecutionConflict(
+    run: typeof heartbeatRuns.$inferSelect,
+    issueId: string,
+    holder: { id: string; identifier: string | null; executionRunId: string | null },
+  ) {
+    const now = new Date();
+    const reason = routineExecutionConflictReason(holder);
+    const cancelled = await setRunStatus(run.id, "cancelled", {
+      finishedAt: now,
+      error: reason,
+      errorCode: ROUTINE_EXECUTION_SUPERSEDED_ERROR_CODE,
+    });
+    if (!cancelled) return null;
+    await setWakeupStatus(run.wakeupRequestId, "skipped", { finishedAt: now, error: reason });
+    await appendRunEvent(cancelled, {
+      eventType: "lifecycle",
+      stream: "system",
+      level: "warn",
+      message: reason,
+      payload: { issueId, lockHolderIssueId: holder.id, lockHolderRunId: holder.executionRunId },
+    });
+    logger.warn(
+      { runId: run.id, issueId, lockHolderIssueId: holder.id },
+      "claimQueuedRun: superseded queued run on a duplicate routine execution issue",
+    );
     return cancelled;
   }
 
@@ -1890,19 +1946,15 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
   // Settle runs that can never be claimed. Letting the error escape stalls the
   // agent's queue and, during startup recovery, stops the server from booting.
   async function cancelRejectedQueuedRuns(
-    rejected: Array<{ run: typeof heartbeatRuns.$inferSelect; err: HttpError }>,
+    rejected: Array<{ run: typeof heartbeatRuns.$inferSelect; err: unknown; reason: string; errorCode: string }>,
   ) {
-    for (const { run, err } of rejected) {
+    for (const { run, err, reason, errorCode } of rejected) {
       logger.warn(
         { err, runId: run.id, agentId: run.agentId, companyId: run.companyId },
         "cancelling queued heartbeat run whose claim was rejected",
       );
       try {
-        await cancelRunInternal(
-          run.id,
-          `Cancelled because the queued run cannot be claimed: ${err.message}`,
-          { errorCode: "queued_run_claim_rejected" },
-        );
+        await cancelRunInternal(run.id, reason, { errorCode });
       } catch (cancelErr) {
         logger.error(
           { err: cancelErr, runId: run.id },
@@ -1917,7 +1969,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     const cutoff = await getWorktreeExecutionCutoff();
     // Cancelled after the start lock is released: cancelRunInternal promotes the
     // agent's next queued run, which takes this same lock.
-    const rejectedClaims: Array<{ run: typeof heartbeatRuns.$inferSelect; err: HttpError }> = [];
+    const rejectedClaims: Parameters<typeof cancelRejectedQueuedRuns>[0] = [];
     const deferredPostCommitEffects: WakeQueuePostCommitEffect[] = [];
     let cancellationReason: string | undefined;
 
@@ -2033,7 +2085,24 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           claimed = await claimQueuedRun(queuedRun, companyAgents, deferredPostCommitEffects);
         } catch (err) {
           if (isPermanentClaimRejection(err)) {
-            rejectedClaims.push({ run: queuedRun, err });
+            rejectedClaims.push({
+              run: queuedRun,
+              err,
+              reason: `Cancelled because the queued run cannot be claimed: ${err.message}`,
+              errorCode: "queued_run_claim_rejected",
+            });
+            continue;
+          }
+          // A concurrent claim bound a duplicate routine execution issue after
+          // the pre-claim check. The claim transaction rolled back, so the run
+          // is still queued; supersede it rather than stall the queue.
+          if (isRoutineExecutionLockConflict(err)) {
+            rejectedClaims.push({
+              run: queuedRun,
+              err,
+              reason: routineExecutionConflictReason(null),
+              errorCode: ROUTINE_EXECUTION_SUPERSEDED_ERROR_CODE,
+            });
             continue;
           }
           if (!isDeferrableClaimRejection(err)) throw err;
@@ -3520,7 +3589,9 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                     executionLockedAt: new Date(),
                     updatedAt: new Date(),
                   })
-                  .where(eq(issues.id, issue.id));
+                  // A duplicate routine execution issue does not adopt the
+                  // lock; its run is superseded when claimed.
+                  .where(and(eq(issues.id, issue.id), noOtherRoutineExecutionLockHolder()));
               }
             }
           }

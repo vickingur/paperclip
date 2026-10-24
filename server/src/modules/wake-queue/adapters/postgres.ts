@@ -4,6 +4,7 @@ import { isCompletedOnboardingHandoffWake } from "../../../services/chat-complet
 import { instanceSettingsService } from "../../../services/instance-settings.js";
 import { currentConversationCommentCondition } from "../../../services/agent-conversations.js";
 import { getExecutionBlocker } from "../../../services/execution-blocker.js";
+import { noOtherRoutineExecutionLockHolder } from "../../../services/routine-execution-lock.js";
 import { and, asc, eq, inArray, isNull, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { extractIssueReferenceIdentifiers } from "@paperclipai/shared";
@@ -526,6 +527,9 @@ function buildTransaction(
             eq(issues.companyId, input.companyId),
             eq(issues.assigneeAgentId, input.deferredAgent.id),
             isNull(issues.executionRunId),
+            // A duplicate routine execution issue leaves the run unbound; the
+            // claim supersedes it instead of failing this release.
+            noOtherRoutineExecutionLockHolder(),
           ),
         );
 
@@ -673,7 +677,7 @@ function buildTransaction(
           executionLockedAt: now,
           updatedAt: now,
         })
-        .where(and(eq(issues.id, issue.id), eq(issues.companyId, companyId)));
+        .where(and(eq(issues.id, issue.id), eq(issues.companyId, companyId), noOtherRoutineExecutionLockHolder()));
 
       return toRunSummary(queuedRun);
     },
@@ -737,7 +741,7 @@ function buildTransaction(
           executionLockedAt: now,
           updatedAt: now,
         })
-        .where(and(eq(issues.id, issue.id), eq(issues.companyId, companyId)));
+        .where(and(eq(issues.id, issue.id), eq(issues.companyId, companyId), noOtherRoutineExecutionLockHolder()));
 
       return toRunSummary(queuedRun);
     },
