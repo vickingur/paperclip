@@ -22,6 +22,7 @@ import {
   ISSUE_RECOVERY_ACTION_STATUSES,
   ISSUE_REVIEW_POLICIES,
   ISSUE_WORK_MODES,
+  ISSUE_CREATE_KINDS,
   clampIssueRequestDepth,
   ISSUE_STATUSES,
   ISSUE_THREAD_INTERACTION_CONTINUATION_POLICIES,
@@ -795,11 +796,19 @@ const onboardingFirstTaskMarkerSchema = {
   onboardingFirstTask: z.boolean().optional(),
 };
 
+// Declares a review or approval request. The server stamps the review-request
+// origin and lets it go to the creator of an open ancestor (not a delegation
+// cycle); it is not stored as a separate column.
+const issueCreateKindSchema = {
+  kind: z.enum(ISSUE_CREATE_KINDS).optional(),
+};
+
 export const createIssueInputSchema = createIssueBaseSchema.extend({
   title: z.string().optional(),
   status: createIssueBaseSchema.shape.status.optional(),
   ...createIssueDuplicateGuardSchema,
   ...onboardingFirstTaskMarkerSchema,
+  ...issueCreateKindSchema,
 });
 
 function requireTitleOrDescription(
@@ -816,6 +825,7 @@ export const createIssueSchema = withCreateIssueStatusDefault(
     title: z.string().optional(),
     ...createIssueDuplicateGuardSchema,
     ...onboardingFirstTaskMarkerSchema,
+    ...issueCreateKindSchema,
   }),
 ).superRefine(requireBlockedStatusForUnblockDescriptor).superRefine(requireTitleOrDescription);
 
@@ -852,6 +862,7 @@ export const createChildIssueSchema = withCreateIssueStatusDefault(
         .max(20)
         .optional(),
       blockParentUntilDone: z.boolean().optional().default(false),
+      ...issueCreateKindSchema,
     }),
 ).superRefine(requireBlockedStatusForUnblockDescriptor).superRefine(requireTitleOrDescription);
 

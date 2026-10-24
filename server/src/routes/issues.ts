@@ -108,6 +108,7 @@ import {
   ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY,
   ISSUE_WATCHDOG_DISCOVERY_KINDS,
   TASK_WATCHDOG_PRODUCT_BUG_ORIGIN_KIND,
+  ISSUE_REVIEW_REQUEST_ORIGIN_KIND,
   ONBOARDING_FIRST_TASK_ORIGIN_KIND,
   rejectIssueThreadInteractionSchema,
   restoreIssueDocumentRevisionSchema,
@@ -3785,6 +3786,7 @@ export function issueRoutes(
       "companyId" | "parentId"
     > & { assigneeUserId?: string | null },
     assigneeAgentId: string | null,
+    reviewRequest = false,
   ): Promise<string | null> {
     if (
       req.actor.type !== "agent" ||
@@ -3808,7 +3810,11 @@ export function issueRoutes(
     if (!source || isConversation(source)) return null;
     const decision = await decideIssueAccess(req, source, "issue:mutate");
     if (!decision.allowed) return null;
-    if (assigneeAgentId && assigneeAgentId !== req.actor.agentId) {
+    if (
+      !reviewRequest &&
+      assigneeAgentId &&
+      assigneeAgentId !== req.actor.agentId
+    ) {
       const ancestor = await svc.findOpenAncestorCreatedByAgent(
         source.id,
         assigneeAgentId,
@@ -7621,15 +7627,19 @@ export function issueRoutes(
    * something the other assumed it had, the chain of blocked issues grows,
    * and no one tells the human. Humans are unaffected, and closed ancestors
    * do not count — re-engaging the creator of finished work is normal.
-   * Self-assigned decomposition is not delegation back to another agent.
+   * Self-assigned decomposition is not delegation back to another agent, and
+   * neither is an explicit review/approval request: the reviewer judges the
+   * work, it does not take back its own execution.
    */
   async function assertNoAgentDelegationCycle(input: {
     actorType: string;
     actorAgentId: string | null | undefined;
     parentIssueId: string | null | undefined;
     assigneeAgentId: string | null | undefined;
+    reviewRequest?: boolean;
   }) {
     if (input.actorType !== "agent") return;
+    if (input.reviewRequest) return;
     if (input.assigneeAgentId === input.actorAgentId) return;
     if (!input.parentIssueId || !input.assigneeAgentId) return;
     const ancestor = await svc.findOpenAncestorCreatedByAgent(
@@ -12212,6 +12222,7 @@ export function issueRoutes(
       const {
         watchdogDiscovery: rawWatchdogDiscovery,
         onboardingFirstTask: rawOnboardingFirstTask,
+        kind: createKind,
         ...rawCreateBody
       } = sanitizedBody;
       // The onboarding first-task marker grants privileged, server-owned behavior:
@@ -12263,6 +12274,7 @@ export function issueRoutes(
               companyId,
               rawCreateBody,
               normalizedAssigneeAgentId ?? null,
+              createKind !== undefined,
             )
           : null;
       const effectiveParentId = watchdogProductBugFollowUp
@@ -12297,6 +12309,7 @@ export function issueRoutes(
         parentIssueId:
           typeof effectiveParentId === "string" ? effectiveParentId : null,
         assigneeAgentId: normalizedAssigneeAgentId ?? null,
+        reviewRequest: createKind !== undefined,
       });
       const actor = getActorInfo(req);
       const runWorkspaceInheritanceSourceIssueId =
@@ -12333,6 +12346,12 @@ export function issueRoutes(
           ? {
               inheritExecutionWorkspaceFromIssueId:
                 runWorkspaceInheritanceSourceIssueId,
+            }
+          : {}),
+        ...(createKind !== undefined
+          ? {
+              originKind: ISSUE_REVIEW_REQUEST_ORIGIN_KIND,
+              originId: effectiveParentId ?? null,
             }
           : {}),
         ...(isOnboardingFirstTask && !watchdogProductBugFollowUp
@@ -12753,14 +12772,19 @@ export function issueRoutes(
           sanitizedBody.assigneeAgentId as string | null | undefined,
           { actorType: req.actor.type },
         );
+      const { kind: createKind, ...childCreateBody } = sanitizedBody;
       await assertNoAgentDelegationCycle({
         actorType: req.actor.type,
         actorAgentId: req.actor.agentId,
         parentIssueId: parent.id,
         assigneeAgentId: normalizedAssigneeAgentId ?? null,
+        reviewRequest: createKind !== undefined,
       });
       const createBody = {
-        ...sanitizedBody,
+        ...childCreateBody,
+        ...(createKind !== undefined
+          ? { originKind: ISSUE_REVIEW_REQUEST_ORIGIN_KIND, originId: parent.id }
+          : {}),
         ...(normalizedAssigneeAgentId !== undefined
           ? { assigneeAgentId: normalizedAssigneeAgentId }
           : {}),

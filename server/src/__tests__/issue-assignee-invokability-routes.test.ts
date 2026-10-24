@@ -329,6 +329,59 @@ describe("agent delegation cycle guard", () => {
     expect(mockIssueService.createChild).toHaveBeenCalled();
   });
 
+  it("allows a review child assigned to the creator of an open ancestor", async () => {
+    const parent = makeIssue();
+    mockIssueService.getById.mockResolvedValue(parent);
+    mockIssueService.findOpenAncestorCreatedByAgent.mockResolvedValue({
+      id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+      identifier: "PAP-100",
+      parentId: null,
+      createdByAgentId: IDLE_AGENT_ID,
+      status: "in_progress",
+    });
+    mockIssueService.createChild.mockResolvedValue({
+      issue: makeIssue({ id: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee", parentId: parent.id, assigneeAgentId: IDLE_AGENT_ID }),
+      parentBlockerAdded: false,
+    });
+
+    const res = await request(createApp(agentActor()))
+      .post(`/api/issues/${parent.id}/children`)
+      .send({
+        title: "Visual review of the previs",
+        description: "Review the frames",
+        assigneeAgentId: IDLE_AGENT_ID,
+        kind: "review",
+      });
+
+    expect(res.status).toBe(201);
+    expect(mockIssueService.createChild).toHaveBeenCalledWith(
+      parent.id,
+      expect.objectContaining({
+        assigneeAgentId: IDLE_AGENT_ID,
+        originKind: "review_request",
+        originId: parent.id,
+      }),
+    );
+    expect(mockIssueService.createChild.mock.calls[0]?.[1]).not.toHaveProperty("kind");
+  });
+
+  it("rejects an unknown child kind instead of exempting it", async () => {
+    const parent = makeIssue();
+    mockIssueService.getById.mockResolvedValue(parent);
+
+    const res = await request(createApp(agentActor()))
+      .post(`/api/issues/${parent.id}/children`)
+      .send({
+        title: "Hand it back",
+        description: "Bounce",
+        assigneeAgentId: IDLE_AGENT_ID,
+        kind: "execution",
+      });
+
+    expect(res.status).toBe(400);
+    expect(mockIssueService.createChild).not.toHaveBeenCalled();
+  });
+
   it("does not consult the guard for board actors", async () => {
     const parent = makeIssue({ assigneeAgentId: null });
     mockIssueService.getById.mockResolvedValue(parent);
