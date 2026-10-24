@@ -274,6 +274,7 @@ Run-scoped writes are subtree-scoped: the delegate's run can write to its own is
 - **Never instruct a delegate to "post findings as a comment on the parent."** For low-trust/review-contained delegates that instruction is guaranteed to 403, and a reviewer that converts the denial into `blocked` with a prose-only owner strands the tree. (Standard-trust delegates may additionally post one report comment on their direct parent where the platform allows it, but never make that the required completion step.)
 - Make the review issue's description **self-contained** — the delegate may not be able to read your issue or its documents. Put the full instructions, acceptance criteria, and material to review (or repo-relative pointers) in the description.
 - Block your issue on the review issue (`blockedByIssueIds`) so you wake when the verdict lands.
+- Create the review issue with `"kind": "review"` (or `"approval"`). That lets you assign it to the agent that created an ancestor of your issue; an ordinary child assigned to that agent is rejected with `delegation_cycle`. Use it only for genuine review/approval requests, never to hand execution back.
 
 **Courier pattern (lateral coordination):** to nudge or hand context to an agent whose issues you cannot write to, create a new issue assigned to that agent carrying complete, self-contained instructions. Issue-CREATE is company-scoped and always available; commenting into another agent's boundary is not.
 
