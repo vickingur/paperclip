@@ -13,6 +13,10 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import {
+  bindRoutineExecutionLock,
+  noOtherRoutineExecutionLockHolder,
+} from "../services/routine-execution-lock.js";
 import { heartbeatService } from "../services/heartbeat.ts";
 import { runningProcesses } from "../adapters/index.ts";
 
@@ -197,6 +201,97 @@ describeEmbeddedPostgres("heartbeat routine execution lock conflicts", () => {
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0]?.executionRunId ?? null);
   }
+
+  // Holds an uncommitted bind of `issueId` until the returned commit() is
+  // called, so a concurrent bind of a duplicate issue passes its NOT EXISTS
+  // guard and then waits on the unique index.
+  async function holdUncommittedBind(issueId: string, runId: string) {
+    let commit!: () => void;
+    let bound!: () => void;
+    const gate = new Promise<void>((resolve) => { commit = resolve; });
+    const ready = new Promise<void>((resolve) => { bound = resolve; });
+    const done = db.transaction(async (tx) => {
+      await tx.update(issues).set({ executionRunId: runId }).where(eq(issues.id, issueId));
+      bound();
+      await gate;
+    });
+    await ready;
+    return { commit: async () => { commit(); await done; } };
+  }
+
+  async function waitForIssueUpdateLockWait() {
+    for (let i = 0; i < 250; i++) {
+      const rows = await db.execute(sql`
+        select pid from pg_stat_activity
+        where datname = current_database() and wait_event_type = 'Lock' and query like 'update "issues"%'`);
+      if (rows.length > 0) return;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    throw new Error("concurrent issue bind never waited on the routine execution index");
+  }
+
+  it("keeps the enclosing transaction when a concurrent bind wins the routine lock", async () => {
+    const { holderIssueId, duplicateIssueId, staleRunId } = await seedDuplicateRoutineIssues();
+    await db.update(issues).set({ executionRunId: null }).where(eq(issues.id, holderIssueId));
+    const holder = await holdUncommittedBind(holderIssueId, staleRunId);
+
+    const enclosing = db.transaction(async (tx) => {
+      const bound = await bindRoutineExecutionLock(tx as unknown as typeof db, (bindTx) => bindTx
+        .update(issues)
+        .set({ executionRunId: staleRunId })
+        .where(sql`${issues.id} = ${duplicateIssueId} and ${noOtherRoutineExecutionLockHolder()}`));
+      // The enclosing transaction must still accept writes after the lost race.
+      await tx.update(issues).set({ title: "Released" }).where(eq(issues.id, duplicateIssueId));
+      return bound;
+    });
+    try {
+      await waitForIssueUpdateLockWait();
+    } finally {
+      await holder.commit();
+    }
+
+    await expect(enclosing).resolves.toBe(false);
+    expect(await executionRunIdOf(duplicateIssueId)).toBeNull();
+    expect(await executionRunIdOf(holderIssueId)).toBe(staleRunId);
+    const [released] = await db.select({ title: issues.title }).from(issues).where(eq(issues.id, duplicateIssueId));
+    expect(released?.title).toBe("Released");
+  });
+
+  it("completes a wakeup whose execution-lock adoption races a duplicate routine bind", async () => {
+    const { companyId, agentId, holderIssueId, duplicateIssueId, staleRunId } = await seedDuplicateRoutineIssues();
+    await db.update(issues).set({ executionRunId: null }).where(eq(issues.id, holderIssueId));
+    // A queued run on the duplicate issue that never took the issue lock; the
+    // wakeup's enqueue transaction adopts it as the execution run.
+    const legacyRunId = await insertQueuedIssueRun(companyId, agentId, duplicateIssueId, new Date(Date.now() - 60_000));
+    const holder = await holdUncommittedBind(holderIssueId, staleRunId);
+
+    const wakeup = heartbeat.wakeup(agentId, {
+      source: "on_demand",
+      triggerDetail: "manual",
+      reason: "issue_assigned",
+      payload: { issueId: duplicateIssueId },
+      contextSnapshot: { issueId: duplicateIssueId, taskId: duplicateIssueId, wakeReason: "issue_assigned" },
+    });
+    try {
+      await waitForIssueUpdateLockWait();
+    } finally {
+      await holder.commit();
+    }
+
+    // Before the savepoint, the adoption raised the unique violation and the
+    // whole enqueue transaction rolled back.
+    await wakeup;
+    await heartbeat.resumeQueuedRuns();
+    await heartbeat.drainActiveRunExecutions();
+
+    expect(await executionRunIdOf(duplicateIssueId)).toBeNull();
+    expect(await executionRunIdOf(holderIssueId)).toBe(staleRunId);
+    expect(await runRow(legacyRunId)).toMatchObject({
+      status: "cancelled",
+      errorCode: "routine_execution_superseded",
+    });
+    expect(mockAdapterExecute).not.toHaveBeenCalled();
+  });
 
   it("supersedes a queued run on a duplicate routine issue during startup recovery", async () => {
     const { companyId, agentId, holderIssueId, duplicateIssueId, staleRunId, holderIdentifier } =

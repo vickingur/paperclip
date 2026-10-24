@@ -4,7 +4,7 @@ import { isCompletedOnboardingHandoffWake } from "../../../services/chat-complet
 import { instanceSettingsService } from "../../../services/instance-settings.js";
 import { currentConversationCommentCondition } from "../../../services/agent-conversations.js";
 import { getExecutionBlocker } from "../../../services/execution-blocker.js";
-import { noOtherRoutineExecutionLockHolder } from "../../../services/routine-execution-lock.js";
+import { bindRoutineExecutionLock, noOtherRoutineExecutionLockHolder } from "../../../services/routine-execution-lock.js";
 import { and, asc, eq, inArray, isNull, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { extractIssueReferenceIdentifiers } from "@paperclipai/shared";
@@ -513,7 +513,7 @@ function buildTransaction(
       // transfers. The lock-clearing step earlier in this transaction
       // already set `executionRunId` to null for this issue, so the `is
       // null` guard only protects against taking the lock twice.
-      await tx
+      await bindRoutineExecutionLock(tx, (bindTx) => bindTx
         .update(issues)
         .set({
           executionRunId: newRun.id,
@@ -531,7 +531,7 @@ function buildTransaction(
             // claim supersedes it instead of failing this release.
             noOtherRoutineExecutionLockHolder(),
           ),
-        );
+        ));
 
       return toRunSummary(newRun);
     },
@@ -669,7 +669,7 @@ function buildTransaction(
         .set({ runId: queuedRun.id, updatedAt: now })
         .where(and(eq(agentWakeupRequests.id, wakeupRequest.id), eq(agentWakeupRequests.companyId, companyId)));
 
-      await tx
+      await bindRoutineExecutionLock(tx, (bindTx) => bindTx
         .update(issues)
         .set({
           executionRunId: queuedRun.id,
@@ -677,7 +677,7 @@ function buildTransaction(
           executionLockedAt: now,
           updatedAt: now,
         })
-        .where(and(eq(issues.id, issue.id), eq(issues.companyId, companyId), noOtherRoutineExecutionLockHolder()));
+        .where(and(eq(issues.id, issue.id), eq(issues.companyId, companyId), noOtherRoutineExecutionLockHolder())));
 
       return toRunSummary(queuedRun);
     },
@@ -733,7 +733,7 @@ function buildTransaction(
         .set({ runId: queuedRun.id, updatedAt: now })
         .where(and(eq(agentWakeupRequests.id, wakeupRequest.id), eq(agentWakeupRequests.companyId, companyId)));
 
-      await tx
+      await bindRoutineExecutionLock(tx, (bindTx) => bindTx
         .update(issues)
         .set({
           executionRunId: queuedRun.id,
@@ -741,7 +741,7 @@ function buildTransaction(
           executionLockedAt: now,
           updatedAt: now,
         })
-        .where(and(eq(issues.id, issue.id), eq(issues.companyId, companyId), noOtherRoutineExecutionLockHolder()));
+        .where(and(eq(issues.id, issue.id), eq(issues.companyId, companyId), noOtherRoutineExecutionLockHolder())));
 
       return toRunSummary(queuedRun);
     },

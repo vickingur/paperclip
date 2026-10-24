@@ -39,6 +39,7 @@ import {
 import { canRetryStoppedRun } from "../cancelled-native-startup.js";
 import { getExecutionBlocker } from "../execution-blocker.js";
 import {
+  bindRoutineExecutionLock,
   findRoutineExecutionLockHolder,
   isRoutineExecutionLockConflict,
   noOtherRoutineExecutionLockHolder,
@@ -1622,7 +1623,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       claimedWakeReason !== "source_scoped_recovery_action"
     ) {
       const claimedAgent = await getAgent(claimed.agentId);
-      await db
+      await bindRoutineExecutionLock(db, (bindTx) => bindTx
         .update(issues)
         .set({
           executionRunId: claimed.id,
@@ -1650,7 +1651,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             // The run is already running; never fail it on the routine lock.
             noOtherRoutineExecutionLockHolder(),
           ),
-        );
+        ));
     }
 
     return claimed;
@@ -3579,7 +3580,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                   .from(agents)
                   .where(eq(agents.id, legacyRun.agentId))
                   .then((rows) => rows[0] ?? null);
-                await tx
+                await bindRoutineExecutionLock(tx as unknown as Db, (bindTx) => bindTx
                   .update(issues)
                   .set({
                     executionRunId: legacyRun.id,
@@ -3591,7 +3592,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                   })
                   // A duplicate routine execution issue does not adopt the
                   // lock; its run is superseded when claimed.
-                  .where(and(eq(issues.id, issue.id), noOtherRoutineExecutionLockHolder()));
+                  .where(and(eq(issues.id, issue.id), noOtherRoutineExecutionLockHolder())));
               }
             }
           }

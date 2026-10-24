@@ -42,6 +42,26 @@ export function noOtherRoutineExecutionLockHolder() {
 }
 
 /**
+ * Runs a guarded `execution_run_id` bind in a savepoint. The NOT EXISTS guard
+ * reads a snapshot, so a concurrent bind of a duplicate issue can commit while
+ * this update waits on the unique index, and the update then raises the
+ * violation anyway. Rolling back only the savepoint keeps the caller's release,
+ * promotion or enqueue transaction intact; the run stays unbound and its claim
+ * supersedes it. Returns false when the bind lost that race.
+ */
+export async function bindRoutineExecutionLock(executor: Db, bind: (tx: Db) => Promise<unknown>) {
+  try {
+    await executor.transaction(async (tx) => {
+      await bind(tx as unknown as Db);
+    });
+    return true;
+  } catch (error) {
+    if (isRoutineExecutionLockConflict(error)) return false;
+    throw error;
+  }
+}
+
+/**
  * Returns the other open execution issue of the same routine dispatch key that
  * holds the execution lock, or null when `issueId` could bind an execution run.
  */
