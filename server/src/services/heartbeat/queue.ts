@@ -1,3 +1,4 @@
+import { wakeBatchDelayMs, wakeBatchIsWaiting } from "../wake-coalescing.js";
 import { isCurrentPendingInteractionAddressee, retainSupersededPendingInteractionWake } from "../pending-interaction-wake.js";
 import { DEPENDENCY_CLOSURE_RECEIPT_KEY, verifyDependencyClosureProof } from "../dependency-closure-proof.js";
 import { commitExecutionReset } from "../execution-reset-producer.js";
@@ -248,6 +249,7 @@ export class ChatControlRecoveryUnresolvedError extends Error {
 
 const RUNNING_ISSUE_WAKE_REASONS_REQUIRING_FOLLOWUP = new Set([
   CHAT_COMPLETION_WAKE_REASON,
+  "issue_children_completed",
   "approval_approved",
   ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
   "issue_recovery_action_restored",
@@ -953,6 +955,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     deferredPostCommitEffects?: WakeQueuePostCommitEffect[],
   ) {
     if (run.status !== "queued") return run;
+    if (wakeBatchIsWaiting(run.contextSnapshot, new Date())) return null;
     // Claim is the first execution boundary. startedAt survives same-run
     // retries; restart recovery may also enter executeRun already running.
     // Neither may reinterpret an admitted, already-started message as new work.
@@ -2206,6 +2209,12 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       triggerDetail,
       payload,
     });
+    // Callers cannot extend the server's dispatch window. A new human input
+    // releases an existing queued batch immediately when it merges.
+    delete enrichedContextSnapshot.wakeBatchNotBefore;
+    if (opts.requestedByActorType === "user" || opts.manualUserWake) {
+      enrichedContextSnapshot.wakeBatchNotBefore = null;
+    }
     // Keep each request's own server-derived origin, including coalesced wakes.
     // A run's merged context cannot establish which caller authored one receipt.
     // Overwrite caller-supplied nested context rather than trusting it.
@@ -3912,6 +3921,8 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           // Server-side recovery retries insert runs directly and never reach
           // this gate.
           if (
+            // A different unblock owner has new work even after reviewing this issue.
+            (reason !== "issue_unblock_requested" || issue.assigneeAgentId === agentId) &&
             isThrottleCandidateIssueRewake({
               reason,
               wakeCommentId: wakeCommentId ?? null,
@@ -3922,6 +3933,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             })
           ) {
             const throttleNow = new Date();
+            const bookkeepingWake = reason === "issue_unblock_requested";
             const recentTerminalRuns = await tx
               .select({
                 id: heartbeatRuns.id,
@@ -3980,7 +3992,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                           activityLog.action,
                           ISSUE_NEW_INPUT_ACTIVITY_ACTIONS,
                         ),
-                        wakeCommentId && opts.requestedByActorType === "agent"
+                        (bookkeepingWake || (wakeCommentId && opts.requestedByActorType === "agent"))
                           ? ne(activityLog.actorType, "agent")
                           : undefined,
                       ),
@@ -3989,6 +4001,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                 : [];
 
               const throttleDecision = evaluateIssueRewakeThrottle({
+                bookkeepingWake,
                 now: throttleNow,
                 recentTerminalRuns,
                 runIdsWithIssueProgress: new Set(
@@ -4010,7 +4023,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                   agentId,
                   source,
                   triggerDetail,
-                  reason: "issue_rewake_throttled",
+                  reason: bookkeepingWake ? "issue_bookkeeping_backoff" : "issue_rewake_throttled",
                   payload: {
                     ...(payload ?? {}),
                     issueId,
@@ -4184,6 +4197,12 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             adoptedCommentIds = await undeliveredLegacyUserCommentIds(tx as unknown as Db,
               agent.companyId, issueId, agentId, adoptedCommentIds);
           }
+          const batchDelay = isConversation(issue) || receiptRequest || opts.allowRunCoalescing === false ||
+            enrichedContextSnapshot.forceFreshSession === true ? 0 : wakeBatchDelayMs({
+              reason, actorType: opts.requestedByActorType ?? null,
+              interactionId: enrichedContextSnapshot.interactionId, manual: Boolean(opts.manualUserWake),
+            });
+          if (batchDelay > 0) enrichedContextSnapshot.wakeBatchNotBefore = new Date(Date.now() + batchDelay).toISOString();
           const newRun = await tx
             .insert(heartbeatRuns)
             .values({

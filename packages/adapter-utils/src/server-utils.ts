@@ -779,6 +779,7 @@ export type PaperclipExternalChatProvider =
   "slack" | "github" | "discord" | "microsoft-teams" | "telegram" | "imessage-photon" | "speko";
 
 type PaperclipWakePayload = {
+  reasons: string[];
   executionContinuation: ExecutionContinuationEnvelope | null;
   reason: string | null;
   recovery: PaperclipWakeRecovery | null;
@@ -1836,6 +1837,7 @@ export function normalizePaperclipWakePayload(
 
   return {
     reason: asString(payload.reason, "").trim() || null,
+    reasons: asStringArray(payload.reasons),
     executionContinuation: parseObject(payload.executionContinuation).version === 1 ? payload.executionContinuation as ExecutionContinuationEnvelope : null,
     recovery,
     issue,
@@ -2426,6 +2428,7 @@ function renderPaperclipWakePromptBody(
       : [];
   const wakeSummaryLines = [
     `- reason: ${normalized.reason ?? "unknown"}`,
+    ...(normalized.reasons.length > 1 ? [`- coalesced reasons: ${normalized.reasons.join(", ")}`] : []),
     `- issue: ${normalized.issue?.identifier ?? normalized.issue?.id ?? "unknown"}${normalized.issue?.title ? ` ${normalized.issue.title}` : ""}`,
     ...(hasWakeCommentBatch
       ? [

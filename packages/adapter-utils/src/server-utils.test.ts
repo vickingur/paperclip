@@ -935,6 +935,13 @@ describe("runChildProcess", () => {
 });
 
 describe("renderPaperclipWakePrompt", () => {
+  it("shows every coalesced wake reason", () => {
+    const prompt = renderPaperclipWakePrompt({ reason: "issue_commented",
+      reasons: ["issue_commented", "issue_children_completed"],
+      issue: { id: "issue-1", title: "Review follow-up" } });
+    expect(prompt).toContain("coalesced reasons: issue_commented, issue_children_completed");
+  });
+
   it.each([false, true])("renders the runtime checkout flag for ordinary task wakes (resume=%s)", resumedSession => {
     const payload = { reason: "issue_assigned", issue: { id: "issue-1", status: "in_progress" },
       comments: [], commentWindow: { requestedCount: 0, includedCount: 0, missingCount: 0 },
