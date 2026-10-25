@@ -868,10 +868,23 @@ export const createChildIssueSchema = withCreateIssueStatusDefault(
 
 export type CreateChildIssue = z.infer<typeof createChildIssueSchema>;
 
-export const createAcceptedPlanDecompositionSchema = z.object({
-  acceptedPlanRevisionId: z.string().guid(),
-  children: z.array(createChildIssueSchema).min(1).max(25),
-});
+// Plan children are execution work: the review/approval `kind` accepted by the
+// child-create route is rejected here rather than silently ignored.
+export const createAcceptedPlanDecompositionSchema = z
+  .object({
+    acceptedPlanRevisionId: z.string().guid(),
+    children: z.array(createChildIssueSchema).min(1).max(25),
+  })
+  .superRefine((value, ctx) => {
+    value.children.forEach((child, index) => {
+      if (child.kind === undefined) return;
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "kind is not supported for accepted-plan decomposition children",
+        path: ["children", index, "kind"],
+      });
+    });
+  });
 
 export type CreateAcceptedPlanDecomposition = z.infer<
   typeof createAcceptedPlanDecompositionSchema
