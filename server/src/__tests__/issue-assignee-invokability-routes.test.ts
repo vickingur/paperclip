@@ -131,6 +131,7 @@ vi.mock("../services/index.js", () => ({
   workProductService: () => ({}),
 }));
 
+import { heartbeatRuns, issues } from "@paperclipai/db";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
 
@@ -156,25 +157,35 @@ function agentActor(): Actor {
   };
 }
 
-// Minimal chainable/thenable db stub: any query resolves to an empty row set.
-// Run containment is mocked because this suite targets assignee invokability.
-function stubDb(): any {
-  const query: any = {};
-  for (const method of ["select", "from", "where", "innerJoin", "leftJoin", "orderBy", "limit", "groupBy", "for"]) {
-    query[method] = () => query;
-  }
-  query.then = (resolve: (rows: unknown[]) => unknown) => Promise.resolve(resolve([]));
-  return { select: () => query };
+// Minimal chainable/thenable db stub: a query resolves to the rows given for
+// its table, otherwise an empty row set. Run containment is mocked because
+// this suite targets assignee invokability.
+function stubDb(rowsByTable: Map<unknown, unknown[]> = new Map()): any {
+  return {
+    select: () => {
+      let rows: unknown[] = [];
+      const query: any = {};
+      for (const method of ["select", "where", "innerJoin", "leftJoin", "orderBy", "limit", "groupBy", "for"]) {
+        query[method] = () => query;
+      }
+      query.from = (table: unknown) => {
+        rows = rowsByTable.get(table) ?? [];
+        return query;
+      };
+      query.then = (resolve: (rows: unknown[]) => unknown) => Promise.resolve(resolve(rows));
+      return query;
+    },
+  };
 }
 
-function createApp(actor: Actor) {
+function createApp(actor: Actor, rowsByTable?: Map<unknown, unknown[]>) {
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
     (req as any).actor = actor;
     next();
   });
-  app.use("/api", issueRoutes(stubDb() as any, {} as any));
+  app.use("/api", issueRoutes(stubDb(rowsByTable) as any, {} as any));
   app.use(errorHandler);
   return app;
 }
@@ -274,6 +285,38 @@ describe("issue assignee invokability guard", () => {
   });
 });
 
+const openAncestorByIdleAgent = {
+  id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+  identifier: "PAP-100",
+  parentId: null,
+  createdByAgentId: IDLE_AGENT_ID,
+  status: "in_progress",
+};
+
+function createdIssue(overrides: Record<string, unknown> = {}) {
+  return makeIssue({
+    id: "99999999-9999-4999-8999-999999999999",
+    identifier: "PAP-1000",
+    assigneeAgentId: IDLE_AGENT_ID,
+    ...overrides,
+  });
+}
+
+// Db rows that bind the agent's current run to `source`.
+function runBoundTo(source: ReturnType<typeof makeIssue>) {
+  return new Map<unknown, unknown[]>([
+    [heartbeatRuns, [{
+      id: AGENT_RUN_ID,
+      companyId: "company-1",
+      agentId: AGENT_ACTOR_ID,
+      issueId: source.id,
+      nativeIssueId: null,
+      contextSnapshot: null,
+    }]],
+    [issues, [source]],
+  ]);
+}
+
 describe("agent delegation cycle guard", () => {
   beforeEach(() => {
     mockIssueService.getById.mockReset();
@@ -327,6 +370,206 @@ describe("agent delegation cycle guard", () => {
 
     expect(res.status).toBe(201);
     expect(mockIssueService.createChild).toHaveBeenCalled();
+  });
+
+  it("allows a review child assigned to the creator of an open ancestor", async () => {
+    const parent = makeIssue();
+    mockIssueService.getById.mockResolvedValue(parent);
+    mockIssueService.findOpenAncestorCreatedByAgent.mockResolvedValue({
+      id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+      identifier: "PAP-100",
+      parentId: null,
+      createdByAgentId: IDLE_AGENT_ID,
+      status: "in_progress",
+    });
+    mockIssueService.createChild.mockResolvedValue({
+      issue: makeIssue({ id: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee", parentId: parent.id, assigneeAgentId: IDLE_AGENT_ID }),
+      parentBlockerAdded: false,
+    });
+
+    const res = await request(createApp(agentActor()))
+      .post(`/api/issues/${parent.id}/children`)
+      .send({
+        title: "Visual review of the previs",
+        description: "Review the frames",
+        assigneeAgentId: IDLE_AGENT_ID,
+        kind: "review",
+      });
+
+    expect(res.status).toBe(201);
+    expect(mockIssueService.createChild).toHaveBeenCalledWith(
+      parent.id,
+      expect.objectContaining({
+        assigneeAgentId: IDLE_AGENT_ID,
+        originKind: "review_request",
+        originId: parent.id,
+      }),
+    );
+    expect(mockIssueService.createChild.mock.calls[0]?.[1]).not.toHaveProperty("kind");
+  });
+
+  it("rejects an unknown child kind instead of exempting it", async () => {
+    const parent = makeIssue();
+    mockIssueService.getById.mockResolvedValue(parent);
+
+    const res = await request(createApp(agentActor()))
+      .post(`/api/issues/${parent.id}/children`)
+      .send({
+        title: "Hand it back",
+        description: "Bounce",
+        assigneeAgentId: IDLE_AGENT_ID,
+        kind: "execution",
+      });
+
+    expect(res.status).toBe(400);
+    expect(mockIssueService.createChild).not.toHaveBeenCalled();
+  });
+
+  it("still refuses an approval child assigned to a paused agent", async () => {
+    const parent = makeIssue();
+    mockIssueService.getById.mockResolvedValue(parent);
+
+    const res = await request(createApp(agentActor()))
+      .post(`/api/issues/${parent.id}/children`)
+      .send({
+        title: "Approve the cut",
+        description: "Sign off",
+        assigneeAgentId: PAUSED_AGENT_ID,
+        kind: "approval",
+      });
+
+    expect(res.status).toBe(409);
+    expect(res.body.error).toContain("paused agent");
+    expect(mockIssueService.createChild).not.toHaveBeenCalled();
+  });
+
+  it("allows a company-route review under an explicit parent with an ancestor-creator assignee", async () => {
+    const parent = makeIssue();
+    mockIssueService.getById.mockResolvedValue(parent);
+    mockIssueService.findOpenAncestorCreatedByAgent.mockResolvedValue(openAncestorByIdleAgent);
+    mockIssueService.create.mockResolvedValue(createdIssue({ parentId: parent.id }));
+
+    const res = await request(createApp(agentActor()))
+      .post("/api/companies/company-1/issues")
+      .send({
+        title: "Visual review of the previs",
+        description: "Review the frames",
+        parentId: parent.id,
+        assigneeAgentId: IDLE_AGENT_ID,
+        kind: "review",
+      });
+
+    expect(res.status).toBe(201);
+    expect(mockIssueService.create).toHaveBeenCalledWith(
+      "company-1",
+      expect.objectContaining({
+        parentId: parent.id,
+        assigneeAgentId: IDLE_AGENT_ID,
+        originKind: "review_request",
+        originId: parent.id,
+      }),
+    );
+    expect(mockIssueService.create.mock.calls[0]?.[1]).not.toHaveProperty("kind");
+  });
+
+  it("still refuses a company-route execution child under an explicit parent with an ancestor-creator assignee", async () => {
+    const parent = makeIssue();
+    mockIssueService.getById.mockResolvedValue(parent);
+    mockIssueService.findOpenAncestorCreatedByAgent.mockResolvedValue(openAncestorByIdleAgent);
+
+    const res = await request(createApp(agentActor()))
+      .post("/api/companies/company-1/issues")
+      .send({
+        title: "Hand it back",
+        description: "Bounce",
+        parentId: parent.id,
+        assigneeAgentId: IDLE_AGENT_ID,
+      });
+
+    expect(res.status).toBe(409);
+    expect(res.body.details).toMatchObject({ code: "delegation_cycle" });
+    expect(mockIssueService.create).not.toHaveBeenCalled();
+  });
+
+  it("stamps a null origin id on a standalone company-route approval", async () => {
+    mockIssueService.create.mockResolvedValue(createdIssue());
+
+    const res = await request(createApp(agentActor()))
+      .post("/api/companies/company-1/issues")
+      .send({
+        title: "Approve the release notes",
+        description: "Sign off",
+        parentId: null,
+        assigneeAgentId: IDLE_AGENT_ID,
+        kind: "approval",
+      });
+
+    expect(res.status).toBe(201);
+    expect(mockIssueService.create).toHaveBeenCalledWith(
+      "company-1",
+      expect.objectContaining({ parentId: null, originKind: "review_request", originId: null }),
+    );
+  });
+
+  it("keeps the run's task as default parent for a review to an ancestor creator", async () => {
+    const source = makeIssue();
+    mockIssueService.getById.mockResolvedValue(source);
+    mockIssueService.findOpenAncestorCreatedByAgent.mockResolvedValue(openAncestorByIdleAgent);
+    mockIssueService.create.mockResolvedValue(createdIssue({ parentId: source.id }));
+
+    const res = await request(createApp(agentActor(), runBoundTo(source)))
+      .post("/api/companies/company-1/issues")
+      .send({
+        title: "Visual review of the previs",
+        description: "Review the frames",
+        assigneeAgentId: IDLE_AGENT_ID,
+        kind: "review",
+      });
+
+    expect(res.status).toBe(201);
+    expect(mockIssueService.findOpenAncestorCreatedByAgent).not.toHaveBeenCalled();
+    expect(mockIssueService.create).toHaveBeenCalledWith(
+      "company-1",
+      expect.objectContaining({
+        parentId: source.id,
+        originKind: "review_request",
+        originId: source.id,
+      }),
+    );
+  });
+
+  it("drops the run's default parent for an execution child to an ancestor creator", async () => {
+    const source = makeIssue();
+    mockIssueService.getById.mockResolvedValue(source);
+    mockIssueService.findOpenAncestorCreatedByAgent.mockResolvedValue(openAncestorByIdleAgent);
+    mockIssueService.create.mockResolvedValue(createdIssue());
+
+    const res = await request(createApp(agentActor(), runBoundTo(source)))
+      .post("/api/companies/company-1/issues")
+      .send({
+        title: "Follow-up",
+        description: "Standalone work",
+        assigneeAgentId: IDLE_AGENT_ID,
+      });
+
+    expect(res.status).toBe(201);
+    expect(mockIssueService.findOpenAncestorCreatedByAgent).toHaveBeenCalledWith(source.id, IDLE_AGENT_ID);
+    const createBody = mockIssueService.create.mock.calls[0]?.[1];
+    expect(createBody?.parentId ?? null).toBeNull();
+    expect(createBody).not.toHaveProperty("originKind", "review_request");
+  });
+
+  it("rejects kind on accepted-plan decomposition children", async () => {
+    const res = await request(createApp(agentActor()))
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/accepted-plan-decompositions")
+      .send({
+        acceptedPlanRevisionId: "ffffffff-ffff-4fff-8fff-ffffffffffff",
+        children: [{ title: "Review", assigneeAgentId: IDLE_AGENT_ID, kind: "review" }],
+      });
+
+    expect(res.status).toBe(400);
+    expect(JSON.stringify(res.body)).toContain("kind is not supported");
+    expect(mockIssueService.getById).not.toHaveBeenCalled();
   });
 
   it("does not consult the guard for board actors", async () => {

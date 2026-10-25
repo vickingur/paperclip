@@ -353,6 +353,13 @@ export const TASK_WATCHDOG_PRODUCT_BUG_ORIGIN_KIND = "task_watchdog_product_bug"
 // (e.g. suppress the seeded-description bubble and rely on a seeded greeting).
 export const ONBOARDING_FIRST_TASK_ORIGIN_KIND = "onboarding_first_task";
 
+// Stamped by the server on a child created with an explicit review/approval
+// `kind`. The reviewer may be the agent that created an open ancestor: asking
+// it to review is not delegating its own work back to it.
+export const ISSUE_REVIEW_REQUEST_ORIGIN_KIND = "review_request";
+export const ISSUE_CREATE_KINDS = ["review", "approval"] as const;
+export type IssueCreateKind = (typeof ISSUE_CREATE_KINDS)[number];
+
 export const ISSUE_ORIGIN_KINDS = [
   "manual",
   "routine_execution",
@@ -364,6 +371,7 @@ export const ISSUE_ORIGIN_KINDS = [
   "task_watchdog",
   TASK_WATCHDOG_PRODUCT_BUG_ORIGIN_KIND,
   ONBOARDING_FIRST_TASK_ORIGIN_KIND,
+  ISSUE_REVIEW_REQUEST_ORIGIN_KIND,
   "chat_channel",
 ] as const;
 export type BuiltInIssueOriginKind = (typeof ISSUE_ORIGIN_KINDS)[number];

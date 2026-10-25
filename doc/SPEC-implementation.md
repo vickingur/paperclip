@@ -727,7 +727,11 @@ project or root-task scope. Both creation endpoints enforce task-assignment
 authorization, including responsible-user and protected-assignment checks, even
 when the new task is unassigned. Created tasks retain the effective containment
 policy and quarantined source attribution. Self-assigned decomposition does not
-count as delegation back to another agent. Persistent instruction changes remain
+count as delegation back to another agent, and neither does a child created with
+`kind: "review"` or `kind: "approval"`: it may be assigned to the creator of an
+open ancestor, and the server stamps `originKind: "review_request"` (origin id =
+parent) on it. Other children assigned to an open ancestor's creator are still
+rejected with `delegation_cycle`. Persistent instruction changes remain
 restricted except for self-edits requested through authenticated owner chat.
 That exception requires the current accepted identity and a recorded direct
 board-message wake, and rechecks the user's current instruction-editing permission
