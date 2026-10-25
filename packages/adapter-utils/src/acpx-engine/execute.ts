@@ -3489,6 +3489,16 @@ function classifyError(
   };
 }
 
+// The ACP agent's generic JSON-RPC internal error (-32603) while starting a
+// session carries no cause, and the next attempt with no change has
+// succeeded (VIK-1979). Report it as transient so the run takes the bounded
+// retry and the agent stays idle; a specific init failure keeps its error.
+const ACPX_GENERIC_SESSION_INIT_ERROR_RE = /^(?:internal(?: server)? error\.?)?$/i;
+
+function isTransientSessionInitFailure(errorCode: string | null | undefined, message: string): boolean {
+  return errorCode === "acpx_session_init_failed" && ACPX_GENERIC_SESSION_INIT_ERROR_RE.test(message.trim());
+}
+
 async function readChildStderrTail(input: {
   logPath: string | null;
   maxBytes?: number;
@@ -4606,6 +4616,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
             // bytes never reach the run log or the acpx.error payload.
             ...(guardTripped ? { suppressChildStderrTail: true } : {}),
           });
+          const transientInit = !guardTripped && isTransientSessionInitFailure(classified.errorCode, message);
           capturedResult = {
             exitCode: 1,
             signal: null,
@@ -4616,7 +4627,11 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
             ...referencedProjectStagingFailuresField,
             model: prepared.requestedModel || null,
             clearSession,
-            resultJson: { phase: "ensure_session" },
+            ...(transientInit ? { errorFamily: "transient_upstream" as const } : {}),
+            resultJson: {
+              phase: "ensure_session",
+              ...(transientInit ? { errorFamily: "transient_upstream" } : {}),
+            },
             summary: message,
           };
           return settleFor("handshake", err);
