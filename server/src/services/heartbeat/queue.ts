@@ -1623,7 +1623,9 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       claimedWakeReason !== "source_scoped_recovery_action"
     ) {
       const claimedAgent = await getAgent(claimed.agentId);
-      await bindRoutineExecutionLock(db, (bindTx) => bindTx
+      // A single statement outside a transaction needs no savepoint: losing a
+      // concurrent bind fails only this update, and the run stays unbound.
+      await db
         .update(issues)
         .set({
           executionRunId: claimed.id,
@@ -1651,7 +1653,10 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             // The run is already running; never fail it on the routine lock.
             noOtherRoutineExecutionLockHolder(),
           ),
-        ));
+        )
+        .catch((error: unknown) => {
+          if (!isRoutineExecutionLockConflict(error)) throw error;
+        });
     }
 
     return claimed;
