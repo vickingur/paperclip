@@ -76,7 +76,29 @@ const PROVIDER_CAPACITY_TEST_ADAPTER = "provider_capacity_test";
 // Exact terminal text from VIK-1854 (SE3 run cffad0fd, Platform Engineer run a5334334).
 const PROVIDER_CAPACITY_MESSAGE =
   "ACP agent reported a terminal service failure.\nSelected model is at capacity. Please try a different model.";
+// Exact failure from VIK-1979 (SE3 runs cad914bd, f2fcd5c8): the ACPX
+// executor's result for a generic internal error while starting the session.
+const SESSION_INIT_INTERNAL_ERROR_MESSAGE = "Internal error";
+const TRANSIENT_FAILURES = {
+  capacity: {
+    // The Codex ACPX classifier's result for a typed `service` capacity failure.
+    errorMessage: PROVIDER_CAPACITY_MESSAGE,
+    errorCode: "codex_transient_upstream",
+    resultJson: {
+      terminalSessionFailure: {
+        category: "service",
+        title: "Selected model is at capacity. Please try a different model.",
+      },
+    },
+  },
+  sessionInit: {
+    errorMessage: SESSION_INIT_INTERNAL_ERROR_MESSAGE,
+    errorCode: "acpx_session_init_failed",
+    resultJson: { phase: "ensure_session" },
+  },
+} as const;
 let capacityRunContinuesConversation = true;
+let transientFailure: (typeof TRANSIENT_FAILURES)[keyof typeof TRANSIENT_FAILURES] = TRANSIENT_FAILURES.capacity;
 
 if (!embeddedPostgresSupport.supported) {
   console.warn(
@@ -133,15 +155,15 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     });
     registerServerAdapter({
       type: PROVIDER_CAPACITY_TEST_ADAPTER,
-      // The Codex ACPX classifier's result for a typed `service` capacity failure.
       execute: async () => ({
         exitCode: 1,
         signal: null,
         timedOut: false,
-        errorMessage: PROVIDER_CAPACITY_MESSAGE,
-        errorCode: "codex_transient_upstream",
+        errorMessage: transientFailure.errorMessage,
+        errorCode: transientFailure.errorCode,
         errorFamily: "transient_upstream",
         resultJson: {
+          ...transientFailure.resultJson,
           // A real Codex/Claude run persists the conversation-continuation
           // policy (run-lifecycle); it carries no bootstrap evidence. Without
           // it, the retry is refused pending reconciliation.
@@ -149,10 +171,6 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
             ? { conversationContinuation: CONVERSATION_CONTINUATION_POLICY }
             : {}),
           errorFamily: "transient_upstream",
-          terminalSessionFailure: {
-            category: "service",
-            title: "Selected model is at capacity. Please try a different model.",
-          },
         },
       }),
       testEnvironment: async () => ({
@@ -173,6 +191,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     // a late write races the deletes and can deadlock or break a foreign key.
     await drainHeartbeatRunsToQuiescence(db, heartbeat);
     capacityRunContinuesConversation = true;
+    transientFailure = TRANSIENT_FAILURES.capacity;
     await cleanupRetryFixture();
     vi.clearAllMocks();
   });
@@ -475,7 +494,11 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     return { agentId, readAgent, readRetryOf };
   }
 
-  it("keeps the agent idle through transient model-capacity retries and errors only when the budget is spent", async () => {
+  it.each([
+    ["model-capacity", TRANSIENT_FAILURES.capacity],
+    ["session-init internal error", TRANSIENT_FAILURES.sessionInit],
+  ])("keeps the agent idle through transient %s retries and errors only when the budget is spent", async (_label, failure) => {
+    transientFailure = failure;
     const { agentId, readAgent, readRetryOf } = await seedCapacityAgent();
     const runRetryNow = async (retryId: string) => {
       await db.update(heartbeatRuns).set({ scheduledRetryAt: new Date(Date.now() - 1000) }).where(eq(heartbeatRuns.id, retryId));
@@ -488,7 +511,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     const run = await heartbeat.invoke(agentId, "on_demand", {}, "manual");
     expect(run).not.toBeNull();
     const failedRun = await waitForRunToFinish(heartbeat, run!.id);
-    expect(failedRun).toMatchObject({ status: "failed", errorCode: "codex_transient_upstream" });
+    expect(failedRun).toMatchObject({ status: "failed", errorCode: failure.errorCode });
     await heartbeat.drainActiveRunExecutions();
 
     // First failure: a retry is queued and the agent stays idle.
@@ -501,15 +524,15 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     expect(await readAgent()).toEqual({ status: "idle", errorReason: null });
 
     // Second consecutive failure: the last retry is queued, still idle.
-    expect(await runRetryNow(firstRetry!.id)).toMatchObject({ status: "failed", errorCode: "codex_transient_upstream" });
+    expect(await runRetryNow(firstRetry!.id)).toMatchObject({ status: "failed", errorCode: failure.errorCode });
     const secondRetry = await readRetryOf(firstRetry!.id);
     expect(secondRetry).toMatchObject({ status: "scheduled_retry", scheduledRetryAttempt: 2 });
     expect(await readAgent()).toEqual({ status: "idle", errorReason: null });
 
     // Third consecutive failure exhausts the budget: now the agent needs attention.
-    expect(await runRetryNow(secondRetry!.id)).toMatchObject({ status: "failed", errorCode: "codex_transient_upstream" });
+    expect(await runRetryNow(secondRetry!.id)).toMatchObject({ status: "failed", errorCode: failure.errorCode });
     expect(await readRetryOf(secondRetry!.id)).toBeNull();
-    expect(await readAgent()).toEqual({ status: "error", errorReason: PROVIDER_CAPACITY_MESSAGE });
+    expect(await readAgent()).toEqual({ status: "error", errorReason: failure.errorMessage });
   });
 
   it("errors on a transient model-capacity failure whose retry is refused", async () => {

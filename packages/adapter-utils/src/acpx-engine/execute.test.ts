@@ -2475,6 +2475,50 @@ describe("shared ACPX engine runtime behavior", () => {
     expect(stderrLog!.text).toContain(stderrTail);
   });
 
+  it.each([
+    // Exact failure from VIK-1979 (SE3 runs cad914bd and f2fcd5c8).
+    ["Internal error", true, true],
+    ["Internal error", false, true],
+    ["Internal server error.", true, true],
+    ["session/new failed: backend rejected initialize", true, false],
+  ])("marks a generic session-init failure transient: %s (acp code %s)", async (message, withAcpCode, transient) => {
+    const root = await makeTempRoot();
+    const sessionInitError = Object.assign(new Error(message), withAcpCode ? { code: "ACP_SESSION_INIT_FAILED" } : {});
+    const execute = createAcpxEngineExecutor({
+      createRuntime: () => ({
+        ensureSession: async () => {
+          throw sessionInitError;
+        },
+        startTurn: () => ({
+          events: (async function* () {})(),
+          result: Promise.resolve({ status: "completed", stopReason: "end_turn" }),
+          cancel: async () => {},
+        }),
+        close: async () => {},
+      }) as never,
+    });
+
+    const result = await execute({
+      runId: "run-1",
+      agent: { id: "agent-1", companyId: "company-1" },
+      runtime: {},
+      config: { agent: "custom", agentCommand: "node ./fake-acp.js", stateDir: path.join(root, "state") },
+      context: {},
+      onLog: async () => {},
+      onMeta: async () => {},
+    } as never);
+
+    expect(result).toMatchObject({ exitCode: 1, errorCode: "acpx_session_init_failed", errorMessage: message });
+    if (transient) {
+      expect(result.errorFamily).toBe("transient_upstream");
+      expect(result.resultJson).toMatchObject({ phase: "ensure_session", errorFamily: "transient_upstream" });
+    } else {
+      expect(result.errorFamily).toBeUndefined();
+      expect(result.resultJson).toMatchObject({ phase: "ensure_session" });
+      expect(result.resultJson).not.toHaveProperty("errorFamily");
+    }
+  });
+
   it("configures in-process child stderr capture without forcing verbose mode", async () => {
     const root = await makeTempRoot();
     const { runtimeOptions } = await runExecutor({ agent: "custom", agentCommand: "node ./fake-acp.js", stateDir: path.join(root, "state") });
