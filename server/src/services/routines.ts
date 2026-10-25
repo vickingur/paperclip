@@ -81,6 +81,7 @@ import { queueIssueAssignmentWakeup, type IssueAssignmentWakeupDeps } from "./is
 import { logActivity } from "./activity-log.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 import { runtimePublicOrigin } from "./cloud-runtime-identity.js";
+import { isRoutineExecutionLockConflict } from "./routine-execution-lock.js";
 
 const OPEN_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked"];
 const LIVE_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"];
@@ -1555,7 +1556,7 @@ export function routineService(
       .then((rows) => rows[0]?.issues ?? null);
     if (executionBoundIssue) return executionBoundIssue;
 
-    return executor
+    const liveRunIssue = await executor
       .select()
       .from(issues)
       .innerJoin(
@@ -1579,6 +1580,28 @@ export function routineService(
       .orderBy(desc(issues.updatedAt), desc(issues.createdAt))
       .limit(1)
       .then((rows) => rows[0]?.issues ?? null);
+    if (liveRunIssue) return liveRunIssue;
+
+    // An open issue that still holds an execution run, even a stale one,
+    // occupies issues_open_routine_execution_uq. A fresh issue could never
+    // execute alongside it, so treat it as the active execution.
+    return executor
+      .select()
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, routine.companyId),
+          eq(issues.originKind, originKind),
+          eq(issues.originId, originId),
+          inArray(issues.status, OPEN_ISSUE_STATUSES),
+          visibleIssueCondition(),
+          isNotNull(issues.executionRunId),
+          ...(fingerprintCondition ? [fingerprintCondition] : []),
+        ),
+      )
+      .orderBy(desc(issues.updatedAt), desc(issues.createdAt))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
   }
 
   async function finalizeRun(runId: string, patch: Partial<typeof routineRuns.$inferInsert>, executor: Db = db) {
@@ -1938,13 +1961,7 @@ export function routineService(
             executionWorkspaceSettings: input.executionWorkspaceSettings ?? null,
           });
         } catch (error) {
-          const isOpenExecutionConflict =
-            !!error &&
-            typeof error === "object" &&
-            "code" in error &&
-            (error as { code?: string }).code === "23505" &&
-            "constraint" in error &&
-            (error as { constraint?: string }).constraint === "issues_open_routine_execution_uq";
+          const isOpenExecutionConflict = isRoutineExecutionLockConflict(error);
           if (!isOpenExecutionConflict || input.routine.concurrencyPolicy === "always_enqueue") {
             throw error;
           }
