@@ -17,7 +17,7 @@ import {
   formatIssueIdentifierLink,
 } from "./heartbeat/scheduling.js";
 import { FAST_RESPONSE_AGENT_GUIDANCE, fastResponseHistoryBody } from "@paperclipai/shared";
-import { agentExecutionsHaveStopped } from "./agent-execution-stop.js";
+import { getAgentExecutionStopBlocker, type ExecutionStopBlocker } from "./agent-execution-stop.js";
 import {
   cancelHeartbeatNativeRun,
   terminateHeartbeatRunProcess,
@@ -5173,7 +5173,7 @@ export function heartbeatService(
     }
   }
 
-  async function stopInvocationsForAgents(agentIds: string[], reason: string) {
+  async function stopInvocationsForAgentsWithDiagnostics(agentIds: string[], reason: string): Promise<ExecutionStopBlocker | null> {
     await cancelInvocationsForAgentsInternal(agentIds, reason);
     const runs = await db.select().from(heartbeatRuns).where(inArray(heartbeatRuns.agentId, agentIds));
     const leasesToRelease = await db.select({ runId: environmentLeases.heartbeatRunId }).from(environmentLeases)
@@ -5185,14 +5185,21 @@ export function heartbeatService(
     for (const run of runs) {
       if (!isHeartbeatRunTerminalStatus(run.status) || liveRunExecutions.has(run.id) ||
           adapterExecutionControls.has(run.id) || processRunCancellationSettlements.has(run.id) ||
-          (run.controllerLeaseExpiresAt && run.controllerLeaseExpiresAt > new Date())) return false;
+          (run.controllerLeaseExpiresAt && run.controllerLeaseExpiresAt > new Date())) {
+        return { runId: run.id, reason: run.controllerLeaseExpiresAt && run.controllerLeaseExpiresAt > new Date()
+          ? "controller_lease" : "run_active" };
+      }
       if (needsRelease.has(run.id)) {
         // Retry incomplete cleanup after a run becomes terminal.
         await releaseEnvironmentLeasesForRun({ runId: run.id, companyId: run.companyId,
           agentId: run.agentId, status: run.status, providerResourceDisposition: "destroy" });
       }
     }
-    return agentExecutionsHaveStopped(db, agentIds);
+    return getAgentExecutionStopBlocker(db, agentIds);
+  }
+
+  async function stopInvocationsForAgents(agentIds: string[], reason: string) {
+    return await stopInvocationsForAgentsWithDiagnostics(agentIds, reason) === null;
   }
 
   return {
@@ -5200,6 +5207,7 @@ export function heartbeatService(
     commitBoardExecutionReset: heartbeatQueue.commitBoardExecutionReset,
     resetBoardExecution: heartbeatQueue.resetBoardExecution,
     stopInvocationsForAgents,
+    stopInvocationsForAgentsWithDiagnostics,
     waitForRunExecutionDrain: async (
       runId: string,
       options: { timeoutMs?: number; intervalMs?: number } = {},
