@@ -33,6 +33,7 @@ Image version: `<upstream describe of merge base>+vik.<fork commit count>`, e.g.
 | Provider-home setup command (`server/src/services/ai-home-setup.ts`) | `PAPERCLIP_AI_HOME_SETUP_COMMAND` runs once a run's provider home is seeded, with `CODEX_HOME`/`CLAUDE_CONFIG_DIR` and `PAPERCLIP_AI_HARNESS` set. Codex trusts a hook by its `hooks.json` path, and each run gets a fresh home, so the hook must be written and trusted per run. A failure is logged; the run goes on. |
 | Codex quota windows named by length (`packages/adapters/codex-local/src/server/quota.ts`) | Upstream labeled the primary window "5h limit" whatever its length; on plans where it is weekly, the panel showed the weekly figure as a 5-hour limit. |
 | Claude quota from agent readings (`server/src/services/observed-claude-quota.ts`) | A `claude setup-token` token cannot read the usage endpoint, so the Anthropic panel only said quota was unavailable. With `PAPERCLIP_CLAUDE_QUOTA_FILE` set, it falls back to the rate-limit windows the agents' Claude Code last reported (usage-guard keeps them in `usage.json`). |
+| Trusted write roots for Codex ACP (`server/src/services/heartbeat/trusted-write-roots.ts`, `packages/adapter-utils/src/acpx-engine/trusted-write-roots.ts`, codex-acp patch) | `PAPERCLIP_TRUSTED_WRITE_ROOTS` (server env) can make one exact directory writable in the Codex turn sandbox for listed issues only (VIK-2207 D1). Unset, it is a no-op. See `doc/TRUSTED-WRITE-ROOTS.md`. |
 
 
 Claude ACPX silence deadline: the host controller stops a Claude ACPX run after

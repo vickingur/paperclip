@@ -50,6 +50,13 @@ it("reserves identity credentials even for mixed-case inherited or configured ke
   for (const key of keys) expect(isForbiddenConfigEnvKey(key)).toBe(true);
 });
 
+it("never accepts trusted write-root channels from adapter config env", () => {
+  for (const key of ["PAPERCLIP_TRUSTED_WRITE_ROOTS", "PAPERCLIP_CODEX_ACP_TRUSTED_WRITE_ROOTS", "paperclip_codex_acp_trusted_write_roots"]) {
+    expect(isForbiddenConfigEnvKey(key)).toBe(true);
+  }
+  expect(isForbiddenConfigEnvKey("PAPERCLIP_CODEX_ACP_NETWORK_ACCESS")).toBe(false);
+});
+
 describe("runtime connection tool delivery", () => {
   const access = {
     version: 1 as const,

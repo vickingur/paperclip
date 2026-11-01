@@ -22,7 +22,7 @@ diff --git a/dist/index.js b/dist/index.js
          const response2 = await this.connection.request(
            methods.client.elicitation.create,
            this.buildElicitationRequest(params, context),
-@@ -25563,7 +25563,7 @@
+@@ -25563,9 +25563,9 @@
              toolCall: {
                toolCallId: context.correlatedCallId,
                kind: "execute",
@@ -32,7 +32,11 @@ diff --git a/dist/index.js b/dist/index.js
                // content: [messageContent],   — omitted: already rendered via item/started
 -              // rawInput: { ... }            — omitted: same reason
              },
-@@ -26988,4 +26988,18 @@
+             _meta: { is_mcp_tool_approval: true },
+             options
+@@ -26986,6 +26986,78 @@
+ var SUPPORTED_GATEWAY_PROTOCOLS = {
+   openai: "responses"
  };
 +function paperclipBaseInstructions(request) {
 +  if (process.env.PAPERCLIP_ACPX_ISOLATED_CONTEXT !== "1") return void 0;
@@ -44,14 +48,72 @@ diff --git a/dist/index.js b/dist/index.js
 +  return void 0;
 +}
 +function paperclipSandboxPolicy(sandboxPolicy) {
++  if (sandboxPolicy.type !== "workspaceWrite") return sandboxPolicy;
 +  const networkAccess = process.env.PAPERCLIP_CODEX_ACP_NETWORK_ACCESS;
-+  if (sandboxPolicy.type !== "workspaceWrite" || !["true", "false"].includes(networkAccess)) return sandboxPolicy;
-+  return { ...sandboxPolicy, networkAccess: networkAccess === "true" && process.env.PAPERCLIP_RUNNER_NETWORK_ACCESS !== "disabled" };
++  const overrideNetwork = ["true", "false"].includes(networkAccess);
++  const roots = paperclipTrustedWriteRoots();
++  if (!overrideNetwork && roots.length === 0) return sandboxPolicy;
++  return {
++    ...sandboxPolicy,
++    ...overrideNetwork ? { networkAccess: networkAccess === "true" && process.env.PAPERCLIP_RUNNER_NETWORK_ACCESS !== "disabled" } : {},
++    ...roots.length > 0 ? { writableRoots: uniqueStrings([...sandboxPolicy.writableRoots ?? [], ...roots]) } : {}
++  };
++}
++function paperclipLog(line) {
++  try {
++    process.stderr.write(line + "\n");
++  } catch {
++  }
++}
++function paperclipTrustedWriteRoots() {
++  const raw = process.env.PAPERCLIP_CODEX_ACP_TRUSTED_WRITE_ROOTS;
++  if (raw === void 0 || raw === "" || raw === "[]") return [];
++  let value;
++  try {
++    value = JSON.parse(raw);
++  } catch {
++    paperclipLog("[paperclip] trusted write roots ignored: malformed JSON");
++    return [];
++  }
++  if (!Array.isArray(value)) {
++    paperclipLog("[paperclip] trusted write roots ignored: not an array");
++    return [];
++  }
++  const roots = [];
++  for (const entry of value) {
++    const rootPath = entry && typeof entry === "object" ? entry.path : void 0;
++    if (typeof rootPath !== "string" || !path6.isAbsolute(rootPath) || path6.resolve(rootPath) !== rootPath || typeof entry.dev !== "number" || typeof entry.ino !== "number") {
++      paperclipLog(`[paperclip] trusted write root dropped: ${JSON.stringify(rootPath ?? null)} (malformed)`);
++      continue;
++    }
++    let reason = null;
++    try {
++      const stat = fs7.lstatSync(rootPath);
++      if (stat.isSymbolicLink() || !stat.isDirectory() || fs7.realpathSync(rootPath) !== rootPath) reason = "not a canonical directory";
++      else if (stat.dev !== entry.dev || stat.ino !== entry.ino) reason = "identity changed";
++    } catch {
++      reason = "missing";
++    }
++    if (reason) {
++      paperclipLog(`[paperclip] trusted write root dropped: ${rootPath} (${reason})`);
++      continue;
++    }
++    roots.push(rootPath);
++  }
++  return roots;
++}
++function paperclipLogTurnPolicy(sandboxPolicy) {
++  try {
++    const json = JSON.stringify(sandboxPolicy);
++    const hash = require("node:crypto").createHash("sha256").update(json).digest("hex").slice(0, 12);
++    paperclipLog(`[paperclip] turn sandboxPolicy sha256:${hash} type=${sandboxPolicy?.type} writableRoots=${JSON.stringify(sandboxPolicy?.writableRoots ?? [])} networkAccess=${sandboxPolicy?.networkAccess}`);
++  } catch {
++  }
 +}
  var CodexAcpClient = class {
    codexClient;
    config;
-@@ -27288,6 +27297,7 @@
+@@ -27288,6 +27360,7 @@
      const response = await this.codexClient.threadResume({
        config: await this.createSessionConfig(request.cwd, additionalDirectories, request.mcpServers ?? []),
        cwd: request.cwd,
@@ -59,7 +121,7 @@ diff --git a/dist/index.js b/dist/index.js
        modelProvider: await this.getResumeModelProvider(),
        threadId: request.sessionId
      });
-@@ -27310,6 +27320,7 @@
+@@ -27310,6 +27383,7 @@
      const response = await this.codexClient.threadResume({
        config: await this.createSessionConfig(request.cwd, additionalDirectories, request.mcpServers ?? []),
        cwd: request.cwd,
@@ -67,14 +129,16 @@ diff --git a/dist/index.js b/dist/index.js
        modelProvider: await this.getResumeModelProvider(),
        threadId: request.sessionId
      });
-@@ -27337,5 +27348,6 @@
+@@ -27337,6 +27411,7 @@
      const response = await this.codexClient.threadStart({
        config: await this.createSessionConfig(request.cwd, additionalDirectories, request.mcpServers),
        modelProvider: this.getModelProvider(),
 +      baseInstructions: paperclipBaseInstructions(request),
        cwd: request.cwd
      });
-@@ -27437,5 +27449,12 @@
+     const codexModels = await this.fetchAvailableModels();
+@@ -27436,6 +27511,13 @@
+     });
      const mergedConfig = {
        ...mergeGatewayConfig(this.config, this.gatewayConfig),
 +      ...(process.env.PAPERCLIP_ACPX_ISOLATED_CONTEXT === "1" ? {
@@ -87,7 +151,7 @@ diff --git a/dist/index.js b/dist/index.js
        projects: Object.fromEntries(sessionRoots.map((root) => [root, {
          trust_level: "trusted"
        }]))
-@@ -27449,7 +27468,7 @@
+@@ -27449,7 +27531,7 @@
        server: mcp
      }));
      let serversToConfigure = requestedServers;
@@ -96,8 +160,7 @@ diff --git a/dist/index.js b/dist/index.js
        const existingNames = await this.getConfigMcpServerNames(projectPath);
        serversToConfigure = requestedServers.filter((mcp) => !existingNames.has(mcp.name));
      }
-@@ -27483,14 +27502,15 @@
-   async refreshSkills(cwd, additionalRoots) {
+@@ -27484,13 +27566,14 @@
      if (!cwd) {
        return;
      }
@@ -114,16 +177,22 @@ diff --git a/dist/index.js b/dist/index.js
        forceReload: true
      });
    }
-@@ -27600,7 +27624,7 @@
+@@ -27595,11 +27678,13 @@
+     if (shouldCancel?.()) {
+       return null;
+     }
++    const sandboxPolicy = addAdditionalDirectoriesToSandboxPolicy(paperclipSandboxPolicy(agentMode.sandboxPolicy), additionalDirectories);
++    paperclipLogTurnPolicy(sandboxPolicy);
+     return await this.codexClient.runTurn({
        threadId: request.sessionId,
        input,
        approvalPolicy: agentMode.approvalPolicy,
 -      sandboxPolicy: addAdditionalDirectoriesToSandboxPolicy(agentMode.sandboxPolicy, additionalDirectories),
-+      sandboxPolicy: addAdditionalDirectoriesToSandboxPolicy(paperclipSandboxPolicy(agentMode.sandboxPolicy), additionalDirectories),
++      sandboxPolicy,
        summary: disableSummary ? "none" : "auto",
        effort,
        model: modelId.model,
-@@ -30595,6 +30614,9 @@
+@@ -30613,6 +30698,9 @@
                updatedGoal
              );
            }

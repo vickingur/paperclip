@@ -33,6 +33,25 @@
 
 import type { SessionReuseStore } from "./run-contracts.js";
 
+// Outstanding borrows per entry, shared by every store instance: the engine
+// builds a store per run over the same persistent map, so a borrow made by one
+// run must stay visible to the next run's store. A borrow adds one; a save of
+// the same entry or `endBorrow` returns one; a release drops the count.
+// `discardIdleByPrefix` never touches an entry with an outstanding borrow,
+// because a live run may still use it.
+const outstandingBorrows = new WeakMap<object, number>();
+
+function borrowCount(entry: unknown): number {
+  return typeof entry === "object" && entry !== null ? outstandingBorrows.get(entry) ?? 0 : 0;
+}
+
+function returnBorrow(entry: unknown): void {
+  if (typeof entry !== "object" || entry === null) return;
+  const outstanding = outstandingBorrows.get(entry) ?? 0;
+  if (outstanding > 1) outstandingBorrows.set(entry, outstanding - 1);
+  else outstandingBorrows.delete(entry);
+}
+
 /**
  * The construction options for a reuse store. The public `SessionReuseStore<T>`
  * surface stays generic; these options carry the per-lane behavior the store
@@ -113,6 +132,7 @@ export function createSessionReuseStore<T>(
     clearEntryTimer(entry);
     if (entries.get(key) !== entry) return;
     entries.delete(key);
+    if (typeof entry === "object" && entry !== null) outstandingBorrows.delete(entry);
     await config.release(entry);
   }
 
@@ -143,12 +163,14 @@ export function createSessionReuseStore<T>(
       // The entry is in use now, so clear its per-entry idle timer. The next
       // `save` re-arms a fresh timer after the run finishes.
       clearEntryTimer(entry);
+      if (typeof entry === "object" && entry !== null) outstandingBorrows.set(entry, borrowCount(entry) + 1);
       return entry;
     },
 
     save(sessionKey: string, entry: T): void {
       // The caller sets the entry's last-used time before it saves, so `save`
       // sets the entry as-is and arms its timer from that time.
+      returnBorrow(entry);
       entries.set(sessionKey, entry);
       armTimer(sessionKey, entry);
     },
@@ -160,6 +182,28 @@ export function createSessionReuseStore<T>(
       // finish before a downstream resource release.
       if (entry === undefined) return Promise.resolve();
       return releaseEntry(sessionKey, entry);
+    },
+
+    endBorrow(entry: T): void {
+      returnBorrow(entry);
+    },
+
+    async discardIdleByPrefix(
+      prefix: string,
+      predicate: (key: string, entry: T) => boolean,
+    ): Promise<string[]> {
+      const discarded: string[] = [];
+      for (const [key, entry] of [...entries.entries()]) {
+        if (!key.startsWith(prefix)) continue;
+        // Even an entry whose run already ended can still be referenced by an
+        // overlapping run of the same key; leave every borrowed entry alone.
+        if (borrowCount(entry) > 0) continue;
+        if (!predicate(key, entry)) continue;
+        if (entries.get(key) !== entry) continue;
+        await releaseEntry(key, entry);
+        discarded.push(key);
+      }
+      return discarded;
     },
 
     async evictIdle(now: number): Promise<void> {

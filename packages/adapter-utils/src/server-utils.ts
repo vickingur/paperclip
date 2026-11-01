@@ -166,10 +166,15 @@ export function isPaperclipRuntimeEnvKey(key: string): boolean {
 // harness-minted run token is the only source of Paperclip API identity.
 // PAPERCLIP_WAKE_PAYLOAD_JSON is retired: wake context travels in the prompt,
 // and a configured copy can exceed OS process-launch limits.
+// Trusted write roots come only from the server deploy env and the engine's
+// validated launch value, never from adapter config: the engine leaves the Codex
+// channel unset for non-Codex agents, so a config copy would otherwise apply.
 // Other PAPERCLIP_*-named config keys are allowed as long as Paperclip has
 // not assigned the same key for the run (runtime vars always win).
+const TRUSTED_WRITE_ROOT_ENV_KEYS = ["PAPERCLIP_TRUSTED_WRITE_ROOTS", "PAPERCLIP_CODEX_ACP_TRUSTED_WRITE_ROOTS"];
 export function isForbiddenConfigEnvKey(key: string): boolean {
   return key === "PAPERCLIP_API_KEY" || key === "PAPERCLIP_WAKE_PAYLOAD_JSON" ||
+    TRUSTED_WRITE_ROOT_ENV_KEYS.includes(key.toUpperCase()) ||
     AGENT_IDENTITY_ENV_KEYS.includes(key.toUpperCase());
 }
 const PAPERCLIP_SKILL_ROOT_RELATIVE_CANDIDATES = [

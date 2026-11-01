@@ -392,6 +392,14 @@ export interface SessionReuseStore<T> {
    * caller can await so the sweep completes before the run reads the cache.
    */
   evictIdle(now: number): void | Promise<void>;
+  /**
+   * Discard every idle entry whose key starts with `prefix` and that matches
+   * `predicate`. An entry that a run has borrowed and not yet saved back is
+   * never discarded. Resolves to the discarded keys.
+   */
+  /** Return one borrow of `entry` without saving it (the run ended and released or kept it). */
+  endBorrow(entry: T): void;
+  discardIdleByPrefix(prefix: string, predicate: (key: string, entry: T) => boolean): Promise<string[]>;
 }
 
 /**
@@ -433,10 +441,22 @@ export interface PaperclipClaudeSettingsIdentity {
 }
 
 /**
- * The 17 fields the session fingerprint hashes. Company, agent, and task
- * identifiers are NOT here; they scope the outer session key only (see
- * `SessionKeyIdentity`). A change to any field here invalidates a warm handle
- * or a resumable session and forces a fresh launch.
+ * One validated trusted write root: its canonical path and the `{dev, ino}`
+ * recorded when the engine validated it. A change of either gives a different
+ * session fingerprint.
+ */
+export interface TrustedWriteRootIdentity {
+  readonly path: string;
+  readonly dev: number;
+  readonly ino: number;
+}
+
+/**
+ * The 17 fields the session fingerprint hashes, plus the optional
+ * `trustedWriteRoots`. Company, agent, and task identifiers are NOT here; they
+ * scope the outer session key only (see `SessionKeyIdentity`). A change to any
+ * field here invalidates a warm handle or a resumable session and forces a
+ * fresh launch.
  */
 export interface SessionFingerprintIdentity {
   readonly agentIdentityKeyId?: string;
@@ -457,6 +477,11 @@ export interface SessionFingerprintIdentity {
   readonly mcpServers: readonly McpServerIdentity[];
   readonly secretManifestHash: string;
   readonly adapterEnvHash: string;
+  /**
+   * Validated trusted write roots. Set only when non-empty, so the legacy
+   * empty-root fingerprint stays byte-identical.
+   */
+  readonly trustedWriteRoots?: readonly TrustedWriteRootIdentity[];
 }
 
 /**

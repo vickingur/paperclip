@@ -59,6 +59,35 @@ describe("acpx identity split and launch environment", () => {
     void _assertOnlyIdentity;
   });
 
+  it("test_trusted_write_roots_are_optional_and_keep_the_legacy_fingerprint_byte_identical", () => {
+    // Pinned legacy hash of the sample identity (no trustedWriteRoots key). The
+    // builder and its canonical JSON are unchanged, so an empty-root run keeps
+    // every saved fingerprint and session key.
+    expect(buildSessionFingerprint(SAMPLE_FINGERPRINT_IDENTITY)).toBe("1da0454701902ca8");
+    const granted = buildSessionFingerprint({
+      ...SAMPLE_FINGERPRINT_IDENTITY,
+      trustedWriteRoots: [{ path: "/fx/cache", dev: 7, ino: 100 }],
+    });
+    expect(granted).not.toBe("1da0454701902ca8");
+    // A different root, or the same path with a new identity, is a new fingerprint.
+    for (const roots of [[{ path: "/fx/other", dev: 7, ino: 100 }], [{ path: "/fx/cache", dev: 7, ino: 101 }], [{ path: "/fx/cache", dev: 8, ino: 100 }]]) {
+      expect(buildSessionFingerprint({ ...SAMPLE_FINGERPRINT_IDENTITY, trustedWriteRoots: roots })).not.toBe(granted);
+    }
+  });
+
+  it("never projects trusted write-root variables from the host environment", () => {
+    const inherited = {
+      PATH: "/usr/bin",
+      PAPERCLIP_TRUSTED_WRITE_ROOTS: "[{\"path\":\"/\"}]",
+      PAPERCLIP_CODEX_ACP_TRUSTED_WRITE_ROOTS: "[{\"path\":\"/\",\"dev\":1,\"ino\":1}]",
+    };
+    for (const agent of ["codex", "claude", "gemini"]) {
+      const projected = projectAcpxInheritedHostEnvironment(inherited, agent, true);
+      expect(projected.PAPERCLIP_TRUSTED_WRITE_ROOTS).toBeUndefined();
+      expect(projected.PAPERCLIP_CODEX_ACP_TRUSTED_WRITE_ROOTS).toBeUndefined();
+    }
+  });
+
   it("test_finalize_launch_environment_is_sole_constructor_of_branded_environment", () => {
     // The finalizer merges every contribution and freezes the launch env.
     const baseEnv: Record<string, string> = { LAUNCH_ENV_TEST_BASE: "base" };
