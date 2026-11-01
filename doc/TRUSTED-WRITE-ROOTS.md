@@ -56,7 +56,8 @@ directories, not symlinks, owned by root or the server uid, not group/world
 writable; the root is not inside, and does not contain, any of the run's
 writable roots (cwd, `/tmp`, temp dirs, agent home, scratch, referenced
 projects, `CODEX_CONFIG` writable roots); no nesting between roots; no
-`.git`, `.codex` or `.agents` entry; not `/`, `/paperclip` or
+`.git`, `.codex` or `.agents` entry (only a confirmed `ENOENT` counts as
+absent; `EACCES`, `EIO` or any other lookup error drops the root); not `/`, `/paperclip` or
 `/paperclip/worktrees`. It records `{dev, ino}`, re-checks right before the
 borrow/spawn decision and again before a prompt on a reused warm runtime, and
 codex-acp re-checks before every turn. Any failure drops that root.

@@ -46,7 +46,7 @@ function createFakeFs() {
       return p;
     },
     lexists: async (p) => {
-      if (!dirs.has(p)) throw new Error(`ENOENT ${p}`);
+      if (!dirs.has(p)) throw Object.assign(new Error(`ENOENT ${p}`), { code: "ENOENT" });
     },
   };
   return { dirs, fakeFs, replace: (p: string) => { dirs.get(p)!.ino += 1000; } };

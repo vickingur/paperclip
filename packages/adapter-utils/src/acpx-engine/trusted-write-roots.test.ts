@@ -163,7 +163,7 @@ describe("trusted write-root topology (§4.2a/b)", () => {
         return p;
       },
       lexists: async (p) => {
-        if (!fakeDirs.has(p)) throw new Error("ENOENT");
+        if (!fakeDirs.has(p)) throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
       },
     };
     const W = ["/paperclip/projects/Northern-Kingdoms", "/tmp", "/paperclip/instances/default/tmp/run", "/paperclip/instances/default/workspaces/agent"];
@@ -215,6 +215,32 @@ describe("trusted write-root path and entry checks (§4.2d)", () => {
     await mkdir(path.join(base, "worktrees/cache", entry));
     expect((await validate([path.join(base, "worktrees/cache")])).rejected[0]?.reason).toBe(`contains ${entry}`);
   });
+
+  it.each([
+    ["EACCES", { code: "EACCES" }, "cannot inspect .git (EACCES)"],
+    ["EIO", { code: "EIO" }, "cannot inspect .git (EIO)"],
+    ["an error without a code", {}, "cannot inspect .git (unknown error)"],
+  ])("rejects a root whose entry lookup fails with %s", async (_label, fields, reason) => {
+    const cache = path.join(base, "worktrees/cache");
+    const fs: TrustedWriteRootFs = {
+      ...fixtureFs(),
+      lexists: async () => {
+        throw Object.assign(new Error("lookup failed"), fields);
+      },
+    };
+    const result = await validateTrustedWriteRoots([{ path: cache }], { runWritableRoots: writable(), serverUid: uid, fs });
+    expect(result).toEqual({ roots: [], rejected: [{ path: cache, reason }] });
+  });
+
+  it.skipIf(uid === 0)("rejects a root without search permission (real EACCES)", async () => {
+    const cache = path.join(base, "worktrees/cache");
+    await chmod(cache, 0o600);
+    try {
+      expect((await validate([cache])).rejected).toEqual([{ path: cache, reason: "cannot inspect .git (EACCES)" }]);
+    } finally {
+      await chmod(cache, 0o755);
+    }
+  });
 });
 
 describe("trusted write-root replacement after prepare (§4.2d)", () => {
@@ -263,6 +289,33 @@ describe("trusted write-root replacement after prepare (§4.2d)", () => {
     const roots = await prepared();
     await rm(path.join(base, "worktrees/cache"), { recursive: true });
     expect((await revalidateTrustedWriteRoots(roots, options())).rejected[0]?.reason).toBe("missing");
+  });
+
+  it.each(["EACCES", "EIO"])("drops a root whose entry lookup now fails with %s", async (code) => {
+    const roots = await prepared();
+    const fs: TrustedWriteRootFs = {
+      ...fixtureFs(),
+      lexists: async () => {
+        throw Object.assign(new Error("lookup failed"), { code });
+      },
+    };
+    expect(await revalidateTrustedWriteRoots(roots, { ...options(), fs })).toEqual({
+      roots: [],
+      rejected: [{ path: roots[0]!.path, reason: `cannot inspect .git (${code})` }],
+    });
+  });
+
+  it.skipIf(uid === 0)("drops a root that lost search permission (real EACCES)", async () => {
+    const roots = await prepared();
+    const cache = path.join(base, "worktrees/cache");
+    await chmod(cache, 0o600);
+    try {
+      expect((await revalidateTrustedWriteRoots(roots, options())).rejected).toEqual([
+        { path: cache, reason: "cannot inspect .git (EACCES)" },
+      ]);
+    } finally {
+      await chmod(cache, 0o755);
+    }
   });
 });
 

@@ -39,7 +39,11 @@ export interface TrustedWriteRootValidation {
 export interface TrustedWriteRootFs {
   lstat(p: string): Promise<Pick<Stats, "dev" | "ino" | "uid" | "mode" | "isDirectory" | "isSymbolicLink">>;
   realpath(p: string): Promise<string>;
-  /** Resolves when the entry exists (without following a final symlink); rejects otherwise. */
+  /**
+   * Resolves when the entry exists (without following a final symlink). Rejects
+   * with `code: "ENOENT"` only when it is confirmed absent; any other rejection
+   * fails validation.
+   */
   lexists(p: string): Promise<void>;
 }
 
@@ -220,13 +224,17 @@ async function checkCandidate(
     }
     if (component === candidate) identity = { path: candidate, dev: stat.dev, ino: stat.ino };
   }
-  // (5) no repository, Codex or agent-skill entry inside the root.
+  // (5) no repository, Codex or agent-skill entry inside the root. Only a
+  // confirmed ENOENT counts as absent; any other lookup error (EACCES, EIO, ...)
+  // leaves absence unknown and drops the root.
   for (const entry of FORBIDDEN_ENTRIES) {
     try {
       await fs.lexists(path.join(candidate, entry));
       return { ok: false, reason: `contains ${entry}` };
-    } catch {
-      // absent: fine
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException | null)?.code;
+      if (code === "ENOENT") continue;
+      return { ok: false, reason: `cannot inspect ${entry} (${typeof code === "string" ? code : "unknown error"})` };
     }
   }
   return identity ? { ok: true, identity } : { ok: false, reason: "missing" };
