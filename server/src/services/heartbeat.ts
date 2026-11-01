@@ -3,6 +3,7 @@ import { createPostgresWatchdogAdapter } from "../modules/active-run-watchdog/ad
 import { dispositionSuppressionReceipt, settleLegacyDispositionSuppression } from "./legacy-disposition-suppression.js";
 import { selectHeartbeatEnvironment } from "./heartbeat/environment-selection.js";
 import { prepareHeartbeatWorkspace } from "./heartbeat/workspace-preparation.js";
+import { readTrustedWriteRootsFromEnv, resolveTrustedWriteRoots } from "./heartbeat/trusted-write-roots.js";
 import { executeHeartbeatRuntime, NativeSessionResumeScheduledError, NativeWorkspaceFinalizeScheduledError } from "./heartbeat/runtime-execution.js";
 import { selectHeartbeatRuntime } from "./heartbeat/runtime-selection.js";
 import { createHeartbeatRunCompletion } from "./heartbeat/run-completion.js";
@@ -3757,6 +3758,11 @@ export function heartbeatService(
             ]
           : []),
       ];
+      // Server-owned: these fields replace any `paperclipWorkspace` a wake or
+      // context supplied. Admission reads only the same-company DB issue and the
+      // realized execution workspace, so a context-fallback project never qualifies.
+      const trustedWriteRootRules = readTrustedWriteRootsFromEnv(process.env, (message) =>
+        logger.warn({ runId: run.id, companyId: agent.companyId }, message));
       context.paperclipWorkspace = {
         cwd: executionWorkspace.cwd,
         source: executionWorkspace.source,
@@ -3774,6 +3780,21 @@ export function heartbeatService(
           await fs.mkdir(home, { recursive: true });
           return home;
         })(),
+        trustedWriteRoots: resolveTrustedWriteRoots({
+          rules: trustedWriteRootRules.rules,
+          agent,
+          dbIssue: issueContext
+            ? {
+                id: issueContext.id,
+                companyId: issueContext.companyId,
+                projectId: issueContext.projectId,
+                workMode: issueContext.workMode,
+                isConversation: isConversation(issueContext) || issueContext.chatProvider != null,
+              }
+            : null,
+          workspaceProjectId: executionWorkspace.projectId,
+        }),
+        trustedWriteRootsRulesHash: trustedWriteRootRules.hash,
       };
       context.paperclipWorkspaces = buildRunWorkspaceHints(resolvedWorkspace);
       // Emit exactly one requested-vs-synced observability line for the referenced-project set. A run

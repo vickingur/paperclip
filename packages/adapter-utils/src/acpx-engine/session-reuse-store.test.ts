@@ -157,4 +157,46 @@ describe("session reuse store", () => {
     expect(store.borrow("stale")).toBeUndefined();
     expect(store.borrow("fresh")).toEqual({ id: "fresh2", lastUsedAt: 1500 });
   });
+
+  it("test_discard_idle_by_prefix_closes_other_idle_entries_and_never_a_borrowed_one", async () => {
+    const entries = new Map<string, Entry>();
+    const released: Entry[] = [];
+    const store = createSessionReuseStore<Entry>(hostConfig(entries, released, 60_000));
+    const granted: Entry = { id: "granted", lastUsedAt: Date.now() };
+    const borrowedElsewhere: Entry = { id: "borrowed", lastUsedAt: Date.now() };
+    const otherTask: Entry = { id: "other-task", lastUsedAt: Date.now() };
+    store.save("paperclip:c:a:t:granted", granted);
+    store.save("paperclip:c:a:t:live", borrowedElsewhere);
+    store.save("paperclip:c:a:t2:other", otherTask);
+    // A live run holds this entry. A later store over the same map (the engine
+    // builds one per run) must still see the borrow.
+    expect(store.borrow("paperclip:c:a:t:live")).toBe(borrowedElsewhere);
+    const nextRunStore = createSessionReuseStore<Entry>(hostConfig(entries, released, 60_000));
+
+    const discarded = await nextRunStore.discardIdleByPrefix("paperclip:c:a:t:", (key) => key !== "paperclip:c:a:t:current");
+    expect(discarded).toEqual(["paperclip:c:a:t:granted"]);
+    expect(released).toEqual([granted]);
+    expect(granted.cleanupTimer).toBeUndefined();
+    expect(entries.has("paperclip:c:a:t:live")).toBe(true);
+    expect(entries.has("paperclip:c:a:t2:other")).toBe(true);
+
+    // Once the borrow ends, the entry is idle and can be discarded.
+    store.endBorrow(borrowedElsewhere);
+    expect(await nextRunStore.discardIdleByPrefix("paperclip:c:a:t:", () => true)).toEqual(["paperclip:c:a:t:live"]);
+    expect(released).toEqual([granted, borrowedElsewhere]);
+  });
+
+  it("test_save_returns_one_borrow_so_overlapping_borrows_stay_protected", async () => {
+    const entries = new Map<string, Entry>();
+    const released: Entry[] = [];
+    const store = createSessionReuseStore<Entry>(hostConfig(entries, released, 60_000));
+    const entry: Entry = { id: "a", lastUsedAt: Date.now() };
+    store.save("p:k", entry);
+    store.borrow("p:k");
+    store.borrow("p:k");
+    store.save("p:k", entry);
+    expect(await store.discardIdleByPrefix("p:", () => true)).toEqual([]);
+    store.save("p:k", entry);
+    expect(await store.discardIdleByPrefix("p:", () => true)).toEqual(["p:k"]);
+  });
 });

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   existsSync,
   lstatSync,
@@ -317,6 +318,34 @@ test("bundled esbuild cannot follow a platform payload or package namespace outs
   assert.equal(readFileSync(join(external, "package.json"), "utf8").includes("0.28.2"), true);
   rmSync(join(graph, "@esbuild"), { recursive: true }); symlinkSync(external, join(graph, "@esbuild"), "dir");
   assert.throws(() => stageBundledEsbuildOptionalDependencies(directory, publish), /escapes its producer graph/);
+});
+
+test("the Codex ACP patch carries the trusted write-root channel and the lockfile pins its hash", async () => {
+  const specifier = "@agentclientprotocol/codex-acp@1.6.2";
+  const patchPath = rootPackage.pnpm.patchedDependencies[specifier];
+  assert.equal(patchPath, "patches/@agentclientprotocol__codex-acp@1.6.2.patch");
+  const patch = await readFile(new URL(`../${patchPath}`, import.meta.url), "utf8");
+  for (const marker of [
+    "function paperclipTrustedWriteRoots(",
+    "process.env.PAPERCLIP_CODEX_ACP_TRUSTED_WRITE_ROOTS",
+    "stat.dev !== entry.dev || stat.ino !== entry.ino",
+    "[paperclip] turn sandboxPolicy sha256:",
+    "paperclipLogTurnPolicy(sandboxPolicy);",
+    // The pinned Codex runtime stays part of the patch.
+    '+    "@openai/codex": "0.160.0",',
+  ]) assert.ok(patch.includes(marker), `codex-acp patch must contain ${marker}`);
+  // pnpm keys a patched dependency by base32(md5(patch)); a stale lockfile hash
+  // would make a frozen install fail or apply an older patch.
+  const alphabet = "abcdefghijklmnopqrstuvwxyz234567";
+  let bits = 0, value = 0, hash = "";
+  for (const byte of createHash("md5").update(patch).digest()) {
+    value = (value << 8) | byte; bits += 8;
+    while (bits >= 5) { hash += alphabet[(value >>> (bits - 5)) & 31]; bits -= 5; }
+  }
+  if (bits > 0) hash += alphabet[(value << (5 - bits)) & 31];
+  const lock = await readFile(new URL("../pnpm-lock.yaml", import.meta.url), "utf8");
+  assert.match(lock, new RegExp(`'${specifier.replace(/[/.@]/g, "\\$&")}':\\n    hash: ${hash}\\n    path: ${patchPath.replace(/[/.@]/g, "\\$&")}`));
+  assert.equal(lock.includes(`${specifier}(patch_hash=${hash})`), true);
 });
 
 test("Paperclip Runner pins the qualified ACPX host callbacks", () => {

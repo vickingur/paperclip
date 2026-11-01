@@ -125,6 +125,7 @@ import type {
   SessionFingerprintIdentity,
   SessionKeyIdentity,
   SettlementCause,
+  TrustedWriteRootIdentity,
   StartupReady,
   StartupResult,
   TurnCompletion,
@@ -150,6 +151,18 @@ import {
   type RuntimeCacheEntry,
 } from "./run-site-host.js";
 import { createSandboxRunSite, type SandboxRunSite } from "./run-site-sandbox.js";
+import {
+  CODEX_ACP_TRUSTED_WRITE_ROOTS_ENV,
+  collectRunWritableRoots,
+  formatTrustedWriteRootsLaunchLine,
+  readTrustedWriteRootAdmissions,
+  revalidateTrustedWriteRoots,
+  sameTrustedWriteRoots,
+  validateTrustedWriteRoots,
+  type TrustedWriteRootAdmissionRecord,
+  type TrustedWriteRootFs,
+  type TrustedWriteRootRejection,
+} from "./trusted-write-roots.js";
 import {
   createRuntimeSpanRunner,
   emitRunPhaseTiming,
@@ -388,6 +401,13 @@ export interface AcpxEngineExecutorOptions {
    * to drive the deadline without real time.
    */
   duplexLossCancelDeadlineMs?: number;
+  /**
+   * Filesystem and owner seams for trusted write-root validation. Tests inject
+   * them so fixture ancestors (for example a world-writable `/tmp`) can stand in
+   * for the real root-owned layout. Production uses `node:fs` and this uid.
+   */
+  trustedWriteRootFs?: TrustedWriteRootFs;
+  trustedWriteRootServerUid?: number;
   warmHandles?: Map<string, RuntimeCacheEntry>;
   /**
    * Per-session staged-runtime cache for the remote runner-backed lane (PR 3).
@@ -461,6 +481,18 @@ interface AcpxPreparedRuntime {
   timeoutResolution: AdapterExecutionTargetTimeoutResolution;
   sessionKey: string;
   fingerprint: string;
+  // The identities the fingerprint and key were built from, so the launch
+  // boundary can rebuild both when a trusted write root fails revalidation.
+  fingerprintIdentity: SessionFingerprintIdentity;
+  sessionKeyIdentity: SessionKeyIdentity;
+  // Validated trusted write roots sent to codex-acp (empty for every other
+  // agent and lane), the server admissions and rules hash they came from, the
+  // rejections, and the run's other writable roots the predicate used.
+  trustedWriteRoots: TrustedWriteRootIdentity[];
+  trustedWriteRootAdmissions: TrustedWriteRootAdmissionRecord[];
+  trustedWriteRootsRulesHash: string | null;
+  trustedWriteRootsRejected: TrustedWriteRootRejection[];
+  trustedWriteRootsRunWritable: string[];
   agentCommand: string | null;
   agentRegistry: AcpAgentRegistry;
   processSessionBridge: AdapterExecutionTargetProcessSessionBridgeHandle | null;
@@ -2238,9 +2270,49 @@ async function buildRuntime(input: {
       : acpxAgent === "gemini" && !executionTargetIsRemote
         ? await fs.realpath(cwd)
         : cwd;
-  // The 17 fields the session fingerprint hashes. Company, agent, and task
-  // identifiers are NOT here; they scope the outer session key only (see
-  // `keyIdentity`). The fingerprint builder accepts only this identity.
+  // Trusted write roots: only the server-built workspace context carries
+  // admissions, and only a local Codex run can receive them. Remote lanes get
+  // none, because the admitted paths are host paths.
+  const trustedAdmissionRead = readTrustedWriteRootAdmissions(workspaceContext);
+  const trustedWriteRootAdmissions = trustedAdmissionRead.admissions;
+  const trustedWriteRootsRulesHash = trustedAdmissionRead.rulesHash;
+  const trustedWriteRootsRunWritable = collectRunWritableRoots({
+    paths: [
+      cwd, sessionCwd, workspaceCwd, configuredCwd, workspaceWorktreePath, agentHome,
+      asString(workspaceContext.agentHomeForPermissions, ""),
+      typeof scratch.dir === "string" ? scratch.dir : "",
+      ...additionalSourceCandidates.map((entry) => entry.localPath),
+    ],
+    env,
+  });
+  let trustedWriteRoots: TrustedWriteRootIdentity[] = [];
+  const trustedWriteRootsRejected: TrustedWriteRootRejection[] = [];
+  if (trustedAdmissionRead.malformed) {
+    trustedWriteRootsRejected.push({ path: "", reason: "malformed admission context" });
+  }
+  if (acpxAgent === "codex" && trustedWriteRootAdmissions.length > 0) {
+    if (executionTargetIsRemote) {
+      for (const admission of trustedWriteRootAdmissions) {
+        trustedWriteRootsRejected.push({ path: admission.path, reason: "remote execution target" });
+      }
+    } else {
+      const validation = await validateTrustedWriteRoots(trustedWriteRootAdmissions, {
+        runWritableRoots: trustedWriteRootsRunWritable,
+        fs: input.deps.trustedWriteRootFs,
+        serverUid: input.deps.trustedWriteRootServerUid,
+      });
+      trustedWriteRoots = validation.roots;
+      trustedWriteRootsRejected.push(...validation.rejected);
+    }
+  }
+  if (acpxAgent === "codex") {
+    // Always set, "[]" when empty; adapter config can never supply this key.
+    env[CODEX_ACP_TRUSTED_WRITE_ROOTS_ENV] = JSON.stringify(trustedWriteRoots);
+  }
+  // The 17 fields the session fingerprint hashes, plus `trustedWriteRoots` when
+  // non-empty. Company, agent, and task identifiers are NOT here; they scope
+  // the outer session key only (see `keyIdentity`). The fingerprint builder
+  // accepts only this identity.
   const fingerprintIdentity: SessionFingerprintIdentity = {
     ...(input.ctx.agentIdentity ? { agentIdentityKeyId: input.ctx.agentIdentity.keyId } : {}),
     acpxAgent,
@@ -2279,6 +2351,10 @@ async function buildRuntime(input: {
     // edits and same-version secret rotations. Per-wake runtime vars never enter
     // resolvedAdapterEnv, so they don't churn the fingerprint every heartbeat.
     adapterEnvHash: shortHash(resolvedAdapterEnv),
+    // Set only when non-empty so the legacy empty-root fingerprint is
+    // byte-identical. Any root or `{dev, ino}` change gives a new fingerprint,
+    // so neither a warm borrow nor a persisted resume can carry a grant across.
+    ...(trustedWriteRoots.length > 0 ? { trustedWriteRoots } : {}),
   };
   const fingerprint = buildSessionFingerprint(fingerprintIdentity);
   const taskKey = asString(input.ctx.runtime.taskKey, "") || wakeTaskId || workspaceId || "default";
@@ -2646,6 +2722,13 @@ async function buildRuntime(input: {
     timeoutResolution,
     sessionKey,
     fingerprint,
+    fingerprintIdentity,
+    sessionKeyIdentity: keyIdentity,
+    trustedWriteRoots,
+    trustedWriteRootAdmissions,
+    trustedWriteRootsRulesHash,
+    trustedWriteRootsRejected,
+    trustedWriteRootsRunWritable,
     agentCommand,
     agentRegistry,
     processSessionBridge,
@@ -3949,6 +4032,56 @@ function openTurnSpan(
   };
 }
 
+function warmHandleKeyHash(sessionKey: string): string {
+  return createHash("sha256").update(sessionKey).digest("hex").slice(0, 12);
+}
+
+function formatWarmHandleLine(decision: "borrowed" | "miss" | "discarded", sessionKey: string, acpSessionId: string): string {
+  return `[paperclip] warm handle ${decision} key=sha256:${warmHandleKeyHash(sessionKey)} acpSessionId=${acpSessionId || "none"}\n`;
+}
+
+/**
+ * Re-run the trusted write-root validation and require the prepared
+ * `{dev, ino}`. A failed or changed root is dropped (no grant for it); the
+ * child env, fingerprint and session key are rebuilt for the reduced set, so a
+ * warm handle or saved session spawned with the old identity no longer matches.
+ * Returns the dropped roots.
+ */
+async function revalidatePreparedTrustedWriteRoots(
+  prepared: AcpxPreparedRuntime,
+  deps: AcpxEngineExecutorOptions,
+): Promise<TrustedWriteRootRejection[]> {
+  if (prepared.acpxAgent !== "codex" || prepared.trustedWriteRoots.length === 0) return [];
+  const check = await revalidateTrustedWriteRoots(prepared.trustedWriteRoots, {
+    runWritableRoots: prepared.trustedWriteRootsRunWritable,
+    fs: deps.trustedWriteRootFs,
+    serverUid: deps.trustedWriteRootServerUid,
+  });
+  if (sameTrustedWriteRoots(check.roots, prepared.trustedWriteRoots)) return [];
+  const dropped = check.rejected.length > 0
+    ? check.rejected
+    : prepared.trustedWriteRoots
+      .filter((root) => !check.roots.some((kept) => kept.path === root.path))
+      .map((root) => ({ path: root.path, reason: "revalidation failed" }));
+  const { trustedWriteRoots: _previous, ...baseIdentity } = prepared.fingerprintIdentity;
+  const fingerprintIdentity: SessionFingerprintIdentity = {
+    ...baseIdentity,
+    ...(check.roots.length > 0 ? { trustedWriteRoots: check.roots } : {}),
+  };
+  prepared.fingerprintIdentity = fingerprintIdentity;
+  prepared.fingerprint = buildSessionFingerprint(fingerprintIdentity);
+  prepared.sessionKey = buildSessionKey(prepared.sessionKeyIdentity, prepared.fingerprint);
+  prepared.trustedWriteRoots = check.roots;
+  prepared.trustedWriteRootsRejected = [...prepared.trustedWriteRootsRejected, ...dropped];
+  const value = JSON.stringify(check.roots);
+  // The launch environment is frozen; replace it with an equally frozen copy.
+  prepared.env = Object.freeze({ ...prepared.env, [CODEX_ACP_TRUSTED_WRITE_ROOTS_ENV]: value });
+  if (CODEX_ACP_TRUSTED_WRITE_ROOTS_ENV in prepared.loggedEnv) {
+    prepared.loggedEnv = { ...prepared.loggedEnv, [CODEX_ACP_TRUSTED_WRITE_ROOTS_ENV]: value };
+  }
+  return dropped;
+}
+
 export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
   const createRuntime = deps.createRuntime ?? createAcpRuntime;
   const now = deps.now ?? (() => Date.now());
@@ -4048,6 +4181,9 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
     // null on the host lane (no staging) and on a build failure (where
     // `buildRuntime` already released its own partial lease).
     let releaseStagingLease: (() => void) | null = null;
+    // The warm entry this run borrowed, if any, and the hook that returns the
+    // borrow when the run ends (see `discardIdleByPrefix`).
+    const warmBorrow: { entry: RuntimeCacheEntry | null; end: (() => void) | null } = { entry: null, end: null };
     let stopTimer: ReturnType<typeof setTimeout> | undefined;
     let removeStopListener: (() => void) | undefined;
     // Unregisters the sandbox duplex bridge's loss listener (below, in
@@ -4317,6 +4453,33 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         );
         await hostStore.evictIdle(now());
 
+        // Final launch boundary for trusted write roots: re-check every root
+        // right before the borrow/spawn decision. A changed root is dropped and
+        // the key is rebuilt, so the old grant's warm handle and saved session
+        // both miss below.
+        const trustedRootsDroppedAtLaunch = await revalidatePreparedTrustedWriteRoots(prepared, deps);
+        for (const dropped of trustedRootsDroppedAtLaunch) {
+          await ctx.onLog("stderr", `[paperclip] trusted write root dropped at launch: ${dropped.path} (${dropped.reason})\n`);
+        }
+        const logTrustedWarmDecisions = prepared.acpxAgent === "codex";
+        if (logTrustedWarmDecisions) {
+          await ctx.onLog("stderr", formatTrustedWriteRootsLaunchLine({
+            roots: prepared.trustedWriteRoots,
+            admissions: prepared.trustedWriteRootAdmissions,
+            rulesHash: prepared.trustedWriteRootsRulesHash,
+            rejected: prepared.trustedWriteRootsRejected,
+          }));
+          // Proactive eviction: an idle warm runtime of this company/agent/task
+          // under a different fingerprint (for example one spawned with a
+          // revoked or changed grant) is closed now instead of at its idle
+          // deadline. Borrowed entries are never touched.
+          const prefix = buildSessionKey(prepared.sessionKeyIdentity, "");
+          const discarded = await hostStore.discardIdleByPrefix(prefix, (key) => key !== prepared.sessionKey);
+          for (const key of discarded) {
+            await ctx.onLog("stderr", formatWarmHandleLine("discarded", key, ""));
+          }
+        }
+
         const previousParams = parseObject(ctx.runtime.sessionParams);
         const canResume = isCompatibleSession(previousParams, prepared);
         const resumeSessionId = canResume ? asString(previousParams.acpSessionId, "") || undefined : undefined;
@@ -4330,7 +4493,20 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           // MCP bearer credentials are run-scoped, even for an unchanged catalog.
           || prepared.mcpServers.length > 0)) {
           await hostStore.discard(prepared.sessionKey);
+          if (logTrustedWarmDecisions) {
+            await ctx.onLog("stderr", formatWarmHandleLine("discarded", prepared.sessionKey, cached.handle.backendSessionId ?? ""));
+          }
           cached = undefined;
+        }
+        if (logTrustedWarmDecisions) {
+          await ctx.onLog("stderr", cached
+            ? formatWarmHandleLine("borrowed", prepared.sessionKey, cached.handle.backendSessionId ?? "")
+            : formatWarmHandleLine("miss", prepared.sessionKey, resumeSessionId ?? ""));
+        }
+        if (cached) {
+          const borrowed = cached;
+          warmBorrow.entry = borrowed;
+          warmBorrow.end = () => hostStore.endBorrow(borrowed);
         }
         childStderrState = cached?.childStderrState ?? { logPath: null, pendingLiveLine: "" };
         processIdentitySink = cached?.processIdentitySink ?? {
@@ -4870,6 +5046,19 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         }
       };
       const stepPreTurnUsage = async (): Promise<void> => {
+        // A borrowed warm runtime was spawned with the prepared roots. Re-check
+        // them once more before its prompt; on any change, send no prompt. The
+        // failed-turn settlement closes the runtime and drops the warm entry,
+        // and the next run starts fresh with the reduced set.
+        if (warmBorrow.entry && prepared.trustedWriteRoots.length > 0) {
+          const dropped = await revalidatePreparedTrustedWriteRoots(prepared, deps);
+          if (dropped.length > 0) {
+            for (const root of dropped) {
+              await ctx.onLog("stderr", `[paperclip] trusted write root dropped before prompt: ${root.path} (${root.reason})\n`);
+            }
+            throw new Error("A trusted write root changed before the prompt on a reused Codex runtime; no prompt was sent.");
+          }
+        }
         // Snapshot pre-turn usage so cumulative agent-reported cost can be
         // attributed to this run alone.
         preTurnStatus = await readRuntimeStatus(runtime, sessionHandle);
@@ -5610,6 +5799,16 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
             resultJson: {
               ...capturedResult.resultJson,
               adapterExecutionTimeout: { ...prepared.timeoutResolution },
+              // Launch record of trusted write roots, present only when the
+              // server admitted or the engine rejected a root.
+              ...(prepared.trustedWriteRootAdmissions.length > 0 || prepared.trustedWriteRootsRejected.length > 0
+                ? { trustedWriteRoots: {
+                    roots: prepared.trustedWriteRoots.map((root) => ({ path: root.path, dev: root.dev, ino: root.ino })),
+                    admission: prepared.trustedWriteRootAdmissions.map((entry) => ({ issueId: entry.issueId, ruleIndex: entry.ruleIndex })),
+                    rulesHash: prepared.trustedWriteRootsRulesHash,
+                    rejected: prepared.trustedWriteRootsRejected,
+                  } }
+                : {}),
             },
           };
           // The sync-back settlement step runs before this reproduces the result
@@ -5630,6 +5829,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
       };
       return await runAttempt(plan);
     } finally {
+      warmBorrow.end?.();
       clearTimeout(stopTimer);
       removeStopListener?.();
       removeLossListener?.();

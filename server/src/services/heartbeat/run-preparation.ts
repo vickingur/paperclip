@@ -2876,6 +2876,8 @@ export function createHeartbeatRunPreparation(db: Db) {
         conversationSessionGeneration: issues.conversationSessionGeneration,
         conversationBoundaryCommentId: issues.conversationBoundaryCommentId,
         id: issues.id,
+        // Trusted write-root admission compares this DB value with the agent.
+        companyId: issues.companyId,
         identifier: issues.identifier,
         title: issues.title,
         titleNeedsGeneration: issues.titleNeedsGeneration,
