@@ -15,6 +15,8 @@ export interface AgentLifecycleOperation {
   retryAt?: string;
   attempts: number;
   responsibleUserId?: string | null;
+  resumePending?: boolean;
+  stopBlocker?: { runId: string | null; reason: string; leaseId?: string };
 }
 
 export interface AgentLifecycleRequest {

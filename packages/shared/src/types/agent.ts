@@ -94,6 +94,9 @@ export interface Agent {
   lifecycleState?: AgentLifecycleState;
   lifecycleVersion?: number;
   lifecycleError?: string | null;
+  lifecycleResumePending?: boolean;
+  lifecycleStopBlocker?: { runId: string | null; reason: string; leaseId?: string } | null;
+  lifecycleRetryAt?: string | null;
   reportsTo: string | null;
   capabilities: string | null;
   adapterType: AgentAdapterType;
