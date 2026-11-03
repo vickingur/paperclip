@@ -1,6 +1,7 @@
+import { summarizeWakeWaste } from "./wake-waste-metrics.js";
 import { and, eq, gte, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { heartbeatRuns, issueRecoveryActions, issues } from "@paperclipai/db";
+import { agentWakeupRequests, heartbeatRuns, issueRecoveryActions, issues } from "@paperclipai/db";
 
 // Default alert threshold: the recovery rate that a regression like the 07-06
 // week (3.26% of runs) blew past while nobody noticed by feel. See the plan on
@@ -81,6 +82,7 @@ export type RecoveryObservabilityReport = {
   byCause: RecoveryCauseGroup[];
   handoff: RecoveryHandoffSummary;
   perCauseRouting: RecoveryCauseRouting[];
+  wakeWaste: ReturnType<typeof summarizeWakeWaste>;
 };
 
 export type HandoffClass =
@@ -356,6 +358,31 @@ export function recoveryObservabilityService(db: Db) {
 
     const perCauseRouting = Array.from(routingByCause.values()).sort((a, b) => b.total - a.total);
 
+    // Use actual dispatched runs rather than wake requests: skipped/coalesced
+    // receipts cannot inflate the KPI. Existing report path owns presentation.
+    const wakeRows = await db.execute(sql`
+      select ${heartbeatRuns.contextSnapshot}->>'issueId' as issue_id,
+        ${heartbeatRuns.agentId} as agent_id,
+        date_trunc('hour', ${heartbeatRuns.startedAt} at time zone 'UTC') at time zone 'UTC' as hour,
+        ${agentWakeupRequests.reason} as reason,
+        coalesce(${agentWakeupRequests.requestedByActorType} = 'system' and ${agentWakeupRequests.triggerDetail} = 'system', false) as system,
+        ${heartbeatRuns.resultJson}->>'noOpClassification' as outcome,
+        count(distinct ${heartbeatRuns.id})::int as count
+      from ${heartbeatRuns} left join ${agentWakeupRequests}
+        on ${agentWakeupRequests.id} = ${heartbeatRuns.wakeupRequestId}
+        and ${agentWakeupRequests.companyId} = ${heartbeatRuns.companyId}
+      where ${heartbeatRuns.companyId} = ${companyId}
+        and ${heartbeatRuns.startedAt} >= ${sinceIso}::timestamptz
+        and ${heartbeatRuns.contextSnapshot}->>'issueId' is not null
+      group by 1, 2, 3, 4, 5, 6
+    `) as unknown as Array<{ issue_id: string; agent_id: string; hour: string | Date;
+      reason: string | null; system: boolean; outcome: string | null; count: number }>;
+    const wakeWaste = summarizeWakeWaste(Array.from(wakeRows, (row, index) => ({
+      id: String(index), issueId: row.issue_id, agentId: row.agent_id,
+      startedAt: new Date(row.hour), reason: row.reason, system: row.system,
+      outcome: row.outcome, count: Number(row.count),
+    })));
+
     return {
       companyId,
       generatedAt: now.toISOString(),
@@ -366,6 +393,7 @@ export function recoveryObservabilityService(db: Db) {
       byCause,
       handoff,
       perCauseRouting,
+      wakeWaste,
     };
   }
 

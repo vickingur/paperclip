@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { shouldQueueFollowupForRunningIssueWake } from "../services/heartbeat/queue.ts";
 import { mergeCoalescedContextSnapshot } from "../services/heartbeat.ts";
 
 describe("native status wake context provenance", () => {
@@ -118,5 +119,20 @@ describe("native status wake context provenance", () => {
     const merged = mergeCoalescedContextSnapshot({}, reviewedContext);
     expect(merged.paperclipExternalChatExecutionBound).toBeUndefined();
     expect(merged.paperclipWake).toBeUndefined();
+  });
+});
+
+describe("wake fan-out", () => {
+  it("keeps all reasons and comment references through review, child completion and replay", () => {
+    const answer = { issueId: "issue-1", wakeReason: "issue_commented", wakeCommentId: "answer-1" };
+    const child = { issueId: "issue-1", wakeReason: "issue_children_completed" };
+    const merged = mergeCoalescedContextSnapshot(mergeCoalescedContextSnapshot(answer, child), answer);
+    expect(merged.wakeReasons).toEqual(["issue_commented", "issue_children_completed"]);
+    expect(merged.wakeCommentIds).toEqual(["answer-1"]);
+  });
+  it("durably defers child completion that arrives after the active run snapshot", () => {
+    expect(shouldQueueFollowupForRunningIssueWake({
+      contextSnapshot: { wakeReason: "issue_children_completed" }, wakeCommentId: null,
+    })).toBe(true);
   });
 });

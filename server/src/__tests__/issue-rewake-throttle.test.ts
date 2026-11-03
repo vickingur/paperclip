@@ -207,3 +207,22 @@ describe("evaluateIssueRewakeThrottle", () => {
     expect(decision).toEqual({ blocked: false, noProgressStreak: 0 });
   });
 });
+
+describe("bookkeeping backoff", () => {
+  it("backs off after one notification even when the run restated its status", () => {
+    expect(evaluateIssueRewakeThrottle({ now: NOW,
+      recentTerminalRuns: [runSample({ id: "r1", finishedSecondsAgo: 90 })],
+      runIdsWithIssueProgress: new Set(["r1"]), hasNewIssueInputSinceLastRun: false,
+      bookkeepingWake: true,
+    }).blocked).toBe(true);
+  });
+  it("admits at the five-minute boundary and on new input, but not one millisecond before", () => {
+    const input = { now: NOW, recentTerminalRuns: [runSample({ id: "r1", finishedSecondsAgo: 300 })],
+      runIdsWithIssueProgress: new Set<string>(), hasNewIssueInputSinceLastRun: false, bookkeepingWake: true };
+    expect(evaluateIssueRewakeThrottle(input).blocked).toBe(false);
+    expect(evaluateIssueRewakeThrottle({ ...input, now: new Date(NOW.getTime() - 1) }).blocked).toBe(true);
+    expect(evaluateIssueRewakeThrottle({ ...input, now: new Date(NOW.getTime() - 1),
+      hasNewIssueInputSinceLastRun: true }).blocked).toBe(false);
+  });
+
+});

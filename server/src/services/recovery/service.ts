@@ -148,6 +148,7 @@ import { withRecoveryContext } from "./status-only-context.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "./pause-hold-guard.js";
 import {
   collectDispositionRepairSourceState,
+  readDispositionRepairHighWater,
   dispositionRepairDelayMs,
   DISPOSITION_REPAIR_MAX_ATTEMPTS,
 } from "./disposition-repair.js";
@@ -3475,6 +3476,14 @@ export function recoveryService(
         ]);
       const durablePathRestored =
         action.ownerType !== "board" && sourceState.hasDurableWaitingPath;
+      // A restored bookkeeping turn is a transient execution path, not a
+      // durable disposition. Retain this action and its consumed attempts
+      // while that turn runs; re-evaluate its real disposition after it ends.
+      if (wakePolicyType === "bounded_owner_disposition_repair" &&
+          hasNewSourcePath && !durablePathRestored && healthyChildren.length === 0) {
+        result.skipped += 1;
+        continue;
+      }
       if (
         durablePathRestored ||
         healthyChildren.length > 0 ||
@@ -3871,7 +3880,11 @@ export function recoveryService(
     // A source run owns one successor slot. Concurrent checks must not advance
     // the counter again after another checker reserved that same successor.
     if (episode && persistedAttempt > episode.attempt) return "skipped";
+    const restoredAttempt = episode ? 0 : await readDispositionRepairHighWater(db, {
+      companyId: current.companyId, issueId: current.id, fingerprint: state.fingerprint,
+    });
     const sameFingerprintAttempt = Math.max(
+      restoredAttempt,
       runAttempt,
       persistedAttempt,
       historicalAttempt,

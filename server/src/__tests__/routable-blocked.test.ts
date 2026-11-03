@@ -32,6 +32,7 @@ describe("routable blocked notifications", () => {
       .resolves.toBe(true);
     expect(wakeup).toHaveBeenCalledWith(agentId, expect.objectContaining({
       reason: "issue_unblock_requested",
+      requestedByActorType: "system",
       idempotencyKey: `issue-unblock:${issue.id}:${issue.blockedTransitionAt!.toISOString()}`,
       payload: { issueId: issue.id, action: "Review the finding" },
     }));

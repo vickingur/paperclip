@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   agents,
+  agentWakeupRequests,
   companies,
   createDb,
   heartbeatRuns,
@@ -129,6 +130,7 @@ describeEmbeddedPostgres("recovery observability report", () => {
   afterEach(async () => {
     await db.delete(issueRecoveryActions);
     await db.delete(heartbeatRuns);
+    await db.delete(agentWakeupRequests);
     await db.delete(issues);
     await db.delete(agents);
     await db.delete(companies);
@@ -187,6 +189,30 @@ describeEmbeddedPostgres("recovery observability report", () => {
 
     return { companyId, managerId, coderId, otherId };
   }
+
+  it("reports five actual system runs without counting coalesced requests", async () => {
+    const { companyId, coderId } = await seedBaseline();
+    const issueId = randomUUID();
+    const startedAt = new Date("2026-07-20T12:00:00Z");
+    for (let i = 0; i < 5; i++) {
+      const [wake] = await db.insert(agentWakeupRequests).values({ companyId, agentId: coderId,
+        source: "automation", triggerDetail: "system", reason: "issue_unblock_requested",
+        requestedByActorType: "system", status: "claimed" }).returning();
+      await db.insert(heartbeatRuns).values({ companyId, agentId: coderId,
+        status: "succeeded", invocationSource: "automation", wakeupRequestId: wake.id,
+        contextSnapshot: { issueId }, startedAt, finishedAt: startedAt,
+        resultJson: i === 0 ? { noOpClassification: "restated_status" } : null });
+    }
+    await db.insert(agentWakeupRequests).values({ companyId, agentId: coderId,
+      source: "automation", reason: "issue_commented", status: "coalesced", payload: { issueId } });
+    const report = await recoveryObservabilityService(db).report(companyId, {
+      now: new Date("2026-07-20T13:00:00Z"), weeks: 1 });
+    expect(report.wakeWaste.hourly).toEqual([{
+      issueId, hour: "2026-07-20T12", wakes: 5, reasons: ["issue_unblock_requested"],
+      alertKey: `${issueId}:2026-07-20T12`,
+    }]);
+    expect(report.wakeWaste.daily).toEqual([{ day: "2026-07-20", noOpRuns: 1, unknownRuns: 4 }]);
+  });
 
   async function seedRecoveryAction(input: {
     companyId: string;

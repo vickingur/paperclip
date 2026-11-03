@@ -24,6 +24,7 @@ export async function deliverAgentUnblockNotification(input: {
   issue: RoutableBlockedIssue;
   wakeup: (agentId: string, options: {
     source: "automation";
+    requestedByActorType: "system";
     triggerDetail: "system";
     reason: "issue_unblock_requested";
     idempotencyKey: string;
@@ -43,6 +44,7 @@ export async function deliverAgentUnblockNotification(input: {
 
   await input.wakeup(owner.agentId, {
     source: "automation",
+    requestedByActorType: "system",
     triggerDetail: "system",
     reason: "issue_unblock_requested",
     idempotencyKey: `issue-unblock:${issue.id}:${issue.blockedTransitionAt.toISOString()}`,

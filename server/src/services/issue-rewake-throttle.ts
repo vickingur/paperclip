@@ -46,6 +46,7 @@ export const ISSUE_REWAKE_RUN_SAMPLE_LIMIT = 8;
  * resolved, interactions, approvals, monitors, reviews, …) passes through.
  */
 export const THROTTLED_ISSUE_REWAKE_REASONS: ReadonlySet<string> = new Set([
+  "issue_unblock_requested",
   "issue_assigned",
   "issue_continuation_needed",
   "issue_assignment_recovery",
@@ -127,6 +128,8 @@ export interface RecentIssueRunSample {
 
 export interface IssueRewakeThrottleInput {
   now: Date;
+  /** Unchanged unblock bookkeeping gets one notification per five minutes. */
+  bookkeepingWake?: boolean;
   /** Terminal runs for the same (agent, issue), newest finish first. */
   recentTerminalRuns: RecentIssueRunSample[];
   /** Runs among the sample that produced issue-visible progress. */
@@ -162,18 +165,18 @@ export function evaluateIssueRewakeThrottle(input: IssueRewakeThrottleInput): Is
     // A failed/cancelled/interrupted run breaks the streak: its follow-up is
     // recovery, not a redundant re-poll, and must not be delayed.
     if (run.status !== "succeeded" || !run.finishedAt) break;
-    if (input.runIdsWithIssueProgress.has(run.id)) break;
+    if (!input.bookkeepingWake && input.runIdsWithIssueProgress.has(run.id)) break;
     noProgressStreak += 1;
   }
 
-  if (noProgressStreak < ISSUE_REWAKE_NO_PROGRESS_THRESHOLD) {
+  if (noProgressStreak < (input.bookkeepingWake ? 1 : ISSUE_REWAKE_NO_PROGRESS_THRESHOLD)) {
     return { blocked: false, noProgressStreak };
   }
 
   const lastRunFinishedAt = runs[0]?.finishedAt;
   if (!lastRunFinishedAt) return { blocked: false, noProgressStreak };
 
-  const cooldownMs = computeIssueRewakeCooldownMs(noProgressStreak);
+  const cooldownMs = input.bookkeepingWake ? 5 * 60_000 : computeIssueRewakeCooldownMs(noProgressStreak);
   const nextAllowedAt = new Date(lastRunFinishedAt.getTime() + cooldownMs);
   if (input.now.getTime() < nextAllowedAt.getTime()) {
     return { blocked: true, noProgressStreak, cooldownMs, lastRunFinishedAt, nextAllowedAt };
