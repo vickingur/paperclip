@@ -1,0 +1,301 @@
+[
+  {
+    "id": "general-server-1",
+    "args": [
+      "--mode",
+      "general",
+      "--group",
+      "general-server",
+      "--shard-index",
+      "0",
+      "--shard-count",
+      "12"
+    ]
+  },
+  {
+    "id": "general-server-2",
+    "args": [
+      "--mode",
+      "general",
+      "--group",
+      "general-server",
+      "--shard-index",
+      "1",
+      "--shard-count",
+      "12"
+    ]
+  },
+  {
+    "id": "general-server-3",
+    "args": [
+      "--mode",
+      "general",
+      "--group",
+      "general-server",
+      "--shard-index",
+      "2",
+      "--shard-count",
+      "12"
+    ]
+  },
+  {
+    "id": "general-server-4",
+    "args": [
+      "--mode",
+      "general",
+      "--group",
+      "general-server",
+      "--shard-index",
+      "3",
+      "--shard-count",
+      "12"
+    ]
+  },
+  {
+    "id": "general-server-5",
+    "args": [
+      "--mode",
+      "general",
+      "--group",
+      "general-server",
+      "--shard-index",
+      "4",
+      "--shard-count",
+      "12"
+    ]
+  },
+  {
+    "id": "general-server-6",
+    "args": [
+      "--mode",
+      "general",
+      "--group",
+      "general-server",
+      "--shard-index",
+      "5",
+      "--shard-count",
+      "12"
+    ]
+  },
+  {
+    "id": "general-server-7",
+    "args": [
+      "--mode",
+      "general",
+      "--group",
+      "general-server",
+      "--shard-index",
+      "6",
+      "--shard-count",
+      "12"
+    ]
+  },
+  {
+    "id": "general-server-8",
+    "args": [
+      "--mode",
+      "general",
+      "--group",
+      "general-server",
+      "--shard-index",
+      "7",
+      "--shard-count",
+      "12"
+    ]
+  },
+  {
+    "id": "general-server-9",
+    "args": [
+      "--mode",
+      "general",
+      "--group",
+      "general-server",
+      "--shard-index",
+      "8",
+      "--shard-count",
+      "12"
+    ]
+  },
+  {
+    "id": "general-server-10",
+    "args": [
+      "--mode",
+      "general",
+      "--group",
+      "general-server",
+      "--shard-index",
+      "9",
+      "--shard-count",
+      "12"
+    ]
+  },
+  {
+    "id": "general-server-11",
+    "args": [
+      "--mode",
+      "general",
+      "--group",
+      "general-server",
+      "--shard-index",
+      "10",
+      "--shard-count",
+      "12"
+    ]
+  },
+  {
+    "id": "general-server-12",
+    "args": [
+      "--mode",
+      "general",
+      "--group",
+      "general-server",
+      "--shard-index",
+      "11",
+      "--shard-count",
+      "12"
+    ]
+  },
+  {
+    "id": "serialized-1",
+    "args": [
+      "--mode",
+      "serialized",
+      "--shard-index",
+      "0",
+      "--shard-count",
+      "9"
+    ]
+  },
+  {
+    "id": "serialized-2",
+    "args": [
+      "--mode",
+      "serialized",
+      "--shard-index",
+      "1",
+      "--shard-count",
+      "9"
+    ]
+  },
+  {
+    "id": "serialized-3",
+    "args": [
+      "--mode",
+      "serialized",
+      "--shard-index",
+      "2",
+      "--shard-count",
+      "9"
+    ]
+  },
+  {
+    "id": "serialized-4",
+    "args": [
+      "--mode",
+      "serialized",
+      "--shard-index",
+      "3",
+      "--shard-count",
+      "9"
+    ]
+  },
+  {
+    "id": "serialized-5",
+    "args": [
+      "--mode",
+      "serialized",
+      "--shard-index",
+      "4",
+      "--shard-count",
+      "9"
+    ]
+  },
+  {
+    "id": "serialized-6",
+    "args": [
+      "--mode",
+      "serialized",
+      "--shard-index",
+      "5",
+      "--shard-count",
+      "9"
+    ]
+  },
+  {
+    "id": "serialized-7",
+    "args": [
+      "--mode",
+      "serialized",
+      "--shard-index",
+      "6",
+      "--shard-count",
+      "9"
+    ]
+  },
+  {
+    "id": "serialized-8",
+    "args": [
+      "--mode",
+      "serialized",
+      "--shard-index",
+      "7",
+      "--shard-count",
+      "9"
+    ]
+  },
+  {
+    "id": "serialized-9",
+    "args": [
+      "--mode",
+      "serialized",
+      "--shard-index",
+      "8",
+      "--shard-count",
+      "9"
+    ]
+  },
+  {
+    "id": "general-workspaces-a-1",
+    "args": [
+      "--mode",
+      "general",
+      "--group",
+      "general-workspaces-a",
+      "--shard-index",
+      "0",
+      "--shard-count",
+      "2"
+    ]
+  },
+  {
+    "id": "general-workspaces-a-2",
+    "args": [
+      "--mode",
+      "general",
+      "--group",
+      "general-workspaces-a",
+      "--shard-index",
+      "1",
+      "--shard-count",
+      "2"
+    ]
+  },
+  {
+    "id": "general-workspaces-b-1",
+    "args": [
+      "--mode",
+      "general",
+      "--group",
+      "general-workspaces-b"
+    ]
+  },
+  {
+    "id": "general-workspaces-c-1",
+    "args": [
+      "--mode",
+      "general",
+      "--group",
+      "general-workspaces-c"
+    ]
+  }
+]

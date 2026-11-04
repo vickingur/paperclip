@@ -1,0 +1,116 @@
+name: Fork exact-head CI
+on:
+  pull_request:
+    branches: [custom]
+  push:
+    branches: [ci/fork-exact-head-sharded]
+permissions:
+  contents: read
+concurrency:
+  group: fork-exact-head-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: false
+jobs:
+  manifest:
+    if: github.repository == 'vickingur/paperclip'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.manifest.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Verify full tested head
+        env:
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
+          printf 'Tested full SHA: %s\n' "$EXPECTED_HEAD"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '24.11.0'
+      - id: manifest
+        run: node scripts/fork-ci.mjs manifest
+      - name: Coverage guard tests
+        run: node --test scripts/__tests__/fork-ci.test.mjs
+  regression:
+    needs: manifest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.manifest.outputs.matrix) }}
+    name: regression (${{ matrix.id }})
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Verify full tested head
+        env:
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
+          printf 'Tested full SHA: %s\n' "$EXPECTED_HEAD"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '24.11.0'
+      - name: Frozen dependencies
+        run: |
+          corepack enable
+          corepack prepare pnpm@9.15.4 --activate
+          pnpm install --frozen-lockfile
+      - name: Run assigned stable regression lane
+        env:
+          CI_LANE: ${{ matrix.id }}
+        run: node scripts/fork-ci.mjs run "$CI_LANE"
+  validation:
+    needs: manifest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        command: [typecheck, build]
+    name: validation (${{ matrix.command }})
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Verify full tested head
+        env:
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
+          printf 'Tested full SHA: %s\n' "$EXPECTED_HEAD"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '24.11.0'
+      - name: Frozen dependencies
+        run: |
+          corepack enable
+          corepack prepare pnpm@9.15.4 --activate
+          pnpm install --frozen-lockfile
+      - name: Full repository validation
+        env:
+          CI_COMMAND: ${{ matrix.command }}
+        run: pnpm "$CI_COMMAND"
+  exact-head-green:
+    if: always()
+    needs: [manifest, regression, validation]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every lane to succeed
+        env:
+          MANIFEST: ${{ needs.manifest.result }}
+          REGRESSION: ${{ needs.regression.result }}
+          VALIDATION: ${{ needs.validation.result }}
+          TESTED_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          test "$MANIFEST" = success
+          test "$REGRESSION" = success
+          test "$VALIDATION" = success
+          printf 'All lanes passed for full head %s\n' "$TESTED_HEAD"
