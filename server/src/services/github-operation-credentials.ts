@@ -8,6 +8,8 @@ import {
   runIdentityContexts,
   type Db,
 } from "@paperclipai/db";
+import { logger } from "../middleware/logger.js";
+import { enforceGitHubCredentialRateLimit } from "./github-credential-rate-limit.js";
 import { forbidden } from "../errors.js";
 import { captureRunIdentity } from "./run-identity.js";
 import {
@@ -112,7 +114,9 @@ export async function resolveGitHubOperationCredentials(
     runId: string;
   },
 ) {
+  enforceGitHubCredentialRateLimit(input);
   const { run, context } = await captureRunIdentity(db, input);
+  logger.debug({ companyId: input.companyId, agentId: input.agentId, runId: input.runId }, "GitHub credential request admitted");
   if (!context) throw forbidden("This run predates managed GitHub credentials");
   let summary: GitHubCredentialSummary;
   let env: Record<string, string> = {};
