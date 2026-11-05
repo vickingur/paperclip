@@ -45,6 +45,7 @@ function createFakeFs() {
       if (p.startsWith("/fx") && !dirs.has(p)) throw new Error(`ENOENT ${p}`);
       return p;
     },
+    readdir: async () => [],
     lexists: async (p) => {
       if (!dirs.has(p)) throw Object.assign(new Error(`ENOENT ${p}`), { code: "ENOENT" });
     },
@@ -214,6 +215,18 @@ describe("trusted write-root session revocation (§4.4)", () => {
     expect(resumed.childRoots).toEqual([]);
     // No trusted-root record is added to a run with nothing admitted or rejected.
     expect((resumed.result.resultJson as Record<string, unknown>).trustedWriteRoots).toBeUndefined();
+  });
+
+  it("keeps the grant on a second run after sandbox placeholders appear", async () => {
+    const state = await setup();
+    const first = await state.run([admit(CACHE)]);
+    expect(first.childRoots).toEqual(cacheIdentity());
+    for (const entry of [".git", ".codex", ".agents", ".aws"]) {
+      state.fakeFsState.dirs.set(`${CACHE}/${entry}`, { ino: 300 + state.fakeFsState.dirs.size, mode: 0o040555 });
+    }
+    const second = await state.run([admit(CACHE)], first.result.sessionParams as Record<string, unknown>);
+    expect(second.childRoots).toEqual(cacheIdentity());
+    expect(second.logs.join("")).not.toContain("contains .git");
   });
 
   it("grant → same grant resumes the persisted session and borrows the warm handle", async () => {

@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, realpath, rename, rm, symlink, chmod, lstat } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rename, rm, symlink, chmod, lstat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -162,6 +162,7 @@ describe("trusted write-root topology (§4.2a/b)", () => {
         if (!fakeDirs.has(p) && !p.startsWith("/paperclip/instances")) throw new Error("ENOENT");
         return p;
       },
+      readdir: async () => [],
       lexists: async (p) => {
         if (!fakeDirs.has(p)) throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
       },
@@ -213,8 +214,57 @@ describe("trusted write-root path and entry checks (§4.2d)", () => {
 
   it.each([".agents", ".codex", ".git"])("rejects a root containing %s", async (entry) => {
     await mkdir(path.join(base, "worktrees/cache", entry));
+    await writeFile(path.join(base, "worktrees/cache", entry, "content"), "data");
     expect((await validate([path.join(base, "worktrees/cache")])).rejected[0]?.reason).toBe(`contains ${entry}`);
   });
+
+  it("admits consecutive runs after empty server-owned sandbox targets appear", async () => {
+    const cache = path.join(base, "worktrees/cache");
+    const first = await validate([cache]);
+    for (const entry of [".git", ".codex", ".agents", ".aws"]) {
+      await mkdir(path.join(cache, entry), { mode: 0o555 });
+    }
+    expect(await validate([cache])).toEqual(first);
+    expect(await revalidateTrustedWriteRoots(first.roots, {
+      runWritableRoots: writable(), serverUid: uid, fs: fixtureFs(),
+    })).toEqual(first);
+  });
+
+  it.each([".git", ".codex", ".agents"])("rejects a symlink placeholder %s", async (entry) => {
+    const cache = path.join(base, "worktrees/cache");
+    await symlink(path.join(base, "worktrees/other"), path.join(cache, entry));
+    expect((await validate([cache])).rejected[0]?.reason).toBe(`contains ${entry}`);
+  });
+
+  it.each(["foreign owner", "group writable", "world writable", "file", "replaced", "unreadable"])(
+    "rejects an empty placeholder that is %s", async (scenario) => {
+      const cache = path.join(base, "worktrees/cache");
+      const entry = path.join(cache, ".git");
+      await mkdir(entry);
+      let reads = 0;
+      const fs: TrustedWriteRootFs = {
+        ...fixtureFs(),
+        lstat: async (p) => {
+          const stat = await fixtureFs().lstat(p);
+          if (p !== entry) return stat;
+          reads += 1;
+          return { ...pickStat(stat),
+            uid: scenario === "foreign owner" ? uid + 7 : stat.uid,
+            mode: stat.mode | (scenario === "group writable" ? 0o020 : scenario === "world writable" ? 0o002 : 0),
+            ino: stat.ino + (scenario === "replaced" && reads > 1 ? 1 : 0),
+            isDirectory: () => scenario !== "file",
+          };
+        },
+        readdir: async (p) => {
+          if (scenario === "unreadable") throw Object.assign(new Error("denied"), { code: "EACCES" });
+          return defaultTrustedWriteRootFs.readdir(p);
+        },
+      };
+      const result = await validateTrustedWriteRoots([{ path: cache }], { runWritableRoots: writable(), serverUid: uid, fs });
+      expect(result.roots).toEqual([]);
+      expect(result.rejected[0]?.reason).toBe(scenario === "unreadable" ? "cannot inspect .git (EACCES)" : "contains .git");
+    },
+  );
 
   it.each([
     ["EACCES", { code: "EACCES" }, "cannot inspect .git (EACCES)"],
