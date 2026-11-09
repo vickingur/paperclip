@@ -46,6 +46,41 @@ describe("Railway isolated container command runner", () => {
     await expect(access(path.dirname(keyPath))).rejects.toThrow();
     expect(spawnMock.mock.calls[0][2].env).toEqual({ PATH: "/usr/bin:/bin", LANG: "C.UTF-8" });
   });
+  it("admits after preparation and before synchronous process creation", async () => {
+    let entered = false;
+    fakeProcess((child, script) => {
+      expect(entered).toBe(true);
+      const marker = script.match(/paperclip_railway_completed_[a-f0-9]+/)![0];
+      child.stdout.write(`ok\n${marker}:0\n`);
+      child.emit("close", 0);
+    });
+    const admit = vi.fn(async <T>(enter: () => Promise<T>) => {
+      expect(spawnMock).not.toHaveBeenCalled();
+      entered = true;
+      const completion = enter();
+      expect(spawnMock).toHaveBeenCalledOnce();
+      const args = spawnMock.mock.calls[0][1] as string[];
+      expect(await readFile(args[args.indexOf("-i") + 1], "utf8")).toBe(input().privateKey);
+      return completion;
+    });
+    await expect(runRailwaySshCommand({ ...input(), admit })).resolves.toMatchObject({ exitCode: 0 });
+    expect(admit).toHaveBeenCalledOnce();
+  });
+  it("prevents process creation when final admission rejects", async () => {
+    const denied = new Error("grant revoked during preparation");
+    const admit = vi.fn(async () => { throw denied; });
+    await expect(runRailwaySshCommand({ ...input(), admit })).rejects.toBe(denied);
+    expect(admit).toHaveBeenCalledOnce();
+    expect(spawnMock).not.toHaveBeenCalled();
+  });
+  it("rechecks cancellation after waiting for final admission", async () => {
+    const controller = new AbortController();
+    await expect(runRailwaySshCommand({ ...input(controller.signal), admit: async enter => {
+      controller.abort();
+      return enter();
+    } })).rejects.toMatchObject({ name: "AbortError" });
+    expect(spawnMock).not.toHaveBeenCalled();
+  });
   it("never treats local success or stdin failure as confirmed remote success", async () => {
     fakeProcess((child) => { child.stdin.emit("error", new Error("EPIPE")); child.emit("close", 0); });
     await expect(runRailwaySshCommand(input())).rejects.toMatchObject({ code: "railway_ssh_command_unconfirmed" });

@@ -6325,6 +6325,7 @@ export function createToolGatewayService(
             ? async (input) => runRailwaySshCommand({
                 ...input,
                 privateKey: await resolveGrantSecretValue(session, connection, grant, sshRef),
+                admit,
                 knownHosts: typeof ssh.knownHosts === "string" ? ssh.knownHosts : "",
               })
             : undefined,
