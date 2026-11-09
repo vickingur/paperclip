@@ -5313,6 +5313,7 @@ export function createToolGatewayService(
     protocolMethod?: string;
     protocolParams?: Record<string, unknown>;
     timeoutMs: number;
+    admitRequest?: <T>(enter: () => Promise<T>) => Promise<T>;
   }): Promise<unknown> {
     if (input.template.templateId === "paperclip.cognee-cloud") {
       if (input.protocolMethod === "resources/list") return { resources: [] };
@@ -5325,7 +5326,10 @@ export function createToolGatewayService(
         tool: input.entry?.toolName ?? "", parameters: asRecord(input.parameters) ?? {},
         signal: AbortSignal.timeout(input.timeoutMs),
         request: async (url, init) => {
-          const response = await guardedRemoteHttpFetch(url, init, remoteHttpFetchOptions());
+          const enter = () => options.remoteHttpRequest
+            ? options.remoteHttpRequest(url.toString(), init)
+            : guardedRemoteHttpFetch(url, init, remoteHttpFetchOptions());
+          const response = await (input.admitRequest ? input.admitRequest(enter) : enter());
           const body = await readBoundedRemoteResponse(response);
           if (!response.ok) throw new ToolGatewayHttpError(502,
             `Cognee Cloud request failed (HTTP ${response.status}).`, "cognee_api_error");
@@ -6685,12 +6689,8 @@ export function createToolGatewayService(
       template,
       grant,
     );
-    const invoke = () => {
-      const enter = () => callLocalStdioMcp({ connection, entry, template, env, parameters,
-        timeoutMs: useProviderDefaultTimeout && template.templateId === "paperclip.cognee-cloud" ? 60_000 : ms });
+    const admit = <T>(enter: () => Promise<T>): Promise<T> => {
       if (!session.agentId || !session.runId) return enter();
-      // Runtime slot acquisition can wait. Revalidate after it, immediately
-      // before entering the prepared command rather than before the slot wait.
       return dispatchUnderAdmission(session, tool, parameters, enter, async (admissionDb) => {
         const current = await resolveConnectedLocalStdioTool(session, tool, admissionDb);
         const currentGrant = await resolveConnectionGrant(session, current.connection, false, admissionDb);
@@ -6703,6 +6703,16 @@ export function createToolGatewayService(
           throw new ToolGatewayHttpError(409, "Prepared connection changed before dispatch", "app_preparation_stale");
         }
       }, approvedClaim);
+    };
+    const invoke = () => {
+      const cognee = template.templateId === "paperclip.cognee-cloud";
+      const enter = () => callLocalStdioMcp({ connection, entry, template, env, parameters,
+        timeoutMs: useProviderDefaultTimeout && cognee ? 60_000 : ms,
+        ...(cognee ? { admitRequest: admit } : {}),
+      });
+      // Cognee can issue several requests; each must pass admission after any
+      // previous response. Commands are admitted after runtime slot acquisition.
+      return cognee ? enter() : admit(enter);
     };
     // Cognee is a bundled HTTP client. Provider failures are tool failures, not
     // crashed local processes, and must never consume slots or restart budgets.

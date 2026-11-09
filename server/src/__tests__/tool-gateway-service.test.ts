@@ -1,3 +1,4 @@
+import * as cognee from "../services/cognee-connection.js";
 import * as runtimeSlots from "../services/tool-runtime-supervisor.js";
 import * as accessPolicy from "../services/tool-access-policy.js";
 import { subscribeDeliveryWork } from "../services/delivery-work-notifications.js";
@@ -1308,6 +1309,37 @@ describeEmbeddedPostgres("tool gateway service", () => {
       expect(changed).toBe(true);
       expect(provider).not.toHaveBeenCalled();
     } finally { policySpy.mockRestore(); }
+  });
+
+  it.each(["none", "connection", "grant"])("fences every bundled Cognee request: %s", async (mutation) => {
+    const { company, agent, run } = await createRunFixture(db);
+    const fixture = await createRemoteMcpToolFixture(db, company.id);
+    await db.update(toolApplications).set({ type: "mcp_stdio" }).where(eq(toolApplications.id, fixture.application.id));
+    await db.update(toolConnections).set({ transport: "local_stdio", config: { templateId: "paperclip.cognee-cloud" } })
+      .where(eq(toolConnections.id, fixture.connection.id));
+    await db.insert(toolPolicies).values({ companyId: company.id, name: "Allow reads", policyType: "allow", selectors: { riskLevel: "read" } });
+    // Synthetic bridge models recall's dataset lookup followed by its search.
+    const urlSpy = vi.spyOn(cognee, "cogneeCloudUrl").mockReturnValue(new URL("https://fixture.aws.cognee.ai"));
+    const bridgeSpy = vi.spyOn(cognee, "callCogneeCloud").mockImplementation(async input => {
+      await input.request(new URL("https://fixture.aws.cognee.ai/datasets"), { method: "GET" });
+      await input.request(new URL("https://fixture.aws.cognee.ai/recall"), { method: "POST" });
+      return { content: [{ type: "text", text: "ok" }], structuredContent: {}, isError: false };
+    });
+    let calls = 0;
+    const gateway = createTestToolGatewayService(db, { remoteHttpRequest: async () => {
+      calls++;
+      if (calls === 1 && mutation === "connection") await db.update(toolConnections).set({ config: { templateId: "changed" } }).where(eq(toolConnections.id, fixture.connection.id));
+      if (calls === 1 && mutation === "grant") await db.update(connectionGrants).set({ status: "revoked" }).where(eq(connectionGrants.connectionId, fixture.connection.id));
+      return new Response("{}");
+    } });
+    try {
+      const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+      const tool = (await gateway.listToolsForSession(session.token)).find(t => t.catalogEntryId === fixture.catalogEntry.id)!;
+      const call = gateway.executeTool({ sessionToken: session.token, tool: tool.name, parameters: {} });
+      if (mutation === "none") await expect(call).resolves.toMatchObject({ status: "completed" });
+      else await expect(call).rejects.toMatchObject({ reasonCode: mutation === "grant" ? "organization_authorization_required" : "local_stdio_template_invalid" });
+      expect(calls).toBe(mutation === "none" ? 2 : 1);
+    } finally { bridgeSpy.mockRestore(); urlSpy.mockRestore(); }
   });
 
   it.each(["none", "template", "grant", "connection"])("fences stdio preparation after slot acquisition: %s", async (mutation) => {
