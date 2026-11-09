@@ -1,3 +1,4 @@
+import * as accessPolicy from "../services/tool-access-policy.js";
 import { subscribeDeliveryWork } from "../services/delivery-work-notifications.js";
 import { DELIVERY_QUEUES } from "../services/delivery-work-notifications.js";
 import { randomUUID } from "node:crypto";
@@ -21,6 +22,7 @@ import {
   issueApprovals,
   issues,
   projects,
+  plugins,
   issueThreadInteractions,
   toolApplications,
   toolCatalogEntries,
@@ -141,7 +143,7 @@ async function createRemoteMcpToolFixture(db: ReturnType<typeof createDb>, compa
   return { application, connection, catalogEntry };
 }
 
-function fakePluginDispatcher(): PluginToolDispatcher {
+function fakePluginDispatcher(pluginId = "fixture-plugin"): PluginToolDispatcher {
   return {
     initialize: async () => {},
     teardown: () => {},
@@ -151,12 +153,12 @@ function fakePluginDispatcher(): PluginToolDispatcher {
         displayName: "Delete everything",
         description: "Destructive fixture tool.",
         parametersSchema: { type: "object" },
-        pluginId: "fixture-plugin",
+        pluginId,
       },
     ],
     getTool: () => null,
     executeTool: async (_name, parameters) => ({
-      pluginId: "fixture-plugin",
+      pluginId,
       toolName: "delete_everything",
       result: { content: "deleted", data: parameters },
     }),
@@ -1129,7 +1131,7 @@ describeEmbeddedPostgres("tool gateway service", () => {
     expect(requests[1]?.status).toBe("pending");
   });
 
-  it("adds formal board approval for destructive tool actions and fails closed until approved", async () => {
+  it.each(["none", "expiry", "formal"])("revalidates approved plugin admission: %s", async (mutation) => {
     const { company, agent, run } = await createRunFixture(db);
     await db.insert(toolPolicies).values({
       companyId: company.id,
@@ -1137,7 +1139,11 @@ describeEmbeddedPostgres("tool gateway service", () => {
       policyType: "require_approval",
       selectors: { toolName: "fixture:delete_everything" },
     });
-    const gateway = createTestToolGatewayService(db, { pluginToolDispatcher: fakePluginDispatcher() });
+    const [registration] = await db.insert(plugins).values({ pluginKey: `fixture-${randomUUID()}`,
+      packageName: "synthetic-fixture", version: "0.0.0", status: "ready", manifestJson: {} as never }).returning();
+    const dispatcher = fakePluginDispatcher(registration!.id);
+    const worker = vi.spyOn(dispatcher, "executeTool");
+    const gateway = createTestToolGatewayService(db, { pluginToolDispatcher: dispatcher });
     const session = await gateway.createSession({
       companyId: company.id,
       agentId: agent.id,
@@ -1191,6 +1197,37 @@ describeEmbeddedPostgres("tool gateway service", () => {
       updatedAt: new Date(),
     }).where(eq(approvals.id, approval.id));
 
+    const originalPolicy = accessPolicy.toolAccessPolicyService;
+    const policySpy = vi.spyOn(accessPolicy, "toolAccessPolicyService").mockImplementation(policyDb => {
+      const service = originalPolicy(policyDb);
+      if (policyDb !== db && mutation !== "none") {
+        const decide = service.decide;
+        service.decide = async (...args) => {
+          const decision = await decide(...args);
+          if (mutation === "expiry") {
+            await policyDb.update(toolActionRequests).set({ expiresAt: new Date(0) })
+              .where(eq(toolActionRequests.id, actionRequest.id));
+          } else {
+            await policyDb.update(approvals).set({ status: "rejected" })
+              .where(eq(approvals.id, approval.id));
+          }
+          return decision;
+        };
+      }
+      return service;
+    });
+    if (mutation !== "none") {
+      try {
+        await expect(gateway.executeTool({ sessionToken: session.token,
+          tool: "fixture:delete_everything", approvedActionRequestId: actionRequest.id,
+          parameters: { target: "tampered" } })).rejects.toMatchObject({
+            reasonCode: mutation === "expiry" ? "action_claim_stale" : "formal_approval_required",
+          });
+        expect(worker).not.toHaveBeenCalled();
+      } finally { policySpy.mockRestore(); }
+      return;
+    }
+    policySpy.mockRestore();
     const result = await gateway.executeTool({
       sessionToken: session.token,
       tool: "fixture:delete_everything",

@@ -1288,7 +1288,7 @@ export function createToolGatewayService(
     session: ToolGatewaySession,
     tool: ToolGatewayDescriptor,
     parameters: unknown,
-    approved = false,
+    approvedClaim?: typeof toolActionRequests.$inferSelect,
   ) {
     if (!session.agentId || !session.runId || !pluginToolDispatcher) {
       throw new ToolGatewayHttpError(403, "Plugin tools require an agent run context", "agent_context_required");
@@ -1304,7 +1304,8 @@ export function createToolGatewayService(
         ${projects}, ${routines}, ${plugins}, ${principalPermissionGrants}, ${toolPolicies},
         ${toolProfiles}, ${toolProfileBindings}, ${toolProfileEntries},
         ${toolMcpGateways}, ${toolApplications}, ${toolConnections},
-        ${toolCatalogEntries}, ${toolGatewaySessions}, ${toolMcpGatewayTokens} IN SHARE MODE`);
+        ${toolCatalogEntries}, ${toolGatewaySessions}, ${toolMcpGatewayTokens},
+        ${toolActionRequests}, ${toolInvocations}, ${issueThreadInteractions}, ${approvals} IN SHARE MODE`);
       const admissionDb = tx as unknown as Db;
       const [run] = await admissionDb.select().from(heartbeatRuns).where(and(
         eq(heartbeatRuns.id, session.runId!), eq(heartbeatRuns.companyId, session.companyId),
@@ -1366,8 +1367,55 @@ export function createToolGatewayService(
       const decision = await toolAccessPolicyService(admissionDb).decide(policyInputForTool({
         session, tool, parameters, consumeRateLimit: false,
       }));
-      if (!decision.allowed && !(approved && decision.decision === "require_approval")) {
+      if (!decision.allowed && !(approvedClaim && decision.decision === "require_approval")) {
         throw new ToolGatewayHttpError(policyErrorStatus(decision), decision.explanation, decision.reasonCode);
+      }
+      if (approvedClaim) {
+        const [request] = await admissionDb.select().from(toolActionRequests).where(and(
+          eq(toolActionRequests.id, approvedClaim.id),
+          eq(toolActionRequests.companyId, session.companyId),
+        ));
+        const [invocation] = await admissionDb.select().from(toolInvocations).where(and(
+          eq(toolInvocations.id, approvedClaim.invocationId),
+          eq(toolInvocations.companyId, session.companyId),
+        ));
+        // Bind the bypass to the exact claim whose signed payload was verified
+        // earlier, rather than accepting any executing request for this tool.
+        if (!request || request.status !== "executing" ||
+            request.updatedAt.getTime() !== approvedClaim.updatedAt.getTime() ||
+            request.signedArguments !== approvedClaim.signedArguments ||
+            request.canonicalArgumentsHash !== summarizeToolValue(parameters).sha256 ||
+            request.approvalId !== approvedClaim.approvalId ||
+            request.interactionId !== approvedClaim.interactionId ||
+            request.invocationId !== approvedClaim.invocationId ||
+            request.issueId !== session.issueId || request.requestedByAgentId !== session.agentId ||
+            (request.expiresAt && request.expiresAt.getTime() <= Date.now()) ||
+            !invocation || invocation.status !== "executing" ||
+            invocation.toolName !== tool.name || invocation.issueId !== session.issueId ||
+            invocation.agentId !== session.agentId || invocation.runId !== session.runId) {
+          throw new ToolGatewayHttpError(409, "Approved action changed before dispatch", "action_claim_stale");
+        }
+        const [issue] = await admissionDb.select().from(issues).where(and(
+          eq(issues.id, request.issueId!), eq(issues.companyId, session.companyId),
+        ));
+        const [interaction] = await admissionDb.select().from(issueThreadInteractions).where(and(
+          eq(issueThreadInteractions.id, request.interactionId!),
+          eq(issueThreadInteractions.companyId, session.companyId),
+          eq(issueThreadInteractions.issueId, request.issueId!),
+        ));
+        if (!issue || issue.status === "done" || issue.status === "cancelled" ||
+            !interaction || interaction.kind !== "request_confirmation" ||
+            !["accepted", "executing"].includes(interaction.status)) {
+          throw new ToolGatewayHttpError(409, "Approved action scope is no longer active", "action_scope_mismatch");
+        }
+        if (request.approvalId) {
+          const [approval] = await admissionDb.select().from(approvals).where(and(
+            eq(approvals.id, request.approvalId), eq(approvals.companyId, session.companyId),
+          ));
+          if (approval?.status !== "approved") {
+            throw new ToolGatewayHttpError(409, "Formal approval is no longer valid", "formal_approval_required");
+          }
+        }
       }
       // No await between registry identity validation and dispatcher entry.
       const fresh = pluginTools().find(entry => entry.name === tool.name);
@@ -10081,6 +10129,7 @@ export function createToolGatewayService(
         callerHeaders: input.callerHeaders,
       });
       await assertGatewayTokenAction(session, "tools/call");
+      let approvedPluginClaim: typeof toolActionRequests.$inferSelect | undefined;
       let invocationId = String(randomUUID());
       const startedAt = Date.now();
 
@@ -10658,6 +10707,7 @@ export function createToolGatewayService(
           actionRequestId: claimed.id,
           status: "executing",
         });
+        approvedPluginClaim = claimed;
         invocationId = storedInvocation.id as typeof invocationId;
         effectiveParameters = storedParameters;
         effectiveArgumentsSummary = storedArgumentValidation.summary;
@@ -10830,7 +10880,7 @@ export function createToolGatewayService(
           ? connectedMcpExecution.result
           : tool.providerType === "paperclip_plugin"
             ? await runWithTimeout(
-                dispatchAdmittedPlugin(session, tool, effectiveParameters, Boolean(input.approvedActionRequestId)),
+                dispatchAdmittedPlugin(session, tool, effectiveParameters, approvedPluginClaim),
                 executionTimeoutMs,
               )
             : await runWithTimeout(
