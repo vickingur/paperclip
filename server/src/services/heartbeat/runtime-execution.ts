@@ -1,3 +1,4 @@
+import { resolveAssignedPluginToolInventoryDigestForRun } from "../native-runtime/assigned-mcp-tools.js";
 import { parseNativeSessionGoalControl } from "./scheduling.js";
 import { isHeartbeatRunTerminalStatus } from "./run-lifecycle.js";
 import {
@@ -736,6 +737,10 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
             }
           : {}),
       };
+      adapterContext.paperclipPluginToolInventoryDigest =
+        await resolveAssignedPluginToolInventoryDigestForRun(db, {
+          companyId: agent.companyId, agentId: agent.id,
+        });
       const runtimeTools = createAdapterRuntimeToolAccess({
         agentId: agent.id,
         companyId: agent.companyId,

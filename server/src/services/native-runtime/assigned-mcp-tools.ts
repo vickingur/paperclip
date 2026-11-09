@@ -71,6 +71,27 @@ export async function resolveAssignedConnectionInstructionsForRun(db: Db, bindin
   return gateway ? gateway.resolveConnectionInstructionsForRun(binding) : null;
 }
 
+// Resolve the policy-filtered plugin catalog on every run. No configured gateway
+// means no delivered plugin tools; tokens and run IDs never enter this digest.
+export async function resolveAssignedPluginToolInventoryDigestForRun(
+  db: Db, binding: { companyId: string; agentId: string },
+): Promise<string | null> {
+  const gateway = assignedMcpGateways.get(db);
+  if (!gateway) return null;
+  const tools = await gateway.listPluginToolsForAgent(binding);
+  function canonical(value: unknown): unknown {
+    if (Array.isArray(value)) return value.map(canonical);
+    if (value && typeof value === "object") {
+      return Object.fromEntries(Object.entries(value).sort(([a], [b]) => a.localeCompare(b))
+        .map(([key, entry]) => [key, canonical(entry)]));
+    }
+    return value;
+  }
+  return createHash("sha256").update(JSON.stringify(canonical(
+    tools.map(pinPluginDescriptor).sort((a, b) => a.name.localeCompare(b.name)),
+  ))).digest("hex");
+}
+
 function assignedToolName(name: string): string {
   const sanitize = (value: string) => value.replace(/[^a-zA-Z0-9_]+/g, "_").replace(/^_+|_+$/g, "");
   const separator = name.lastIndexOf(":");

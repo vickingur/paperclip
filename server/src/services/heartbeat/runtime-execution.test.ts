@@ -1,3 +1,5 @@
+import { registerAssignedMcpGateway, resolveAssignedPluginToolInventoryDigestForRun } from "../native-runtime/assigned-mcp-tools.js";
+import type { ToolGatewayService } from "../tool-gateway.js";
 import { randomUUID } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -123,6 +125,20 @@ describe.skipIf(!support.supported)("heartbeat runtime execution boundary", () =
     expect(input.effects.onLegacyAdapterEntered).not.toHaveBeenCalled();
     expect(await finalizations()).toHaveLength(0);
     expectCleanup(input);
+  });
+
+  it("delivers the current policy-filtered plugin inventory digest to the legacy adapter", async () => {
+    const { input, adapter } = await fixture();
+    const listPluginToolsForAgent = vi.fn().mockResolvedValue([{ name: "fixture:asset_put", displayName: "Asset put", description: "Fixture", parametersSchema: { type: "object" }, pluginId: "fixture" }]);
+    registerAssignedMcpGateway(db, { listPluginToolsForAgent } as unknown as ToolGatewayService);
+    const binding = { companyId: input.agent.companyId, agentId: input.agent.id };
+    const expected = await resolveAssignedPluginToolInventoryDigestForRun(db, binding);
+    adapter.execute.mockImplementationOnce(async ctx => {
+      expect(ctx.context.paperclipPluginToolInventoryDigest).toBe(expected);
+      return { exitCode: 0, signal: null, timedOut: false };
+    });
+    expect(await executeHeartbeatRuntime(db, input)).toMatchObject({ dispatched: true });
+    expect(listPluginToolsForAgent).toHaveBeenLastCalledWith(binding);
   });
 
   it("captures usage and live instruction saves before finalizing a legacy workspace", async () => {
