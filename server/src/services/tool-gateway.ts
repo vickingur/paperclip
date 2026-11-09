@@ -44,6 +44,7 @@ import {
   companies,
   companyMemberships,
   companySecrets,
+  companySecretVersions,
   connectionGrantMembers,
   connectionGrantDelegations,
   connectionGrants,
@@ -1364,7 +1365,8 @@ export function createToolGatewayService(
         ${toolCatalogEntries}, ${toolGatewaySessions}, ${toolMcpGatewayTokens},
         ${toolActionRequests}, ${toolInvocations}, ${issueThreadInteractions}, ${approvals},
         ${connectionGrants}, ${connectionGrantMembers}, ${connectionGrantDelegations},
-        ${companyMemberships}, ${toolStdioCommandTemplates} IN SHARE MODE`);
+        ${companyMemberships}, ${toolStdioCommandTemplates},
+        ${companySecrets}, ${companySecretVersions} IN SHARE MODE`);
       const admissionDb = tx as unknown as Db;
       const [run] = await admissionDb.select().from(heartbeatRuns).where(and(
         eq(heartbeatRuns.id, session.runId!), eq(heartbeatRuns.companyId, session.companyId),
@@ -4440,6 +4442,36 @@ export function createToolGatewayService(
     return headers;
   }
 
+  // Compare metadata only: never read or persist credential material here.
+  // Capture before preparation, then re-read under admission's write fence.
+  async function preparedCredentialState(
+    connection: typeof toolConnections.$inferSelect,
+    grant: typeof connectionGrants.$inferSelect,
+    admissionDb: Db = db,
+  ): Promise<string> {
+    const ids = [...new Set([
+      ...(connection.credentialRefs ?? []).map(ref => ref.secretId),
+      ...(grant.credentialSecretRefs ?? []).map(ref => ref.secretId),
+    ].filter((id): id is string => typeof id === "string"))].sort();
+    if (!ids.length) return stableHash([]);
+    const secretRows = await admissionDb.select({
+      id: companySecrets.id, status: companySecrets.status,
+      latestVersion: companySecrets.latestVersion, epoch: companySecrets.aiSessionEpoch,
+      provider: companySecrets.provider, externalRef: companySecrets.externalRef,
+      providerConfigId: companySecrets.providerConfigId,
+    }).from(companySecrets).where(and(
+      eq(companySecrets.companyId, connection.companyId), inArray(companySecrets.id, ids),
+    )).orderBy(asc(companySecrets.id));
+    const versions = await admissionDb.select({
+      id: companySecretVersions.id, secretId: companySecretVersions.secretId,
+      version: companySecretVersions.version, status: companySecretVersions.status,
+      revokedAt: companySecretVersions.revokedAt,
+      providerVersionRef: companySecretVersions.providerVersionRef,
+    }).from(companySecretVersions).where(inArray(companySecretVersions.secretId, secretRows.map(row => row.id)))
+      .orderBy(asc(companySecretVersions.secretId), asc(companySecretVersions.version));
+    return stableHash(JSON.parse(JSON.stringify({ secretRows, versions })));
+  }
+
   function credentialVersionRefHash(value: Record<string, unknown>): string {
     return stableHash(value);
   }
@@ -6218,6 +6250,7 @@ export function createToolGatewayService(
       ms = railwayCommandBudgetMs(parameters);
     }
     const grant = await resolveConnectionGrant(session, connection);
+    const credentialState = await preparedCredentialState(connection, grant);
     const admit = <T>(enter: () => Promise<T>): Promise<T> => {
       if (!session.agentId || !session.runId) return enter();
       return dispatchUnderAdmission(session, tool, parameters, enter, async (admissionDb) => {
@@ -6228,7 +6261,8 @@ export function createToolGatewayService(
         const preparedHash = (value: unknown) => stableHash(JSON.parse(JSON.stringify(value)));
         if (preparedHash(current.entry) !== preparedHash(entry) ||
             preparedHash(current.connection) !== preparedHash(connection) ||
-            preparedHash(currentGrant) !== preparedHash(grant)) {
+            preparedHash(currentGrant) !== preparedHash(grant) ||
+            await preparedCredentialState(current.connection, currentGrant, admissionDb) !== credentialState) {
           throw new ToolGatewayHttpError(409, "Prepared connection changed before dispatch", "app_preparation_stale");
         }
       }, approvedClaim);
@@ -6686,6 +6720,7 @@ export function createToolGatewayService(
       tool,
     );
     const grant = await resolveConnectionGrant(session, connection);
+    const credentialState = await preparedCredentialState(connection, grant);
     const template = await resolveLocalStdioRuntimeTemplate(connection);
     const env = await localStdioEnvironment(
       session,
@@ -6703,7 +6738,8 @@ export function createToolGatewayService(
         if (preparedHash(current.entry) !== preparedHash(entry) ||
             preparedHash(current.connection) !== preparedHash(connection) ||
             preparedHash(currentGrant) !== preparedHash(grant) ||
-            preparedHash(currentTemplate) !== preparedHash(template)) {
+            preparedHash(currentTemplate) !== preparedHash(template) ||
+            await preparedCredentialState(current.connection, currentGrant, admissionDb) !== credentialState) {
           throw new ToolGatewayHttpError(409, "Prepared connection changed before dispatch", "app_preparation_stale");
         }
       }, approvedClaim);

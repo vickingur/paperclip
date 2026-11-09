@@ -16,6 +16,7 @@ import {
   companies,
   companySecretBindings,
   companySecrets,
+  companySecretVersions,
   companyMemberships,
   toolConnectionInstalls,
   issueComments,
@@ -1414,13 +1415,24 @@ describeEmbeddedPostgres("tool gateway service", () => {
     } finally { slotSpy.mockRestore(); }
   });
 
-  it.each(["none", "connection", "grant", "application"])("fences prepared HTTP metadata after MCP initialization: %s", async (mutation) => {
+  it.each(["none", "connection", "grant", "application", "rotation", "secret_disabled", "version_revoked"])("fences prepared HTTP metadata after MCP initialization: %s", async (mutation) => {
     const { company, agent, run } = await createRunFixture(db);
     const fixture = await createRemoteMcpToolFixture(db, company.id);
     await db.update(toolConnections).set({ config: { url: "https://8.8.8.8/mcp", mcpSessionRequired: true } })
       .where(eq(toolConnections.id, fixture.connection.id));
     await db.insert(toolPolicies).values({ companyId: company.id, name: "Allow reads",
       policyType: "allow", selectors: { riskLevel: "read" } });
+    const credential = await secretService(db).create(company.id, {
+      provider: "local_encrypted", name: "Synthetic admission credential",
+      key: `admission.${randomUUID()}`, value: "synthetic-token",
+    });
+    await db.insert(companySecretBindings).values({ companyId: company.id, secretId: credential.id,
+      targetType: "tool_connection", targetId: fixture.connection.id, configPath: "token" });
+    await db.update(connectionGrants).set({ credentialSecretRefs: [{ secretId: credential.id,
+      configPath: "token", versionSelector: "latest" }] }).where(eq(connectionGrants.connectionId, fixture.connection.id));
+    await db.update(toolConnections).set({ credentialRefs: [{ secretId: credential.id,
+      name: "token", placement: "header", key: "Authorization", prefix: "Bearer ", versionSelector: "latest" }] })
+      .where(eq(toolConnections.id, fixture.connection.id));
     const methods: string[] = [];
     const gateway = createTestToolGatewayService(db, { remoteHttpRequest: async (_url, init) => {
       const payload = JSON.parse(String(init.body));
@@ -1434,6 +1446,9 @@ describeEmbeddedPostgres("tool gateway service", () => {
         if (mutation === "grant") await db.update(connectionGrants)
           .set({ credentialSecretRefs: [{ configPath: "token", secretId: randomUUID(), versionSelector: "latest" }] })
           .where(eq(connectionGrants.connectionId, fixture.connection.id));
+        if (mutation === "rotation") await secretService(db).rotate(credential.id, { value: "rotated-synthetic-token" });
+        if (mutation === "secret_disabled") await db.update(companySecrets).set({ status: "disabled" }).where(eq(companySecrets.id, credential.id));
+        if (mutation === "version_revoked") await db.update(companySecretVersions).set({ revokedAt: new Date() }).where(eq(companySecretVersions.secretId, credential.id));
         if (mutation === "application") await db.update(toolApplications).set({ status: "disabled" })
           .where(eq(toolApplications.id, fixture.application.id));
         return Response.json({ jsonrpc: "2.0", id: payload.id, result: {
