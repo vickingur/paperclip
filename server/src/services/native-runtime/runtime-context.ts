@@ -25,6 +25,7 @@ import {
 import { resolvePaperclipInstanceRoot } from "../../home-paths.js";
 import { agentInstructionsService, agentInstructionsBundleMode } from "../agent-instructions.js";
 import { agentInstructionRevisionService } from "../agent-instruction-revisions.js";
+import { hasPinnedTools } from "./pinned-tool-assignment.js";
 import { captureToolAssignmentInventory } from "./plugin-assignment-inventory.js";
 import { toolAccessService } from "../tool-access.js";
 import { filterResolvedGitHubConnectionsForRun } from "../git-credentials.js";
@@ -249,6 +250,17 @@ export async function captureNativeRuntimeToolAssignment(input: { db: Db; agent:
   return captureToolAssignmentInventory(input.db, {
     companyId: input.agent.companyId, agentId: input.agent.id, runId: input.runId,
   }, () => resolveNativeRuntimeAppAssignment(input));
+}
+
+/** Version-2 snapshot projection for the pinned delivery path. The legacy
+ * builder must migrate together with its caller before this replaces v1. */
+export async function resolveCapturedNativeRuntimeMcpSnapshot(input: { db: Db; agent: Pick<RuntimeAgent, "id" | "companyId">; runId: string }) {
+  const captured = await captureNativeRuntimeToolAssignment(input);
+  return {
+    assignmentSetId: `sha256:${captured.digest}`,
+    digest: captured.digest,
+    bindingId: hasPinnedTools(captured.assignment) ? `native-mcp:${input.runId}` : null,
+  };
 }
 
 export async function resolveNativeRuntimeMcpSnapshot(input: { db: Db; agent: Pick<RuntimeAgent, "id" | "companyId">; runId: string }) {

@@ -440,3 +440,20 @@ it("pins a voice tool only when the current requester can call through that assi
   expect(await captureNativeRuntimeToolAssignment(input)).toBe(pin);
   expect(serviceMocks.getEffectiveProfilesForAgent).not.toHaveBeenCalled();
 });
+
+
+it("projects the persisted mixed inventory digest and connectionless plugin binding without rediscovery", async () => {
+  const { resolveCapturedNativeRuntimeMcpSnapshot } = await import("./runtime-context.js");
+  const input = { db: {} as Db, agent: { id: "agent-1", companyId: "company-1" }, runId: "run-1" };
+  const assignment = { version: 2, connections: [], tools: [], plugins: [{ name: "synthetic:read", pluginId: "synthetic", descriptorDigest: "a".repeat(64) }] };
+  serviceMocks.captureToolAssignmentInventory.mockResolvedValue({ assignment, digest: "persisted-digest" });
+  serviceMocks.getEffectiveProfilesForAgent.mockClear();
+  expect(await resolveCapturedNativeRuntimeMcpSnapshot(input)).toEqual({ assignmentSetId: "sha256:persisted-digest", digest: "persisted-digest", bindingId: "native-mcp:run-1" });
+  serviceMocks.captureToolAssignmentInventory.mockResolvedValueOnce({ assignment: { ...assignment, plugins: [], connections: ["app"] }, digest: "mixed-digest" });
+  expect((await resolveCapturedNativeRuntimeMcpSnapshot(input)).bindingId).toBe("native-mcp:run-1");
+  serviceMocks.captureToolAssignmentInventory.mockResolvedValueOnce({ assignment: { ...assignment, plugins: [] }, digest: "empty-digest" });
+  expect(await resolveCapturedNativeRuntimeMcpSnapshot(input)).toEqual({ assignmentSetId: "sha256:empty-digest", digest: "empty-digest", bindingId: null });
+  expect(serviceMocks.getEffectiveProfilesForAgent).not.toHaveBeenCalled();
+  serviceMocks.captureToolAssignmentInventory.mockRejectedValueOnce(new Error("native_assignment_invalid_persisted_inventory"));
+  await expect(resolveCapturedNativeRuntimeMcpSnapshot(input)).rejects.toThrow("native_assignment_invalid_persisted_inventory");
+});
