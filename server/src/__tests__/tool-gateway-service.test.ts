@@ -14,6 +14,7 @@ import {
   agents,
   approvals,
   companies,
+  companySecretProviderConfigs,
   companySecretBindings,
   companySecrets,
   companySecretVersions,
@@ -1379,7 +1380,7 @@ describeEmbeddedPostgres("tool gateway service", () => {
     } finally { bridgeSpy.mockRestore(); urlSpy.mockRestore(); }
   });
 
-  it.each(["none", "template", "grant", "connection", "rotation", "secret_disabled", "version_revoked", "binding"])("fences stdio preparation after slot acquisition: %s", async (mutation) => {
+  it.each(["none", "template", "grant", "connection", "rotation", "secret_disabled", "version_revoked", "binding", "provider_config", "provider_disabled"])("fences stdio preparation after slot acquisition: %s", async (mutation) => {
     const { company, agent, run } = await createRunFixture(db);
     const fixture = await createRemoteMcpToolFixture(db, company.id);
     await db.update(toolApplications).set({type:"mcp_stdio"}).where(eq(toolApplications.id,fixture.application.id));
@@ -1397,6 +1398,10 @@ describeEmbeddedPostgres("tool gateway service", () => {
       provider: "local_encrypted", name: "Synthetic stdio credential",
       key: `stdio.admission.${randomUUID()}`, value: "synthetic-token",
     });
+    const [providerConfig] = await db.insert(companySecretProviderConfigs).values({
+      companyId: company.id, provider: "local_encrypted", displayName: "Synthetic vault", config: {},
+    }).returning();
+    await db.update(companySecrets).set({ providerConfigId: providerConfig.id }).where(eq(companySecrets.id, credential.id));
     await db.insert(companySecretBindings).values({ companyId: company.id, secretId: credential.id,
       targetType: "tool_connection", targetId: fixture.connection.id, configPath: "token" });
     await db.update(connectionGrants).set({ credentialSecretRefs: [{ secretId: credential.id,
@@ -1412,6 +1417,8 @@ describeEmbeddedPostgres("tool gateway service", () => {
         if(mutation === "template") await db.update(toolStdioCommandTemplates).set({args:["-e","process.exit(88)"]}).where(eq(toolStdioCommandTemplates.id,template.id));
         if(mutation === "grant") await db.update(connectionGrants).set({status:"revoked"}).where(eq(connectionGrants.connectionId,fixture.connection.id));
         if(mutation === "connection") await db.update(toolConnections).set({config:{templateId:"changed"}}).where(eq(toolConnections.id,fixture.connection.id));
+        if (mutation === "provider_config") await db.update(companySecretProviderConfigs).set({ config: { syntheticRevision: 2 } }).where(eq(companySecretProviderConfigs.id, providerConfig.id));
+        if (mutation === "provider_disabled") await db.update(companySecretProviderConfigs).set({ status: "disabled" }).where(eq(companySecretProviderConfigs.id, providerConfig.id));
         if (mutation === "binding") await db.delete(companySecretBindings).where(eq(companySecretBindings.secretId, credential.id));
         if (mutation === "rotation") await secretService(db).rotate(credential.id, { value: "rotated-synthetic-token" });
         if (mutation === "secret_disabled") await db.update(companySecrets).set({ status: "disabled" }).where(eq(companySecrets.id, credential.id));
@@ -1426,7 +1433,7 @@ describeEmbeddedPostgres("tool gateway service", () => {
       const tool = (await gateway.listToolsForSession(session.token)).find(t=>t.catalogEntryId===fixture.catalogEntry.id)!;
       const call = gateway.executeTool({sessionToken:session.token,tool:tool.name,parameters:{}});
       if(mutation === "none") await expect(call).resolves.toMatchObject({status:"completed"});
-      else await expect(call).rejects.toMatchObject({reasonCode:["template", "rotation", "secret_disabled", "version_revoked", "binding"].includes(mutation) ? "app_preparation_stale" : mutation === "connection" ? "local_stdio_template_invalid" : "organization_authorization_required"});
+      else await expect(call).rejects.toMatchObject({reasonCode:["template", "rotation", "secret_disabled", "version_revoked", "binding", "provider_config", "provider_disabled"].includes(mutation) ? "app_preparation_stale" : mutation === "connection" ? "local_stdio_template_invalid" : "organization_authorization_required"});
     } finally { slotSpy.mockRestore(); }
   });
 
@@ -1477,7 +1484,7 @@ describeEmbeddedPostgres("tool gateway service", () => {
     } finally { slotSpy.mockRestore(); }
   });
 
-  it.each(["none", "connection", "grant", "application", "rotation", "secret_disabled", "version_revoked", "binding"])("fences prepared HTTP metadata after MCP initialization: %s", async (mutation) => {
+  it.each(["none", "connection", "grant", "application", "rotation", "secret_disabled", "version_revoked", "binding", "provider_config", "provider_disabled"])("fences prepared HTTP metadata after MCP initialization: %s", async (mutation) => {
     const { company, agent, run } = await createRunFixture(db);
     const fixture = await createRemoteMcpToolFixture(db, company.id);
     await db.update(toolConnections).set({ config: { url: "https://8.8.8.8/mcp", mcpSessionRequired: true } })
@@ -1488,6 +1495,10 @@ describeEmbeddedPostgres("tool gateway service", () => {
       provider: "local_encrypted", name: "Synthetic admission credential",
       key: `admission.${randomUUID()}`, value: "synthetic-token",
     });
+    const [providerConfig] = await db.insert(companySecretProviderConfigs).values({
+      companyId: company.id, provider: "local_encrypted", displayName: "Synthetic vault", config: {},
+    }).returning();
+    await db.update(companySecrets).set({ providerConfigId: providerConfig.id }).where(eq(companySecrets.id, credential.id));
     await db.insert(companySecretBindings).values({ companyId: company.id, secretId: credential.id,
       targetType: "tool_connection", targetId: fixture.connection.id, configPath: "token" });
     await db.update(connectionGrants).set({ credentialSecretRefs: [{ secretId: credential.id,
@@ -1508,6 +1519,8 @@ describeEmbeddedPostgres("tool gateway service", () => {
         if (mutation === "grant") await db.update(connectionGrants)
           .set({ credentialSecretRefs: [{ configPath: "token", secretId: randomUUID(), versionSelector: "latest" }] })
           .where(eq(connectionGrants.connectionId, fixture.connection.id));
+        if (mutation === "provider_config") await db.update(companySecretProviderConfigs).set({ config: { syntheticRevision: 2 } }).where(eq(companySecretProviderConfigs.id, providerConfig.id));
+        if (mutation === "provider_disabled") await db.update(companySecretProviderConfigs).set({ status: "disabled" }).where(eq(companySecretProviderConfigs.id, providerConfig.id));
         if (mutation === "binding") await db.delete(companySecretBindings).where(eq(companySecretBindings.secretId, credential.id));
         if (mutation === "rotation") await secretService(db).rotate(credential.id, { value: "rotated-synthetic-token" });
         if (mutation === "secret_disabled") await db.update(companySecrets).set({ status: "disabled" }).where(eq(companySecrets.id, credential.id));

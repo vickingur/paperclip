@@ -44,6 +44,7 @@ import {
   companies,
   companyMemberships,
   companySecrets,
+  companySecretProviderConfigs,
   companySecretBindings,
   companySecretVersions,
   connectionGrantMembers,
@@ -1367,7 +1368,8 @@ export function createToolGatewayService(
         ${toolActionRequests}, ${toolInvocations}, ${issueThreadInteractions}, ${approvals},
         ${connectionGrants}, ${connectionGrantMembers}, ${connectionGrantDelegations},
         ${companyMemberships}, ${toolStdioCommandTemplates},
-        ${companySecrets}, ${companySecretVersions}, ${companySecretBindings} IN SHARE MODE`);
+        ${companySecrets}, ${companySecretVersions}, ${companySecretBindings},
+        ${companySecretProviderConfigs} IN SHARE MODE`);
       const admissionDb = tx as unknown as Db;
       const [run] = await admissionDb.select().from(heartbeatRuns).where(and(
         eq(heartbeatRuns.id, session.runId!), eq(heartbeatRuns.companyId, session.companyId),
@@ -4481,7 +4483,18 @@ export function createToolGatewayService(
       eq(companySecretBindings.targetId, connection.id),
       inArray(companySecretBindings.secretId, ids),
     )).orderBy(asc(companySecretBindings.id));
-    return stableHash(JSON.parse(JSON.stringify({ secretRows, versions, bindings })));
+    const providerIds = [...new Set(secretRows.map(row => row.providerConfigId)
+      .filter((id): id is string => typeof id === "string"))].sort();
+    // Hash only runtime-relevant configuration in memory. Health/telemetry writes
+    // do not invalidate prepared credentials; no configuration is logged/stored.
+    const providers = providerIds.length ? await admissionDb.select({
+      id: companySecretProviderConfigs.id, provider: companySecretProviderConfigs.provider,
+      status: companySecretProviderConfigs.status, config: companySecretProviderConfigs.config,
+    }).from(companySecretProviderConfigs).where(and(
+      eq(companySecretProviderConfigs.companyId, connection.companyId),
+      inArray(companySecretProviderConfigs.id, providerIds),
+    )).orderBy(asc(companySecretProviderConfigs.id)) : [];
+    return stableHash(JSON.parse(JSON.stringify({ secretRows, versions, bindings, providers })));
   }
 
   function credentialVersionRefHash(value: Record<string, unknown>): string {
