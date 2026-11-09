@@ -1379,7 +1379,7 @@ describeEmbeddedPostgres("tool gateway service", () => {
     } finally { bridgeSpy.mockRestore(); urlSpy.mockRestore(); }
   });
 
-  it.each(["none", "template", "grant", "connection"])("fences stdio preparation after slot acquisition: %s", async (mutation) => {
+  it.each(["none", "template", "grant", "connection", "rotation", "secret_disabled", "version_revoked"])("fences stdio preparation after slot acquisition: %s", async (mutation) => {
     const { company, agent, run } = await createRunFixture(db);
     const fixture = await createRemoteMcpToolFixture(db, company.id);
     await db.update(toolApplications).set({type:"mcp_stdio"}).where(eq(toolApplications.id,fixture.application.id));
@@ -1393,6 +1393,17 @@ describeEmbeddedPostgres("tool gateway service", () => {
     await db.update(toolConnections).set({transport:"local_stdio", config:{templateId:templateKey}})
       .where(eq(toolConnections.id,fixture.connection.id));
     await db.insert(toolPolicies).values({companyId:company.id,name:"Allow reads",policyType:"allow",selectors:{riskLevel:"read"}});
+    const credential = await secretService(db).create(company.id, {
+      provider: "local_encrypted", name: "Synthetic stdio credential",
+      key: `stdio.admission.${randomUUID()}`, value: "synthetic-token",
+    });
+    await db.insert(companySecretBindings).values({ companyId: company.id, secretId: credential.id,
+      targetType: "tool_connection", targetId: fixture.connection.id, configPath: "token" });
+    await db.update(connectionGrants).set({ credentialSecretRefs: [{ secretId: credential.id,
+      configPath: "token", versionSelector: "latest" }] }).where(eq(connectionGrants.connectionId, fixture.connection.id));
+    await db.update(toolConnections).set({ credentialRefs: [{ secretId: credential.id,
+      name: "token", placement: "env", key: "SYNTHETIC_TOKEN", versionSelector: "latest" }] })
+      .where(eq(toolConnections.id, fixture.connection.id));
     const original = runtimeSlots.createToolRuntimeSupervisor;
     const slotSpy = vi.spyOn(runtimeSlots,"createToolRuntimeSupervisor").mockImplementation((...args) => {
       const supervisor = original(...args);
@@ -1401,6 +1412,9 @@ describeEmbeddedPostgres("tool gateway service", () => {
         if(mutation === "template") await db.update(toolStdioCommandTemplates).set({args:["-e","process.exit(88)"]}).where(eq(toolStdioCommandTemplates.id,template.id));
         if(mutation === "grant") await db.update(connectionGrants).set({status:"revoked"}).where(eq(connectionGrants.connectionId,fixture.connection.id));
         if(mutation === "connection") await db.update(toolConnections).set({config:{templateId:"changed"}}).where(eq(toolConnections.id,fixture.connection.id));
+        if (mutation === "rotation") await secretService(db).rotate(credential.id, { value: "rotated-synthetic-token" });
+        if (mutation === "secret_disabled") await db.update(companySecrets).set({ status: "disabled" }).where(eq(companySecrets.id, credential.id));
+        if (mutation === "version_revoked") await db.update(companySecretVersions).set({ revokedAt: new Date() }).where(eq(companySecretVersions.secretId, credential.id));
         return callback(handle);
       });
       return supervisor;
@@ -1411,7 +1425,7 @@ describeEmbeddedPostgres("tool gateway service", () => {
       const tool = (await gateway.listToolsForSession(session.token)).find(t=>t.catalogEntryId===fixture.catalogEntry.id)!;
       const call = gateway.executeTool({sessionToken:session.token,tool:tool.name,parameters:{}});
       if(mutation === "none") await expect(call).resolves.toMatchObject({status:"completed"});
-      else await expect(call).rejects.toMatchObject({reasonCode:mutation === "template" ? "app_preparation_stale" : mutation === "connection" ? "local_stdio_template_invalid" : "organization_authorization_required"});
+      else await expect(call).rejects.toMatchObject({reasonCode:["template", "rotation", "secret_disabled", "version_revoked"].includes(mutation) ? "app_preparation_stale" : mutation === "connection" ? "local_stdio_template_invalid" : "organization_authorization_required"});
     } finally { slotSpy.mockRestore(); }
   });
 
