@@ -5,7 +5,7 @@ import * as accessPolicy from "../services/tool-access-policy.js";
 import { subscribeDeliveryWork } from "../services/delivery-work-notifications.js";
 import { DELIVERY_QUEUES } from "../services/delivery-work-notifications.js";
 import { randomUUID } from "node:crypto";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
@@ -1589,6 +1589,66 @@ describeEmbeddedPostgres("tool gateway service", () => {
     await expect(gateway.executeTool({ sessionToken: session.token, tool: tool.name, parameters: {} }))
       .resolves.toMatchObject({ status: "completed" });
     expect(request).toHaveBeenCalledTimes(1);
+  });
+
+  it("bounds reverse-order writer contention before provider entry", async () => {
+    const { company, agent, run } = await createRunFixture(db);
+    const other = await createRunFixture(db);
+    const fixture = await createRemoteMcpToolFixture(db, company.id);
+    await db.insert(toolPolicies).values({ companyId: company.id, name: "Allow reads",
+      policyType: "allow", selectors: { riskLevel: "read" } });
+    const [provider] = await db.insert(companySecretProviderConfigs).values({
+      companyId: other.company.id, provider: "local_encrypted", displayName: "Reverse writer", config: {},
+    }).returning();
+    const request = vi.fn<NonNullable<ToolGatewayServiceOptions["remoteHttpRequest"]>>(async (_url, init) =>
+      Response.json({ jsonrpc: "2.0", id: JSON.parse(String(init.body)).id,
+        result: { content: [{ type: "text", text: "ok" }] } }));
+    const gateway = createTestToolGatewayService(db, { remoteHttpRequest: request });
+    const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+    const tool = (await gateway.listToolsForSession(session.token)).find(t => t.catalogEntryId === fixture.catalogEntry.id)!;
+    let release!: () => void;
+    let locked!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    const ready = new Promise<void>(resolve => { locked = resolve; });
+    const writer = db.transaction(async tx => {
+      await tx.execute(sql`SET LOCAL lock_timeout = '500ms'`);
+      await tx.update(companySecretProviderConfigs).set({ config: { syntheticRevision: 2 } })
+        .where(eq(companySecretProviderConfigs.id, provider.id));
+      locked();
+      await held;
+      // Admission has already locked agents and is waiting for our later table.
+      // This upgrade forms the reverse-order cycle; bound the writer's wait.
+      await tx.update(agents).set({ updatedAt: new Date() }).where(eq(agents.id, other.agent.id));
+    });
+    const writerResult = Promise.allSettled([writer]);
+    await ready;
+    const call = gateway.executeTool({ sessionToken: session.token, tool: tool.name, parameters: {} });
+    const callResult = Promise.allSettled([call]);
+    try {
+      await vi.waitFor(async () => {
+        const waiting = await db.execute(sql`SELECT 1 FROM pg_locks
+          WHERE relation = 'company_secret_provider_configs'::regclass
+          AND mode = 'ShareLock' AND NOT granted`);
+        expect(waiting.length).toBeGreaterThan(0);
+      }, { timeout: 1500, interval: 10 });
+      expect(request).not.toHaveBeenCalled();
+    } finally {
+      release();
+    }
+    const [writerOutcome] = await writerResult;
+    expect(writerOutcome.status).toBe("rejected");
+    if (writerOutcome.status === "rejected") {
+      const error = writerOutcome.reason;
+      expect(error.code ?? error.cause?.code).toBe("55P03");
+    }
+    expect(await callResult).toEqual([expect.objectContaining({
+      status: "fulfilled", value: expect.objectContaining({ status: "completed" }),
+    })]);
+    expect(request).toHaveBeenCalledTimes(1);
+    // Rollback restores the unrelated writer's state; no health repair needed.
+    const [restored] = await db.select().from(companySecretProviderConfigs)
+      .where(eq(companySecretProviderConfigs.id, provider.id));
+    expect(restored.config).toEqual({});
   });
 
   it("admits concurrent remote calls before either provider completes", async () => {
