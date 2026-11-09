@@ -48,6 +48,27 @@ const support = await getEmbeddedPostgresTestSupport();
       expect(servers).toHaveLength(1);
       expect(servers[0]!.connectionId).toBe(`assignment:${fresh.digest}`);
       await expect(buildPaperclipRuntimeMcpServers({ db, agent: agent!, runId: failedRun!.id, expectedAssignmentDigest: "wrong" })).rejects.toThrow("native_assignment_digest_mismatch");
+      // Direct plugin routes must respect the same persisted ceiling as MCP.
+      const dispatchGateway = createToolGatewayService(db, { pluginToolDispatcher: dispatcher });
+      const call = (tool: string) => dispatchGateway.executePluginTool({
+        actor: { type: "agent", companyId: company!.id, agentId: agent!.id, runId: failedRun!.id },
+        tool, parameters: {}, runContext: { ...failedBinding, projectId: "" },
+      });
+      const originalList = dispatcher.listToolsForAgent;
+      const drift = vi.spyOn(dispatcher, "listToolsForAgent").mockImplementation(() => originalList().map(t =>
+        t.name === names[1] ? { ...t, description: "Replacement descriptor" } : t));
+      await expect(call(names[1]!)).rejects.toThrow("outside the run inventory");
+      expect(executeTool).not.toHaveBeenCalled();
+      drift.mockRestore();
+      let reads = 0;
+      const racing = vi.spyOn(dispatcher, "listToolsForAgent").mockImplementation(() => {
+        const descriptors = originalList();
+        return ++reads === 1 ? descriptors : descriptors.map(t =>
+          t.name === names[1] ? { ...t, description: "Changed during admission" } : t);
+      });
+      await expect(call(names[1]!)).rejects.toThrow("descriptor changed before dispatch");
+      expect(executeTool).not.toHaveBeenCalled();
+      racing.mockRestore();
       const listSpy = vi.spyOn(dispatcher, "listToolsForAgent");
       const concurrent = await Promise.all(Array.from({ length: 3 }, () => capturePluginAssignmentInventory(db, binding)));
       expect(listSpy).toHaveBeenCalledTimes(1);

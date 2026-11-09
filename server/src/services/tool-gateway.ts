@@ -1,3 +1,5 @@
+import { pinPluginDescriptor } from "./native-runtime/pinned-tool-assignment.js";
+import { readToolAssignmentInventory } from "./native-runtime/plugin-assignment-inventory.js";
 import { notifyDeliveryWork, DELIVERY_QUEUES } from "./delivery-work-notifications.js";
 import { composeConnectionInstructions } from "./connection-instructions.js";
 import { isInsufficientConnectionScope, INSUFFICIENT_CONNECTION_SCOPE_MESSAGE } from "./connection-permission-errors.js";
@@ -1275,6 +1277,61 @@ export function createToolGatewayService(
       providerType: "paperclip_plugin" as const,
       risk: inferToolRisk(tool.name),
     }));
+  }
+
+  // Recheck after approval/audit bookkeeping, immediately before entering the
+  // dispatcher. Discovery and earlier policy decisions are not call authority.
+  async function dispatchAdmittedPlugin(
+    session: ToolGatewaySession,
+    tool: ToolGatewayDescriptor,
+    parameters: unknown,
+    approved = false,
+  ) {
+    if (!session.agentId || !session.runId || !pluginToolDispatcher) {
+      throw new ToolGatewayHttpError(403, "Plugin tools require an agent run context", "agent_context_required");
+    }
+    const [run] = await db.select().from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.id, session.runId), eq(heartbeatRuns.companyId, session.companyId),
+      eq(heartbeatRuns.agentId, session.agentId),
+    ));
+    if (!run || run.status !== "running") {
+      throw new ToolGatewayHttpError(403, "Plugin run is inactive", "native_assignment_run_inactive");
+    }
+    const stored = run.contextSnapshot?.nativeToolAssignment as { digest?: string } | undefined;
+    const expected = pinPluginDescriptor(tool);
+    if (stored === undefined && session.gatewayProfileId) {
+      const [profile] = await db.select().from(toolProfiles).where(and(
+        eq(toolProfiles.id, session.gatewayProfileId), eq(toolProfiles.companyId, session.companyId),
+      ));
+      if (profile?.profileKey.startsWith("native:") || profile?.metadata?.source === "paperclip_runner") {
+        throw new ToolGatewayHttpError(403, "Native run inventory is missing", "native_assignment_not_captured");
+      }
+    }
+    if (stored !== undefined) {
+      const captured = await readToolAssignmentInventory(db, {
+        companyId: session.companyId, agentId: session.agentId, runId: session.runId,
+      }, stored.digest ?? "");
+      const pinned = captured.assignment.plugins.find(entry => entry.name === tool.name);
+      if (!pinned || pinned.pluginId !== expected.pluginId || pinned.descriptorDigest !== expected.descriptorDigest) {
+        throw new ToolGatewayHttpError(403, "Plugin is outside the run inventory", "native_assignment_tool_stale");
+      }
+    }
+    const decision = await policyService.decide(policyInputForTool({
+      session, tool, parameters, consumeRateLimit: false,
+    }));
+    if (!decision.allowed && !(approved && decision.decision === "require_approval")) {
+      throw new ToolGatewayHttpError(policyErrorStatus(decision), decision.explanation, decision.reasonCode);
+    }
+    // No await between registry identity validation and dispatcher entry.
+    const fresh = pluginTools().find(entry => entry.name === tool.name);
+    const actual = fresh && pinPluginDescriptor(fresh);
+    if (!actual || actual.pluginId !== expected.pluginId || actual.descriptorDigest !== expected.descriptorDigest) {
+      throw new ToolGatewayHttpError(403, "Plugin descriptor changed before dispatch", "native_assignment_tool_stale");
+    }
+    return pluginToolDispatcher.executeTool(tool.name, parameters, {
+      agentId: session.agentId, runId: session.runId, companyId: session.companyId,
+      projectId: session.projectId ?? "",
+    });
   }
 
   function allTools(): ToolGatewayDescriptor[] {
@@ -10687,16 +10744,7 @@ export function createToolGatewayService(
           ? connectedMcpExecution.result
           : tool.providerType === "paperclip_plugin"
             ? await runWithTimeout(
-                pluginToolDispatcher!.executeTool(
-                  tool.name,
-                  effectiveParameters,
-                  {
-                    agentId: session.agentId!,
-                    runId: session.runId!,
-                    companyId: session.companyId,
-                    projectId: session.projectId ?? "",
-                  },
-                ),
+                dispatchAdmittedPlugin(session, tool, effectiveParameters, Boolean(input.approvedActionRequestId)),
                 executionTimeoutMs,
               )
             : await runWithTimeout(
@@ -11108,11 +11156,7 @@ export function createToolGatewayService(
 
       const startedAt = Date.now();
       try {
-        const result = await pluginToolDispatcher.executeTool(
-          input.tool,
-          requestedParameters,
-          input.runContext,
-        );
+        const result = await dispatchAdmittedPlugin(sessionLike, tool, requestedParameters);
         const resultValidation = validateToolContent({
           value: result,
           direction: "result",
