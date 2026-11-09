@@ -1546,7 +1546,7 @@ describeEmbeddedPostgres("tool gateway service", () => {
     }
   });
 
-  it("fails closed on unrelated-company admission contention and recovers after release", async () => {
+  it.each(["provider", "agent", "run", "issue"])("fails closed on unrelated-company %s writer and recovers after release", async (writerTable) => {
     const { company, agent, run } = await createRunFixture(db);
     const fixture = await createRemoteMcpToolFixture(db, company.id);
     await db.insert(toolPolicies).values({ companyId: company.id, name: "Allow reads",
@@ -1565,8 +1565,14 @@ describeEmbeddedPostgres("tool gateway service", () => {
     const held = new Promise<void>(resolve => { release = resolve; });
     const ready = new Promise<void>(resolve => { locked = resolve; });
     const writer = db.transaction(async tx => {
-      await tx.update(companySecretProviderConfigs).set({ config: { syntheticRevision: 2 } })
-        .where(eq(companySecretProviderConfigs.id, provider.id));
+      if (writerTable === "provider") await tx.update(companySecretProviderConfigs)
+        .set({ config: { syntheticRevision: 2 } }).where(eq(companySecretProviderConfigs.id, provider.id));
+      if (writerTable === "agent") await tx.update(agents)
+        .set({ updatedAt: new Date() }).where(eq(agents.id, other.agent.id));
+      if (writerTable === "run") await tx.update(heartbeatRuns)
+        .set({ updatedAt: new Date() }).where(eq(heartbeatRuns.id, other.run.id));
+      if (writerTable === "issue") await tx.update(issues)
+        .set({ updatedAt: new Date() }).where(eq(issues.id, other.issue.id));
       locked();
       await held;
     });
@@ -1583,6 +1589,39 @@ describeEmbeddedPostgres("tool gateway service", () => {
     await expect(gateway.executeTool({ sessionToken: session.token, tool: tool.name, parameters: {} }))
       .resolves.toMatchObject({ status: "completed" });
     expect(request).toHaveBeenCalledTimes(1);
+  });
+
+  it("admits concurrent remote calls before either provider completes", async () => {
+    const { company, agent, run } = await createRunFixture(db);
+    const fixture = await createRemoteMcpToolFixture(db, company.id);
+    await db.insert(toolPolicies).values({ companyId: company.id, name: "Allow reads",
+      policyType: "allow", selectors: { riskLevel: "read" } });
+    let release!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    let entered!: () => void;
+    const bothEntered = new Promise<void>(resolve => { entered = resolve; });
+    let entries = 0;
+    const gateway = createTestToolGatewayService(db, { remoteHttpRequest: async (_url, init) => {
+      if (++entries === 2) entered();
+      await held;
+      return Response.json({ jsonrpc: "2.0", id: JSON.parse(String(init.body)).id,
+        result: { content: [{ type: "text", text: "ok" }] } });
+    } });
+    const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+    const tool = (await gateway.listToolsForSession(session.token)).find(t => t.catalogEntryId === fixture.catalogEntry.id)!;
+    const calls = [0, 1].map(() => gateway.executeTool({
+      sessionToken: session.token, tool: tool.name, parameters: {},
+    }));
+    const results = Promise.allSettled(calls);
+    try {
+      await Promise.race([bothEntered, Promise.all(calls).then(() => { throw new Error("Concurrent calls completed before provider release"); })]);
+      await db.update(agents).set({ updatedAt: new Date() }).where(eq(agents.id, agent.id));
+    } finally {
+      release();
+    }
+    expect(await results).toEqual([0, 1].map(() => expect.objectContaining({
+      status: "fulfilled", value: expect.objectContaining({ status: "completed" }),
+    })));
   });
 
   it.each(["none", "expiry", "claim", "signature", "arguments", "invocation", "confirmation", "issue"])("revalidates approved HTTP app after MCP initialization: %s", async (mutation) => {
