@@ -56,6 +56,7 @@ import {
   projects,
   routines,
   principalPermissionGrants,
+  plugins,
   toolActionRequests,
   toolActionDeliveries,
   toolAccessAuditEvents,
@@ -1300,7 +1301,7 @@ export function createToolGatewayService(
       await tx.execute(sql`SET LOCAL lock_timeout = '2s'`);
       await tx.execute(sql`SET LOCAL statement_timeout = '5s'`);
       await tx.execute(sql`LOCK TABLE ${agents}, ${heartbeatRuns}, ${issues},
-        ${projects}, ${routines}, ${principalPermissionGrants}, ${toolPolicies},
+        ${projects}, ${routines}, ${plugins}, ${principalPermissionGrants}, ${toolPolicies},
         ${toolProfiles}, ${toolProfileBindings}, ${toolProfileEntries},
         ${toolMcpGateways}, ${toolApplications}, ${toolConnections},
         ${toolCatalogEntries} IN SHARE MODE`);
@@ -1311,6 +1312,11 @@ export function createToolGatewayService(
       ));
       if (!run || run.status !== "running") {
         throw new ToolGatewayHttpError(403, "Plugin run is inactive", "native_assignment_run_inactive");
+      }
+      const [registration] = await admissionDb.select({ status: plugins.status }).from(plugins)
+        .where(eq(plugins.id, tool.pluginId!));
+      if (registration?.status !== "ready") {
+        throw new ToolGatewayHttpError(403, "Plugin registration is not ready", "plugin_registration_inactive");
       }
       const stored = run.contextSnapshot?.nativeToolAssignment as { digest?: string } | undefined;
       const expected = pinPluginDescriptor(tool);

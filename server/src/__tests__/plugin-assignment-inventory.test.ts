@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import * as accessPolicy from "../services/tool-access-policy.js";
 import { and, eq, sql } from "drizzle-orm";
 import { randomUUID } from "node:crypto";
-import { agents, companies, createDb, connectionGrants, toolApplications, toolConnections, toolCatalogEntries, heartbeatRuns, toolProfiles, toolProfileBindings, toolProfileEntries, toolPolicies } from "@paperclipai/db";
+import { agents, companies, createDb, connectionGrants, toolApplications, toolConnections, toolCatalogEntries, heartbeatRuns, toolProfiles, toolProfileBindings, toolProfileEntries, toolPolicies, plugins } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { createToolGatewayService } from "../services/tool-gateway.js";
 import { registerAssignedMcpGateway } from "../services/native-runtime/assigned-mcp-tools.js";
@@ -26,8 +26,11 @@ const support = await getEmbeddedPostgresTestSupport();
       await db.insert(toolProfileEntries).values(names.map(toolName => ({ companyId: company!.id, profileId: profile!.id, selectorType: "tool_name" as const, effect: "include" as const, toolName })));
       const binding = { companyId: company!.id, agentId: agent!.id, runId: run!.id };
       await expect(resolvePluginAssignmentInventory(db, binding)).rejects.toThrow("assigned_mcp_gateway_unavailable");
+      const [registration] = await db.insert(plugins).values({ pluginKey: "synthetic.pipeline",
+        packageName: "synthetic-pipeline", version: "0.0.0", status: "ready",
+        manifestJson: {} as never }).returning();
       const executeTool = vi.fn();
-      const dispatcher = { listToolsForAgent: () => [...names, "synthetic.pipeline:ungranted"].map(name => ({ name, displayName: name, description: "Synthetic", parametersSchema: { type: "object" }, pluginId: "synthetic-registration" })), executeTool } as unknown as PluginToolDispatcher;
+      const dispatcher = { listToolsForAgent: () => [...names, "synthetic.pipeline:ungranted"].map(name => ({ name, displayName: name, description: "Synthetic", parametersSchema: { type: "object" }, pluginId: registration!.id })), executeTool } as unknown as PluginToolDispatcher;
       registerAssignedMcpGateway(db, createToolGatewayService(db, { pluginToolDispatcher: dispatcher }));
       await expect(readToolAssignmentInventory(db, binding, "absent")).rejects.toThrow("native_assignment_not_captured");
       const captured = await resolvePluginAssignmentInventory(db, binding);
@@ -76,6 +79,11 @@ const support = await getEmbeddedPostgresTestSupport();
       await expect(call(names[1]!)).rejects.toThrow("outside the run inventory");
       expect(executeTool).not.toHaveBeenCalled();
       drift.mockRestore();
+      // Persisted disable must deny even while the in-memory dispatcher is stale.
+      await db.update(plugins).set({ status: "disabled" }).where(eq(plugins.id, registration!.id));
+      await expect(call(names[1]!)).rejects.toMatchObject({ reasonCode: "plugin_registration_inactive" });
+      expect(executeTool).not.toHaveBeenCalled();
+      await db.update(plugins).set({ status: "ready" }).where(eq(plugins.id, registration!.id));
       let reads = 0;
       const racing = vi.spyOn(dispatcher, "listToolsForAgent").mockImplementation(() => {
         const descriptors = originalList();
@@ -137,6 +145,38 @@ const support = await getEmbeddedPostgresTestSupport();
       expect(executeTool).not.toHaveBeenCalled();
       await db.insert(toolProfileEntries).values({ companyId: company!.id, profileId: profile!.id,
         selectorType: "tool_name", effect: "include", toolName: names[1]! });
+      // Disable launched at the same boundary serializes with admission, even
+      // if lifecycle delivery has not removed the descriptor from memory.
+      const disableOrder: string[] = [];
+      let disable: Promise<unknown> | undefined;
+      let disableStarted!: () => void;
+      const disabling = new Promise<void>(resolve => { disableStarted = resolve; });
+      let disableReads = 0;
+      const disableBoundary = vi.spyOn(dispatcher, "listToolsForAgent").mockImplementation(() => {
+        if (++disableReads === 2) {
+          disable = db.update(plugins).set({ status: "disabled" })
+            .where(eq(plugins.id, registration!.id)).then(() => { disableOrder.push("disabled"); });
+          disableStarted();
+        }
+        return originalList();
+      });
+      let finishDisabledOperation!: () => void;
+      const disabledOperation = new Promise<void>(resolve => { finishDisabledOperation = resolve; });
+      executeTool.mockImplementationOnce(() => {
+        disableOrder.push("admitted");
+        return disabledOperation.then(() => ({ ok: true }));
+      });
+      const beforeDisable = call(names[1]!);
+      await disabling;
+      await disable;
+      expect(disableOrder).toEqual(["admitted", "disabled"]);
+      finishDisabledOperation();
+      await beforeDisable;
+      disableBoundary.mockRestore();
+      executeTool.mockClear();
+      await expect(call(names[1]!)).rejects.toMatchObject({ reasonCode: "plugin_registration_inactive" });
+      expect(executeTool).not.toHaveBeenCalled();
+      await db.update(plugins).set({ status: "ready" }).where(eq(plugins.id, registration!.id));
       const listSpy = vi.spyOn(dispatcher, "listToolsForAgent");
       const concurrent = await Promise.all(Array.from({ length: 3 }, () => capturePluginAssignmentInventory(db, binding)));
       expect(listSpy).toHaveBeenCalledTimes(1);
