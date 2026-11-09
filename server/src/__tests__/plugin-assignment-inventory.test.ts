@@ -5,7 +5,7 @@ import { agents, companies, createDb, heartbeatRuns, toolProfiles, toolProfileBi
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { createToolGatewayService } from "../services/tool-gateway.js";
 import { registerAssignedMcpGateway } from "../services/native-runtime/assigned-mcp-tools.js";
-import { captureToolAssignmentInventory, capturePluginAssignmentInventory, resolvePluginAssignmentInventory } from "../services/native-runtime/plugin-assignment-inventory.js";
+import { readToolAssignmentInventory, captureToolAssignmentInventory, capturePluginAssignmentInventory, resolvePluginAssignmentInventory } from "../services/native-runtime/plugin-assignment-inventory.js";
 import type { PluginToolDispatcher } from "../services/plugin-tool-dispatcher.js";
 const support = await getEmbeddedPostgresTestSupport();
 (support.supported ? describe : describe.skip)("configured run-scoped native plugin capture", () => {
@@ -27,6 +27,7 @@ const support = await getEmbeddedPostgresTestSupport();
       const executeTool = vi.fn();
       const dispatcher = { listToolsForAgent: () => [...names, "synthetic.pipeline:ungranted"].map(name => ({ name, displayName: name, description: "Synthetic", parametersSchema: { type: "object" }, pluginId: "synthetic-registration" })), executeTool } as unknown as PluginToolDispatcher;
       registerAssignedMcpGateway(db, createToolGatewayService(db, { pluginToolDispatcher: dispatcher }));
+      await expect(readToolAssignmentInventory(db, binding, "absent")).rejects.toThrow("native_assignment_not_captured");
       const captured = await resolvePluginAssignmentInventory(db, binding);
       expect(captured.assignment.plugins.map(t => t.name)).toEqual([...names].sort());
       expect(captured.assignment.connections).toEqual([]);
@@ -68,10 +69,21 @@ const support = await getEmbeddedPostgresTestSupport();
       expect(resolveApps).toHaveBeenCalledTimes(1);
       await expect(captureToolAssignmentInventory(db, { ...binding, agentId: other!.id }, resolveApps)).rejects.toThrow("native_assignment_run_scope_mismatch");
       await expect(captureToolAssignmentInventory(db, { ...binding, runId: inactive!.id }, resolveApps)).rejects.toThrow("native_assignment_run_inactive");
+      listSpy.mockClear();
+      expect(await readToolAssignmentInventory(db, binding, unified[0]!.digest)).toEqual(unified[0]);
+      // Live approval policy already changed after plugin capture. The immutable
+      // digest, rather than the current descriptor intersection, remains valid.
+      await expect(readToolAssignmentInventory(db, binding, approvalCapture.digest)).rejects.toThrow("native_assignment_digest_mismatch");
+      await expect(readToolAssignmentInventory(db, { ...binding, agentId: other!.id }, unified[0]!.digest)).rejects.toThrow("native_assignment_run_scope_mismatch");
+      await expect(readToolAssignmentInventory(db, { ...binding, companyId: randomUUID() }, unified[0]!.digest)).rejects.toThrow("native_assignment_run_scope_mismatch");
+      await expect(readToolAssignmentInventory(db, { ...binding, runId: inactive!.id }, unified[0]!.digest)).rejects.toThrow("native_assignment_run_inactive");
+      await expect(readToolAssignmentInventory(db, failedBinding, unified[0]!.digest)).rejects.toThrow("native_assignment_digest_mismatch");
+      expect(listSpy).not.toHaveBeenCalled();
       const [full] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run!.id));
       expect(full!.contextSnapshot).toEqual({ retained: "synthetic", nativePluginAssignment: captured, nativeToolAssignment: unified[0] });
       await db.update(heartbeatRuns).set({ contextSnapshot: { nativeToolAssignment: { ...unified[0], digest: "corrupt" } } }).where(eq(heartbeatRuns.id, run!.id));
       await expect(captureToolAssignmentInventory(db, binding, resolveApps)).rejects.toThrow("native_assignment_invalid_persisted_inventory");
+      await expect(readToolAssignmentInventory(db, binding, unified[0]!.digest)).rejects.toThrow("native_assignment_invalid_persisted_inventory");
       expect(resolveApps).toHaveBeenCalledTimes(1);
       await db.update(heartbeatRuns).set({ contextSnapshot: { nativePluginAssignment: { ...captured, digest: "corrupt" } } }).where(eq(heartbeatRuns.id, run!.id));
       await expect(capturePluginAssignmentInventory(db, binding)).rejects.toThrow("native_assignment_invalid_persisted_inventory");

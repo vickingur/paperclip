@@ -112,3 +112,27 @@ export async function captureToolAssignmentInventory(
     return captured;
   });
 }
+
+/**
+ * Realization reads the capture owned by this run. Never discover or repair a
+ * missing pin here: doing so could enlarge a resumed session's tool ceiling.
+ * The returned inventory still requires current-policy admission at dispatch.
+ */
+export async function readToolAssignmentInventory(
+  db: Db,
+  binding: { companyId: string; agentId: string; runId: string },
+  expectedAssignmentDigest: string,
+) {
+  const [run] = await db.select().from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.id, binding.runId),
+    eq(heartbeatRuns.companyId, binding.companyId),
+    eq(heartbeatRuns.agentId, binding.agentId),
+  ));
+  if (!run) throw new Error("native_assignment_run_scope_mismatch");
+  if (run.status !== "running") throw new Error("native_assignment_run_inactive");
+  const stored = run.contextSnapshot?.nativeToolAssignment;
+  if (stored === undefined) throw new Error("native_assignment_not_captured");
+  const captured = parseStoredPluginInventory(stored, false);
+  if (captured.digest !== expectedAssignmentDigest) throw new Error("native_assignment_digest_mismatch");
+  return captured;
+}
