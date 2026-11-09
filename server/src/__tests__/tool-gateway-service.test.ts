@@ -1546,6 +1546,45 @@ describeEmbeddedPostgres("tool gateway service", () => {
     }
   });
 
+  it("fails closed on unrelated-company admission contention and recovers after release", async () => {
+    const { company, agent, run } = await createRunFixture(db);
+    const fixture = await createRemoteMcpToolFixture(db, company.id);
+    await db.insert(toolPolicies).values({ companyId: company.id, name: "Allow reads",
+      policyType: "allow", selectors: { riskLevel: "read" } });
+    const other = await createRunFixture(db);
+    const [provider] = await db.insert(companySecretProviderConfigs).values({
+      companyId: other.company.id, provider: "local_encrypted", displayName: "Other synthetic vault", config: {},
+    }).returning();
+    const request = vi.fn<NonNullable<ToolGatewayServiceOptions["remoteHttpRequest"]>>(async (_url, init) => Response.json({ jsonrpc: "2.0", id: JSON.parse(String(init.body)).id,
+      result: { content: [{ type: "text", text: "ok" }] } }));
+    const gateway = createTestToolGatewayService(db, { remoteHttpRequest: request });
+    const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+    const tool = (await gateway.listToolsForSession(session.token)).find(t => t.catalogEntryId === fixture.catalogEntry.id)!;
+    let release!: () => void;
+    let locked!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    const ready = new Promise<void>(resolve => { locked = resolve; });
+    const writer = db.transaction(async tx => {
+      await tx.update(companySecretProviderConfigs).set({ config: { syntheticRevision: 2 } })
+        .where(eq(companySecretProviderConfigs.id, provider.id));
+      locked();
+      await held;
+    });
+    try {
+      await ready;
+      // No reference to the other company's provider; the table fence still conflicts.
+      await expect(gateway.executeTool({ sessionToken: session.token, tool: tool.name, parameters: {} }))
+        .rejects.toMatchObject({ status: 503, reasonCode: "admission_contended" });
+      expect(request).not.toHaveBeenCalled();
+    } finally {
+      release();
+      await writer;
+    }
+    await expect(gateway.executeTool({ sessionToken: session.token, tool: tool.name, parameters: {} }))
+      .resolves.toMatchObject({ status: "completed" });
+    expect(request).toHaveBeenCalledTimes(1);
+  });
+
   it.each(["none", "expiry", "claim", "signature", "arguments", "invocation", "confirmation", "issue"])("revalidates approved HTTP app after MCP initialization: %s", async (mutation) => {
     const { company, agent, run } = await createRunFixture(db);
     const fixture = await createRemoteMcpToolFixture(db, company.id);

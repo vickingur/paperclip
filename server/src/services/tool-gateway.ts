@@ -1462,7 +1462,19 @@ export function createToolGatewayService(
       // Handle early rejection without awaiting external work under DB locks.
       void execution.catch(() => {});
       return { execution };
-    }, { isolationLevel: "read committed" });
+    }, { isolationLevel: "read committed" }).catch((error: unknown) => {
+      // Drizzle wraps PostgreSQL errors in `cause`. Contention before provider
+      // entry is a local admission failure, not evidence of provider ill health.
+      let cause: unknown = error;
+      for (let depth = 0; depth < 8 && cause && typeof cause === "object"; depth++) {
+        const failure = cause as { code?: unknown; cause?: unknown };
+        if (failure.code === "55P03" || failure.code === "40P01" || failure.code === "57014") {
+          throw new ToolGatewayHttpError(503, "Tool admission is temporarily busy", "admission_contended");
+        }
+        cause = failure.cause;
+      }
+      throw error;
+    });
     return admitted.execution;
   }
 
