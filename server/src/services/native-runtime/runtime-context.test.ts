@@ -108,6 +108,34 @@ afterEach(async () => {
 });
 
 describe("buildNativeRuntimeContext", () => {
+  it("refreshes native compatibility for plugin grants and descriptor changes without run-binding churn", async () => {
+    serviceMocks.exportFiles.mockResolvedValue({ entryFile: "AGENTS.md", files: { "AGENTS.md": "Synthetic instructions\n" } });
+    const tool = (name: string, parametersSchema = {}) => ({ name, pluginId: "synthetic", displayName: name, description: "Synthetic", parametersSchema });
+    const input = { db: {} as Db, agent: { id: "agent-1", companyId: "company-1", name: "Synthetic", adapterConfig: {} }, runId: "run-1", runtimeConfig: {}, runtimeSkillEntries: [] };
+    const capture = (plugins: ReturnType<typeof tool>[]) => {
+      const assignment = createPinnedToolAssignment({ connections: [], tools: [], plugins });
+      serviceMocks.captureToolAssignmentInventory.mockResolvedValue({ assignment, digest: pinnedToolAssignmentDigest(assignment) });
+    };
+    capture([tool("synthetic:status")]);
+    const before = await buildNativeRuntimeContext(input);
+    const nextRun = await buildNativeRuntimeContext({ ...input, runId: "run-2" });
+    expect(nextRun.mcp.bindingId).not.toBe(before.mcp.bindingId);
+    expect(nextRun.aggregateDigest).toBe(before.aggregateDigest);
+    capture([tool("synthetic:status"), tool("synthetic:asset_put")]);
+    const granted = await buildNativeRuntimeContext(input);
+    expect(granted.aggregateDigest).not.toBe(before.aggregateDigest);
+    capture([tool("synthetic:asset_put"), tool("synthetic:status")]);
+    expect((await buildNativeRuntimeContext(input)).aggregateDigest).toBe(granted.aggregateDigest);
+    capture([tool("synthetic:status", { type: "string" }), tool("synthetic:asset_put")]);
+    expect((await buildNativeRuntimeContext(input)).aggregateDigest).not.toBe(granted.aggregateDigest);
+    capture([]);
+    const revoked = await buildNativeRuntimeContext(input);
+    expect(revoked.mcp.bindingId).toBeNull();
+    expect(revoked.aggregateDigest).not.toBe(before.aggregateDigest);
+    capture([tool("synthetic:status")]);
+    expect((await buildNativeRuntimeContext(input)).aggregateDigest).toBe(before.aggregateDigest);
+  });
+
   it("uses committed instructions when the disk projection is stale", async () => {
     serviceMocks.exportFiles.mockResolvedValue({
       entryFile: "AGENTS.md",
