@@ -1257,6 +1257,48 @@ describeEmbeddedPostgres("tool gateway service", () => {
     expect((result.result as { result?: { data?: { target?: string } } }).result?.data?.target).toBe("repo");
   });
 
+  it.each(["application", "connection"])("rejects catalog %s replacement after tool resolution", async (mutation) => {
+    const { company, agent, run } = await createRunFixture(db);
+    const first = await createRemoteMcpToolFixture(db, company.id);
+    await db.update(toolApplications).set({ name: "Original MCP" }).where(eq(toolApplications.id, first.application.id));
+    const replacement = await createRemoteMcpToolFixture(db, company.id);
+    await db.delete(toolCatalogEntries).where(eq(toolCatalogEntries.id, replacement.catalogEntry.id));
+    await db.insert(toolPolicies).values({ companyId: company.id, name: "Allow reads",
+      policyType: "allow", selectors: { riskLevel: "read" } });
+    const provider = vi.fn();
+    const originalPolicy = accessPolicy.toolAccessPolicyService;
+    let changed = false;
+    let armed = false;
+    const policySpy = vi.spyOn(accessPolicy, "toolAccessPolicyService").mockImplementation(policyDb => {
+      const service = originalPolicy(policyDb);
+      const decide = service.decide;
+      service.decide = async (...args) => {
+        const decision = await decide(...args);
+        if (armed && !changed) {
+          changed = true;
+          await db.update(toolCatalogEntries).set(mutation === "application"
+            ? { applicationId: replacement.application.id }
+            : { connectionId: replacement.connection.id })
+            .where(eq(toolCatalogEntries.id, first.catalogEntry.id));
+        }
+        return decision;
+      };
+      return service;
+    });
+    const gateway = createTestToolGatewayService(db, { remoteHttpRequest: provider });
+    const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+    const tool = (await gateway.listToolsForSession(session.token))
+      .find(candidate => candidate.catalogEntryId === first.catalogEntry.id)!;
+    expect(tool).toBeTruthy();
+    armed = true;
+    try {
+      await expect(gateway.executeTool({ sessionToken: session.token, tool: tool.name,
+        parameters: {} })).rejects.toMatchObject({ reasonCode: "tool_not_found" });
+      expect(changed).toBe(true);
+      expect(provider).not.toHaveBeenCalled();
+    } finally { policySpy.mockRestore(); }
+  });
+
   it("maps remote MCP elicitation to a durable issue interaction", async () => {
     const { company, agent, run } = await createRunFixture(db);
     await createRemoteMcpToolFixture(db, company.id);

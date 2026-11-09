@@ -4985,6 +4985,7 @@ export function createToolGatewayService(
   async function resolveConnectedRemoteTool(
     session: ToolGatewaySession,
     tool: ToolGatewayDescriptor,
+    admissionDb: Db = db,
   ) {
     if (
       (tool.providerType !== "mcp_remote_http" && tool.providerType !== "provider_rest") ||
@@ -4997,7 +4998,7 @@ export function createToolGatewayService(
         "tool_not_found",
       );
     }
-    const [entry] = await db
+    const [entry] = await admissionDb
       .select()
       .from(toolCatalogEntries)
       .where(
@@ -5007,14 +5008,14 @@ export function createToolGatewayService(
         ),
       )
       .limit(1);
-    if (!entry || entry.status !== "active" || entry.entryKind !== "tool") {
+    if (!entry || entry.connectionId !== tool.connectionId || entry.applicationId !== tool.applicationId || entry.status !== "active" || entry.entryKind !== "tool") {
       throw new ToolGatewayHttpError(
         404,
         `Tool "${tool.name}" not found`,
         "tool_not_found",
       );
     }
-    const [connection] = await db
+    const [connection] = await admissionDb
       .select()
       .from(toolConnections)
       .where(
@@ -5047,7 +5048,7 @@ export function createToolGatewayService(
     if (isRailwayEndpoint(connection.config.url) && isRailwayToolBlocked(entry.toolName)) {
       throw new ToolGatewayHttpError(403, "This Railway action cannot bind its effects to an approved target. Use redeploy, restart, or rollback for an existing deployment.", "railway_action_blocked");
     }
-    await assertAppRunInventory(session, entry);
+    await assertAppRunInventory(session, entry, admissionDb);
     return { entry, connection };
   }
 
@@ -5079,6 +5080,7 @@ export function createToolGatewayService(
   async function resolveConnectedLocalStdioTool(
     session: ToolGatewaySession,
     tool: ToolGatewayDescriptor,
+    admissionDb: Db = db,
   ) {
     if (
       tool.providerType !== "mcp_local_stdio" ||
@@ -5091,7 +5093,7 @@ export function createToolGatewayService(
         "tool_not_found",
       );
     }
-    const [entry] = await db
+    const [entry] = await admissionDb
       .select()
       .from(toolCatalogEntries)
       .where(
@@ -5101,14 +5103,14 @@ export function createToolGatewayService(
         ),
       )
       .limit(1);
-    if (!entry || entry.status !== "active" || entry.entryKind !== "tool") {
+    if (!entry || entry.connectionId !== tool.connectionId || entry.applicationId !== tool.applicationId || entry.status !== "active" || entry.entryKind !== "tool") {
       throw new ToolGatewayHttpError(
         404,
         `Tool "${tool.name}" not found`,
         "tool_not_found",
       );
     }
-    const [connection] = await db
+    const [connection] = await admissionDb
       .select()
       .from(toolConnections)
       .where(
@@ -5138,7 +5140,7 @@ export function createToolGatewayService(
         },
       );
     }
-    await assertAppRunInventory(session, entry);
+    await assertAppRunInventory(session, entry, admissionDb);
     return { entry, connection };
   }
 
