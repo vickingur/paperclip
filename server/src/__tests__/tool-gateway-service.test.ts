@@ -1379,7 +1379,7 @@ describeEmbeddedPostgres("tool gateway service", () => {
     } finally { bridgeSpy.mockRestore(); urlSpy.mockRestore(); }
   });
 
-  it.each(["none", "template", "grant", "connection", "rotation", "secret_disabled", "version_revoked"])("fences stdio preparation after slot acquisition: %s", async (mutation) => {
+  it.each(["none", "template", "grant", "connection", "rotation", "secret_disabled", "version_revoked", "binding"])("fences stdio preparation after slot acquisition: %s", async (mutation) => {
     const { company, agent, run } = await createRunFixture(db);
     const fixture = await createRemoteMcpToolFixture(db, company.id);
     await db.update(toolApplications).set({type:"mcp_stdio"}).where(eq(toolApplications.id,fixture.application.id));
@@ -1412,6 +1412,7 @@ describeEmbeddedPostgres("tool gateway service", () => {
         if(mutation === "template") await db.update(toolStdioCommandTemplates).set({args:["-e","process.exit(88)"]}).where(eq(toolStdioCommandTemplates.id,template.id));
         if(mutation === "grant") await db.update(connectionGrants).set({status:"revoked"}).where(eq(connectionGrants.connectionId,fixture.connection.id));
         if(mutation === "connection") await db.update(toolConnections).set({config:{templateId:"changed"}}).where(eq(toolConnections.id,fixture.connection.id));
+        if (mutation === "binding") await db.delete(companySecretBindings).where(eq(companySecretBindings.secretId, credential.id));
         if (mutation === "rotation") await secretService(db).rotate(credential.id, { value: "rotated-synthetic-token" });
         if (mutation === "secret_disabled") await db.update(companySecrets).set({ status: "disabled" }).where(eq(companySecrets.id, credential.id));
         if (mutation === "version_revoked") await db.update(companySecretVersions).set({ revokedAt: new Date() }).where(eq(companySecretVersions.secretId, credential.id));
@@ -1425,11 +1426,58 @@ describeEmbeddedPostgres("tool gateway service", () => {
       const tool = (await gateway.listToolsForSession(session.token)).find(t=>t.catalogEntryId===fixture.catalogEntry.id)!;
       const call = gateway.executeTool({sessionToken:session.token,tool:tool.name,parameters:{}});
       if(mutation === "none") await expect(call).resolves.toMatchObject({status:"completed"});
-      else await expect(call).rejects.toMatchObject({reasonCode:["template", "rotation", "secret_disabled", "version_revoked"].includes(mutation) ? "app_preparation_stale" : mutation === "connection" ? "local_stdio_template_invalid" : "organization_authorization_required"});
+      else await expect(call).rejects.toMatchObject({reasonCode:["template", "rotation", "secret_disabled", "version_revoked", "binding"].includes(mutation) ? "app_preparation_stale" : mutation === "connection" ? "local_stdio_template_invalid" : "organization_authorization_required"});
     } finally { slotSpy.mockRestore(); }
   });
 
-  it.each(["none", "connection", "grant", "application", "rotation", "secret_disabled", "version_revoked"])("fences prepared HTTP metadata after MCP initialization: %s", async (mutation) => {
+  it.each(["none", "expiry", "claim", "signature", "arguments", "invocation", "confirmation", "issue"])("revalidates approved stdio app after slot acquisition: %s", async (mutation) => {
+    const { company, agent, run, issue } = await createRunFixture(db);
+    const fixture = await createRemoteMcpToolFixture(db, company.id);
+    await db.update(toolApplications).set({type:"mcp_stdio"}).where(eq(toolApplications.id,fixture.application.id));
+    const templateKey = `test.${randomUUID()}`;
+    const script = `const rl = require("node:readline").createInterface({input:process.stdin});
+      rl.on("line", line => { const m=JSON.parse(line); if(!m.id)return;
+      const result=m.method==="initialize" ? {protocolVersion:"2024-11-05",capabilities:{},serverInfo:{name:"fixture",version:"1"}} : {content:[{type:"text",text:"ok"}]};
+      process.stdout.write(JSON.stringify({jsonrpc:"2.0",id:m.id,result})+"\\n"); });`;
+    const [template] = await db.insert(toolStdioCommandTemplates).values({companyId:company.id,
+      templateKey, name:"Synthetic stdio", command:process.execPath, args:["-e",script], envKeys:[], tools:[], status:"active"}).returning();
+    await db.update(toolConnections).set({transport:"local_stdio", config:{templateId:templateKey}})
+      .where(eq(toolConnections.id,fixture.connection.id));
+    await db.insert(toolPolicies).values({companyId:company.id,name:"Review app calls",policyType:"require_approval",selectors:{riskLevel:"read"}});
+    let actionRequest: typeof toolActionRequests.$inferSelect;
+    const original = runtimeSlots.createToolRuntimeSupervisor;
+    const slotSpy = vi.spyOn(runtimeSlots,"createToolRuntimeSupervisor").mockImplementation((...args) => {
+      const supervisor = original(...args);
+      const useSlot = supervisor.useConnectionSlot;
+      supervisor.useConnectionSlot = (input, callback) => useSlot(input, async handle => {
+        if (mutation === "expiry") await db.update(toolActionRequests).set({ expiresAt: new Date(0) }).where(eq(toolActionRequests.id, actionRequest.id));
+        if (mutation === "claim") await db.update(toolActionRequests).set({ updatedAt: new Date(0) }).where(eq(toolActionRequests.id, actionRequest.id));
+        if (mutation === "signature") await db.update(toolActionRequests).set({ signedArguments: "tampered" }).where(eq(toolActionRequests.id, actionRequest.id));
+        if (mutation === "arguments") await db.update(toolActionRequests).set({ canonicalArgumentsHash: "tampered" }).where(eq(toolActionRequests.id, actionRequest.id));
+        if (mutation === "invocation") await db.update(toolInvocations).set({ toolName: "fixture:other" }).where(eq(toolInvocations.id, actionRequest.invocationId));
+        if (mutation === "confirmation") await db.update(issueThreadInteractions).set({ status: "rejected" }).where(eq(issueThreadInteractions.id, actionRequest.interactionId!));
+        if (mutation === "issue") await db.update(issues).set({ status: "done" }).where(eq(issues.id, issue.id));
+        return callback(handle);
+      });
+      return supervisor;
+    });
+    try {
+      const gateway = createTestToolGatewayService(db);
+      const session = await gateway.createSession({companyId:company.id,agentId:agent.id,runId:run.id});
+      const tool = (await gateway.listToolsForSession(session.token)).find(t=>t.catalogEntryId===fixture.catalogEntry.id)!;
+      await expect(gateway.executeTool({sessionToken:session.token,tool:tool.name,parameters:{}}))
+        .rejects.toMatchObject({reasonCode:"approval_required"});
+      [actionRequest] = await db.select().from(toolActionRequests);
+      await commitToolActionReview(db, {companyId:company.id,actionRequestId:actionRequest.id,
+        decision:"approved",actor:{userId:"reviewer"}});
+      const call = gateway.executeTool({sessionToken:session.token,tool:tool.name,
+        approvedActionRequestId:actionRequest.id,parameters:{}});
+      if(mutation === "none") await expect(call).resolves.toMatchObject({status:"completed"});
+      else await expect(call).rejects.toMatchObject({reasonCode:["confirmation", "issue"].includes(mutation) ? "action_scope_mismatch" : "action_claim_stale"});
+    } finally { slotSpy.mockRestore(); }
+  });
+
+  it.each(["none", "connection", "grant", "application", "rotation", "secret_disabled", "version_revoked", "binding"])("fences prepared HTTP metadata after MCP initialization: %s", async (mutation) => {
     const { company, agent, run } = await createRunFixture(db);
     const fixture = await createRemoteMcpToolFixture(db, company.id);
     await db.update(toolConnections).set({ config: { url: "https://8.8.8.8/mcp", mcpSessionRequired: true } })
@@ -1460,6 +1508,7 @@ describeEmbeddedPostgres("tool gateway service", () => {
         if (mutation === "grant") await db.update(connectionGrants)
           .set({ credentialSecretRefs: [{ configPath: "token", secretId: randomUUID(), versionSelector: "latest" }] })
           .where(eq(connectionGrants.connectionId, fixture.connection.id));
+        if (mutation === "binding") await db.delete(companySecretBindings).where(eq(companySecretBindings.secretId, credential.id));
         if (mutation === "rotation") await secretService(db).rotate(credential.id, { value: "rotated-synthetic-token" });
         if (mutation === "secret_disabled") await db.update(companySecrets).set({ status: "disabled" }).where(eq(companySecrets.id, credential.id));
         if (mutation === "version_revoked") await db.update(companySecretVersions).set({ revokedAt: new Date() }).where(eq(companySecretVersions.secretId, credential.id));
@@ -1480,6 +1529,53 @@ describeEmbeddedPostgres("tool gateway service", () => {
       expect(methods).toEqual(["initialize", "notifications/initialized", "tools/call"]);
     } else {
       await expect(call).rejects.toMatchObject({ reasonCode: mutation === "application" ? "application_disabled" : "app_preparation_stale" });
+      expect(methods).toEqual(["initialize"]);
+    }
+  });
+
+  it.each(["none", "expiry", "claim", "signature", "arguments", "invocation", "confirmation", "issue"])("revalidates approved HTTP app after MCP initialization: %s", async (mutation) => {
+    const { company, agent, run } = await createRunFixture(db);
+    const fixture = await createRemoteMcpToolFixture(db, company.id);
+    await db.update(toolConnections).set({ config: { url: "https://8.8.8.8/mcp", mcpSessionRequired: true } })
+      .where(eq(toolConnections.id, fixture.connection.id));
+    await db.insert(toolPolicies).values({ companyId: company.id, name: "Review app calls",
+      policyType: "require_approval", selectors: { riskLevel: "read" } });
+    let actionRequest: typeof toolActionRequests.$inferSelect;
+    const methods: string[] = [];
+    const gateway = createTestToolGatewayService(db, { remoteHttpRequest: async (_url, init) => {
+      const payload = JSON.parse(String(init.body));
+      methods.push(payload.method);
+      if (payload.method === "initialize") {
+        // This write must finish while the provider promise is pending: admission
+        // locks are released at entry, rather than held for provider completion.
+        if (mutation === "expiry") await db.update(toolActionRequests).set({ expiresAt: new Date(0) }).where(eq(toolActionRequests.id, actionRequest.id));
+        if (mutation === "claim") await db.update(toolActionRequests).set({ updatedAt: new Date(0) }).where(eq(toolActionRequests.id, actionRequest.id));
+        if (mutation === "signature") await db.update(toolActionRequests).set({ signedArguments: "tampered" }).where(eq(toolActionRequests.id, actionRequest.id));
+        if (mutation === "arguments") await db.update(toolActionRequests).set({ canonicalArgumentsHash: "tampered" }).where(eq(toolActionRequests.id, actionRequest.id));
+        if (mutation === "invocation") await db.update(toolInvocations).set({ toolName: "fixture:other" }).where(eq(toolInvocations.id, actionRequest.invocationId));
+        if (mutation === "confirmation") await db.update(issueThreadInteractions).set({ status: "rejected" }).where(eq(issueThreadInteractions.id, actionRequest.interactionId!));
+        if (mutation === "issue") await db.update(issues).set({ status: "done" }).where(eq(issues.id, session.issueId!));
+        return Response.json({ jsonrpc: "2.0", id: payload.id, result: {
+          protocolVersion: "2025-06-18", capabilities: { tools: {} }, serverInfo: { name: "fixture", version: "1" },
+        } }, { headers: { "mcp-session-id": randomUUID() } });
+      }
+      if (payload.method === "notifications/initialized") return new Response(null, { status: 202 });
+      return Response.json({ jsonrpc: "2.0", id: payload.id, result: { content: [{ type: "text", text: "ok" }] } });
+    } });
+    const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+    const tool = (await gateway.listToolsForSession(session.token)).find(t => t.catalogEntryId === fixture.catalogEntry.id)!;
+    await expect(gateway.executeTool({ sessionToken: session.token, tool: tool.name, parameters: {} }))
+      .rejects.toMatchObject({ reasonCode: "approval_required" });
+    [actionRequest] = await db.select().from(toolActionRequests);
+    await commitToolActionReview(db, { companyId: company.id, actionRequestId: actionRequest.id,
+      decision: "approved", actor: { userId: "reviewer" } });
+    const call = gateway.executeTool({ sessionToken: session.token, tool: tool.name,
+      approvedActionRequestId: actionRequest.id, parameters: {} });
+    if (mutation === "none") {
+      await expect(call).resolves.toMatchObject({ status: "completed" });
+      expect(methods).toEqual(["initialize", "notifications/initialized", "tools/call"]);
+    } else {
+      await expect(call).rejects.toMatchObject({ reasonCode: ["confirmation", "issue"].includes(mutation) ? "action_scope_mismatch" : "action_claim_stale" });
       expect(methods).toEqual(["initialize"]);
     }
   });

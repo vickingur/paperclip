@@ -44,6 +44,7 @@ import {
   companies,
   companyMemberships,
   companySecrets,
+  companySecretBindings,
   companySecretVersions,
   connectionGrantMembers,
   connectionGrantDelegations,
@@ -1366,7 +1367,7 @@ export function createToolGatewayService(
         ${toolActionRequests}, ${toolInvocations}, ${issueThreadInteractions}, ${approvals},
         ${connectionGrants}, ${connectionGrantMembers}, ${connectionGrantDelegations},
         ${companyMemberships}, ${toolStdioCommandTemplates},
-        ${companySecrets}, ${companySecretVersions} IN SHARE MODE`);
+        ${companySecrets}, ${companySecretVersions}, ${companySecretBindings} IN SHARE MODE`);
       const admissionDb = tx as unknown as Db;
       const [run] = await admissionDb.select().from(heartbeatRuns).where(and(
         eq(heartbeatRuns.id, session.runId!), eq(heartbeatRuns.companyId, session.companyId),
@@ -4469,7 +4470,18 @@ export function createToolGatewayService(
       providerVersionRef: companySecretVersions.providerVersionRef,
     }).from(companySecretVersions).where(inArray(companySecretVersions.secretId, secretRows.map(row => row.id)))
       .orderBy(asc(companySecretVersions.secretId), asc(companySecretVersions.version));
-    return stableHash(JSON.parse(JSON.stringify({ secretRows, versions })));
+    const bindings = await admissionDb.select({
+      id: companySecretBindings.id, secretId: companySecretBindings.secretId,
+      configPath: companySecretBindings.configPath, versionSelector: companySecretBindings.versionSelector,
+      required: companySecretBindings.required, projectionClass: companySecretBindings.projectionClass,
+      projectionAllowlistKey: companySecretBindings.projectionAllowlistKey,
+    }).from(companySecretBindings).where(and(
+      eq(companySecretBindings.companyId, connection.companyId),
+      eq(companySecretBindings.targetType, "tool_connection"),
+      eq(companySecretBindings.targetId, connection.id),
+      inArray(companySecretBindings.secretId, ids),
+    )).orderBy(asc(companySecretBindings.id));
+    return stableHash(JSON.parse(JSON.stringify({ secretRows, versions, bindings })));
   }
 
   function credentialVersionRefHash(value: Record<string, unknown>): string {
