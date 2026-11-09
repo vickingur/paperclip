@@ -1,3 +1,4 @@
+import * as browserUse from "../services/browser-use.js";
 import * as cognee from "../services/cognee-connection.js";
 import * as runtimeSlots from "../services/tool-runtime-supervisor.js";
 import * as accessPolicy from "../services/tool-access-policy.js";
@@ -1309,6 +1310,41 @@ describeEmbeddedPostgres("tool gateway service", () => {
       expect(changed).toBe(true);
       expect(provider).not.toHaveBeenCalled();
     } finally { policySpy.mockRestore(); }
+  });
+
+  it.each(["none", "connection", "grant"])("fences every Browser Use request: %s", async (mutation) => {
+    const { company, agent, run } = await createRunFixture(db);
+    const fixture = await createRemoteMcpToolFixture(db, company.id);
+    await db.update(toolApplications).set({ type: "rest_api" }).where(eq(toolApplications.id, fixture.application.id));
+    await db.update(toolConnections).set({ transport: "rest_api", config: { sourceTemplateKey: "browser-use-cloud" } })
+      .where(eq(toolConnections.id, fixture.connection.id));
+    await db.insert(toolPolicies).values({ companyId: company.id, name: "Allow reads", policyType: "allow", selectors: { riskLevel: "read" } });
+    const original = browserUse.browserUseService;
+    const bridgeSpy = vi.spyOn(browserUse, "browserUseService").mockImplementation((serviceDb, request, ...rest) => {
+      const service = original(serviceDb, request, ...rest);
+      service.execute = async () => {
+        await request!("https://api.browser-use.com/api/v2/sessions", { method: "POST" });
+        await request!("https://api.browser-use.com/api/v2/tasks", { method: "POST" });
+        return {} as never;
+      };
+      return service;
+    });
+    let calls = 0;
+    const gateway = createTestToolGatewayService(db, { remoteHttpRequest: async () => {
+      calls++;
+      if (calls === 1 && mutation === "connection") await db.update(toolConnections).set({ name: "Changed browser connection" }).where(eq(toolConnections.id, fixture.connection.id));
+      if (calls === 1 && mutation === "grant") await db.update(connectionGrants).set({ status: "revoked" }).where(eq(connectionGrants.connectionId, fixture.connection.id));
+      return new Response("{}");
+    } });
+    try {
+      const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+      const tool = (await gateway.listToolsForSession(session.token)).find(t => t.catalogEntryId === fixture.catalogEntry.id)!;
+      expect(tool).toBeTruthy();
+      const call = gateway.executeTool({ sessionToken: session.token, tool: tool.name, parameters: {} });
+      if (mutation === "none") await expect(call).resolves.toMatchObject({ status: "completed" });
+      else await expect(call).rejects.toMatchObject({ reasonCode: mutation === "grant" ? "organization_authorization_required" : "app_preparation_stale" });
+      expect(calls).toBe(mutation === "none" ? 2 : 1);
+    } finally { bridgeSpy.mockRestore(); }
   });
 
   it.each(["none", "connection", "grant"])("fences every bundled Cognee request: %s", async (mutation) => {

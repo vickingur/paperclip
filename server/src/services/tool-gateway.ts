@@ -6218,8 +6218,26 @@ export function createToolGatewayService(
       ms = railwayCommandBudgetMs(parameters);
     }
     const grant = await resolveConnectionGrant(session, connection);
+    const admit = <T>(enter: () => Promise<T>): Promise<T> => {
+      if (!session.agentId || !session.runId) return enter();
+      return dispatchUnderAdmission(session, tool, parameters, enter, async (admissionDb) => {
+        const current = await resolveConnectedRemoteTool(session, tool, admissionDb);
+        const currentGrant = await resolveConnectionGrant(session, current.connection, false, admissionDb);
+        // JSON serialization retains timestamp values (stableSerialize alone
+        // treats Date objects as empty objects).
+        const preparedHash = (value: unknown) => stableHash(JSON.parse(JSON.stringify(value)));
+        if (preparedHash(current.entry) !== preparedHash(entry) ||
+            preparedHash(current.connection) !== preparedHash(connection) ||
+            preparedHash(currentGrant) !== preparedHash(grant)) {
+          throw new ToolGatewayHttpError(409, "Prepared connection changed before dispatch", "app_preparation_stale");
+        }
+      }, approvedClaim);
+    };
     if (isBrowserUseConnection(connection)) {
-      const data = await browserUseService(db, options.remoteHttpRequest).execute(session, grant, invocationId!, entry.toolName, parameters);
+      const request = (target: string, init: RequestInit) => admit(() => options.remoteHttpRequest
+        ? options.remoteHttpRequest(target, init)
+        : guardedRemoteHttpFetch(target, init, remoteHttpFetchOptions()));
+      const data = await browserUseService(db, request).execute(session, grant, invocationId!, entry.toolName, parameters);
       return { result: { content: JSON.stringify(data), data: { structuredContent: data, transport: "rest_api" } } };
     }
     const endpoint = await resolvedRemoteEndpoint(session, connection, grant);
@@ -6268,22 +6286,7 @@ export function createToolGatewayService(
               // letting the tighter default cut a legitimately slow tool short.
               responseTimeoutMs: ms,
             });
-        // Interactive calls have no run-owned assignment. Autonomous calls
-        // must revalidate the exact prepared metadata at every HTTP entry,
-        // including tools/call after an asynchronous MCP initialization.
-        if (!session.agentId || !session.runId) return enter();
-        return dispatchUnderAdmission(session, tool, parameters, enter, async (admissionDb) => {
-          const current = await resolveConnectedRemoteTool(session, tool, admissionDb);
-          const currentGrant = await resolveConnectionGrant(session, current.connection, false, admissionDb);
-          // JSON serialization retains timestamp values (stableSerialize alone
-          // treats Date objects as empty objects).
-          const preparedHash = (value: unknown) => stableHash(JSON.parse(JSON.stringify(value)));
-          if (preparedHash(current.entry) !== preparedHash(entry) ||
-              preparedHash(current.connection) !== preparedHash(connection) ||
-              preparedHash(currentGrant) !== preparedHash(grant)) {
-            throw new ToolGatewayHttpError(409, "Prepared connection changed before dispatch", "app_preparation_stale");
-          }
-        }, approvedClaim);
+        return admit(enter);
       };
       const requireExplicitRetryAfterOAuthRefresh = async (refreshedResponse: Response): Promise<never> => {
         // The provider rejected this dispatch, but automatic replay is unsafe:
