@@ -25,6 +25,7 @@ import {
 import { resolvePaperclipInstanceRoot } from "../../home-paths.js";
 import { agentInstructionsService, agentInstructionsBundleMode } from "../agent-instructions.js";
 import { agentInstructionRevisionService } from "../agent-instruction-revisions.js";
+import { captureToolAssignmentInventory } from "./plugin-assignment-inventory.js";
 import { toolAccessService } from "../tool-access.js";
 import { filterResolvedGitHubConnectionsForRun } from "../git-credentials.js";
 
@@ -185,7 +186,7 @@ async function materializeSelectedSkills(runtimeConfig: Record<string, unknown>,
   }));
 }
 
-export async function resolveNativeRuntimeMcpSnapshot(input: { db: Db; agent: Pick<RuntimeAgent, "id" | "companyId">; runId: string }) {
+export async function resolveNativeRuntimeAppAssignment(input: { db: Db; agent: Pick<RuntimeAgent, "id" | "companyId">; runId: string }) {
   const effective = await toolAccessService(input.db).getEffectiveProfilesForAgent(input.agent.companyId, input.agent.id);
   const permitted = new Set([...effective.entries.filter((entry) => entry.effect === "include" && entry.connectionId).map((entry) => entry.connectionId!), ...effective.allowedTools.map((tool) => tool.connectionId)]);
   const hasGitHubConnection = effective.installedConnections.some((connection) => {
@@ -240,6 +241,18 @@ export async function resolveNativeRuntimeMcpSnapshot(input: { db: Db; agent: Pi
       .map((tool) => tool.id)
       .sort(),
   };
+  return assignment;
+}
+
+/** Capture the immutable ceiling; this does not authorize gateway exposure. */
+export async function captureNativeRuntimeToolAssignment(input: { db: Db; agent: Pick<RuntimeAgent, "id" | "companyId">; runId: string }) {
+  return captureToolAssignmentInventory(input.db, {
+    companyId: input.agent.companyId, agentId: input.agent.id, runId: input.runId,
+  }, () => resolveNativeRuntimeAppAssignment(input));
+}
+
+export async function resolveNativeRuntimeMcpSnapshot(input: { db: Db; agent: Pick<RuntimeAgent, "id" | "companyId">; runId: string }) {
+  const assignment = await resolveNativeRuntimeAppAssignment(input);
   const assignmentDigest = sha256(JSON.stringify(assignment));
   return { assignmentSetId: `sha256:${assignmentDigest}`, digest: assignmentDigest, bindingId: assignment.connections.length ? `native-mcp:${input.runId}` : null };
 }

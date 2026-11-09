@@ -9,12 +9,15 @@ import {
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const serviceMocks = vi.hoisted(() => ({
+  captureToolAssignmentInventory: vi.fn(),
   exportFiles: vi.fn(),
   readCommittedForRuntime: vi.fn(),
   getEffectiveProfilesForAgent: vi.fn(),
   githubBotConnectionIdsForRun: vi.fn(),
   spekoToolsForSession: vi.fn(),
 }));
+
+vi.mock("./plugin-assignment-inventory.js", () => ({ captureToolAssignmentInventory: serviceMocks.captureToolAssignmentInventory }));
 
 vi.mock("../voice/speko-agent-tools.js", () => ({ spekoToolsForSession: serviceMocks.spekoToolsForSession }));
 vi.mock("../chat-github-tools.js", () => ({
@@ -37,7 +40,7 @@ vi.mock("../tool-access.js", () => ({
 }));
 
 import { createHash } from "node:crypto";
-import { buildNativeRuntimeContext, resolveNativeRuntimeMcpSnapshot } from "./runtime-context.js";
+import { buildNativeRuntimeContext, captureNativeRuntimeToolAssignment, resolveNativeRuntimeMcpSnapshot } from "./runtime-context.js";
 
 const temporaryRoots: string[] = [];
 let previousPaperclipHome: string | undefined;
@@ -419,4 +422,21 @@ it("pins a voice tool only when the current requester can call through that assi
   serviceMocks.spekoToolsForSession.mockResolvedValue([{ connectionId: "voice-connection" }]);
   expect((await resolveNativeRuntimeMcpSnapshot(input)).bindingId).toBe("native-mcp:run-1");
   expect(serviceMocks.spekoToolsForSession).toHaveBeenLastCalledWith(db, { companyId: "company-1", agentId: "agent-1", runId: "run-1", issueId: "task-1", identityContextId: "identity-1" });
+});
+
+ it("captures apps using authoritative run selection only when the persistence layer requests it", async () => {
+  const db = {} as Db;
+  const pin = { assignment: { version: 2, connections: [], tools: [], plugins: [] }, digest: "stored" };
+  serviceMocks.captureToolAssignmentInventory.mockImplementationOnce(async (database, binding, resolveApps) => {
+    expect(database).toBe(db);
+    expect(binding).toEqual({ companyId: "company-1", agentId: "agent-1", runId: "run-1" });
+    expect(await resolveApps()).toEqual({ version: 1, agentId: "agent-1", connections: ["connection-1"], tools: ["tool-1"] });
+    return pin;
+  });
+  const input = { db, agent: { id: "agent-1", companyId: "company-1" }, runId: "run-1" };
+  expect(await captureNativeRuntimeToolAssignment(input)).toBe(pin);
+  serviceMocks.getEffectiveProfilesForAgent.mockClear();
+  serviceMocks.captureToolAssignmentInventory.mockResolvedValueOnce(pin);
+  expect(await captureNativeRuntimeToolAssignment(input)).toBe(pin);
+  expect(serviceMocks.getEffectiveProfilesForAgent).not.toHaveBeenCalled();
 });
