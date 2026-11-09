@@ -245,6 +245,50 @@ describe("assigned MCP runner tools", () => {
     await expect(assigned.execute({ tool: assigned.definitions()[0]!.name as string, arguments: {} })).rejects.toBe(error);
   });
 
+  it.each([
+    ["schema", { parametersSchema: { type: "object", required: ["changed"] } }],
+    ["provider", { pluginId: "replacement" }],
+    ["risk", { risk: "write" }],
+    ["route", { connectionId: "replacement" }],
+    ["approval", { description: "Approval is now required" }],
+  ])("withholds %s drift from search, schema retrieval and direct/wrapped execution", async (_kind, change) => {
+    const f = fixture([descriptor("recall")]);
+    const assigned = await createAssignedMcpTools(f);
+    const name = assigned.definitions()[0]!.name as string;
+    f.listToolsForNamedGateway.mockResolvedValue([{ ...descriptor("recall"), ...change }]);
+    await expect(assigned.execute({ tool: searchName, arguments: { query: "" } })).resolves.toEqual({ tools: [], nextOffset: null });
+    await expect(assigned.execute({ tool: searchName, arguments: { query: "", schemaTool: name } })).rejects.toThrow("assigned_mcp_tool_unknown");
+    await expect(assigned.execute({ tool: name, arguments: {} })).rejects.toThrow("assigned_mcp_tool_stale");
+    await expect(assigned.execute({ tool: callName, arguments: { name, arguments: {} } })).rejects.toThrow("assigned_mcp_tool_stale");
+    expect(f.executeTool).not.toHaveBeenCalled();
+  });
+
+  it("rejects committed revocation after search and permits unchanged regrant", async () => {
+    const f = fixture([descriptor("recall")]);
+    const assigned = await createAssignedMcpTools(f);
+    const name = assigned.definitions()[0]!.name as string;
+    await assigned.execute({ tool: searchName, arguments: { query: "" } });
+    f.listToolsForNamedGateway.mockResolvedValue([]);
+    await expect(assigned.execute({ tool: name, arguments: {} })).rejects.toThrow("assigned_mcp_tool_stale");
+    expect(f.executeTool).not.toHaveBeenCalled();
+    f.listToolsForNamedGateway.mockResolvedValue([descriptor("recall")]);
+    await assigned.execute({ tool: name, arguments: {} });
+    expect(f.executeTool).toHaveBeenCalledTimes(1);
+  });
+
+  it("clones the pinned descriptor and fails closed on ambiguous fresh names", async () => {
+    const original = descriptor("recall");
+    const f = fixture([original]);
+    const assigned = await createAssignedMcpTools(f);
+    const name = assigned.definitions()[0]!.name as string;
+    original.description = "mutated";
+    expect(assigned.definitions()[0]!.description).not.toContain("mutated");
+    await expect(assigned.execute({ tool: name, arguments: {} })).rejects.toThrow("assigned_mcp_tool_stale");
+    f.listToolsForNamedGateway.mockResolvedValue([descriptor("recall"), descriptor("recall")]);
+    await expect(assigned.execute({ tool: name, arguments: {} })).rejects.toThrow("assigned_mcp_tool_name_collision");
+    expect(f.executeTool).not.toHaveBeenCalled();
+  });
+
   it("propagates discovery denial", async () => {
     const f = fixture([]);
     const error = new Error("gateway_token_revoked");
