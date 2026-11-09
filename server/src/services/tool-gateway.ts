@@ -9021,6 +9021,40 @@ export function createToolGatewayService(
       return tools;
     },
 
+    /** Server-owned run context; never accept issue/project selectors from the caller. */
+    async listPluginToolsForRun(input: {
+      companyId: string;
+      agentId: string;
+      runId: string;
+    }): Promise<Array<AgentToolDescriptor & { annotations?: Record<string, unknown> }>> {
+      await assertAgentInCompany(input.companyId, input.agentId);
+      const context = await resolveRunContext(input);
+      if (!pluginToolDispatcher) {
+        throw new ToolGatewayHttpError(503, "Native plugin discovery is unavailable", "plugin_discovery_unavailable");
+      }
+      try {
+        const decisions = await decideToolsForListing(pluginTools(), (tool) =>
+          policyInputForAgentTool({
+            companyId: input.companyId, agentId: input.agentId,
+            heartbeatRunId: input.runId, issueId: context.issueId,
+            projectId: context.projectId, tool,
+          }),
+        );
+        return decisions
+          .filter(({ decision }) => decision.allowed || decision.decision === "require_approval")
+          .map(({ tool, decision }) => {
+            const { providerType: _providerType, risk: _risk, ...descriptor } = tool;
+            return decision.decision === "require_approval"
+              ? { ...descriptor, annotations: { requiresApproval: true }, description: [descriptor.description?.trim(), TOOL_APPROVAL_DESCRIPTION_SUFFIX].filter(Boolean).join(" ") }
+              : descriptor;
+          });
+      } catch {
+        // Discovery failures can contain private plugin/provider diagnostics.
+        // Never turn them into an empty successful catalog or expose raw text.
+        throw new ToolGatewayHttpError(503, "Native plugin discovery failed", "plugin_discovery_failed");
+      }
+    },
+
     async listPluginToolsForAgent(input: {
       companyId: string;
       agentId: string;

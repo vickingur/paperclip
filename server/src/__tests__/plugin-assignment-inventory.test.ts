@@ -1,0 +1,48 @@
+import { describe, expect, it, vi } from "vitest";
+import { randomUUID } from "node:crypto";
+import { agents, companies, createDb, heartbeatRuns, toolProfiles, toolProfileBindings, toolProfileEntries, toolPolicies } from "@paperclipai/db";
+import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
+import { createToolGatewayService } from "../services/tool-gateway.js";
+import { registerAssignedMcpGateway } from "../services/native-runtime/assigned-mcp-tools.js";
+import { resolvePluginAssignmentInventory } from "../services/native-runtime/plugin-assignment-inventory.js";
+import type { PluginToolDispatcher } from "../services/plugin-tool-dispatcher.js";
+const support = await getEmbeddedPostgresTestSupport();
+(support.supported ? describe : describe.skip)("configured run-scoped native plugin capture", () => {
+  it("captures six exact grants without connections and rejects wrong scope, inactive runs and missing configuration", async () => {
+    const temp = await startEmbeddedPostgresTestDatabase("vik906-inventory-");
+    const db = createDb(temp.connectionString);
+    try {
+      const [company] = await db.insert(companies).values({ name: "Synthetic inventory", issuePrefix: "S906" }).returning();
+      const [agent] = await db.insert(agents).values({ companyId: company!.id, name: "Synthetic engineer", role: "engineer", adapterType: "codex_local" }).returning();
+      const [other] = await db.insert(agents).values({ companyId: company!.id, name: "Other engineer", role: "engineer", adapterType: "codex_local" }).returning();
+      const [run] = await db.insert(heartbeatRuns).values({ companyId: company!.id, agentId: agent!.id, status: "running", contextSnapshot: {} }).returning();
+      const [inactive] = await db.insert(heartbeatRuns).values({ companyId: company!.id, agentId: agent!.id, status: "succeeded", contextSnapshot: {} }).returning();
+      const names = ["reconcile", "job_list", "job_log", "job_status", "ledger", "asset_put"].map(n => `synthetic.pipeline:${n}`);
+      const [profile] = await db.insert(toolProfiles).values({ companyId: company!.id, profileKey: `capture-${randomUUID()}`, name: "Existing exact grants", defaultAction: "deny" }).returning();
+      await db.insert(toolProfileBindings).values({ companyId: company!.id, profileId: profile!.id, targetType: "agent", targetId: agent!.id });
+      await db.insert(toolProfileEntries).values(names.map(toolName => ({ companyId: company!.id, profileId: profile!.id, selectorType: "tool_name" as const, effect: "include" as const, toolName })));
+      const binding = { companyId: company!.id, agentId: agent!.id, runId: run!.id };
+      await expect(resolvePluginAssignmentInventory(db, binding)).rejects.toThrow("assigned_mcp_gateway_unavailable");
+      const executeTool = vi.fn();
+      const dispatcher = { listToolsForAgent: () => [...names, "synthetic.pipeline:ungranted"].map(name => ({ name, displayName: name, description: "Synthetic", parametersSchema: { type: "object" }, pluginId: "synthetic-registration" })), executeTool } as unknown as PluginToolDispatcher;
+      registerAssignedMcpGateway(db, createToolGatewayService(db, { pluginToolDispatcher: dispatcher }));
+      const captured = await resolvePluginAssignmentInventory(db, binding);
+      expect(captured.assignment.plugins.map(t => t.name)).toEqual([...names].sort());
+      expect(captured.assignment.connections).toEqual([]);
+      expect(captured.digest).toMatch(/^[a-f0-9]{64}$/);
+      await expect(resolvePluginAssignmentInventory(db, { ...binding, agentId: other!.id })).rejects.toThrow("Run does not belong to agent");
+      await expect(resolvePluginAssignmentInventory(db, { ...binding, companyId: randomUUID() })).rejects.toThrow();
+      await expect(resolvePluginAssignmentInventory(db, { ...binding, runId: inactive!.id })).rejects.toThrow("Run is not active");
+      await db.insert(toolPolicies).values({ companyId: company!.id, name: "Synthetic approval", policyType: "require_approval", selectors: { toolName: names[0] } }).returning();
+      const approvalCapture = await resolvePluginAssignmentInventory(db, binding);
+      expect(approvalCapture.digest).not.toBe(captured.digest);
+      const approvedDescriptor = (await createToolGatewayService(db, { pluginToolDispatcher: dispatcher }).listPluginToolsForRun(binding)).find(t => t.name === names[0]);
+      expect(approvedDescriptor?.annotations).toEqual({ requiresApproval: true });
+      registerAssignedMcpGateway(db, createToolGatewayService(db, { pluginToolDispatcher: { ...dispatcher, listToolsForAgent() { throw new Error("synthetic-private-error"); } } }));
+      await expect(resolvePluginAssignmentInventory(db, binding)).rejects.toThrow("Native plugin discovery failed");
+      registerAssignedMcpGateway(db, createToolGatewayService(db));
+      await expect(resolvePluginAssignmentInventory(db, binding)).rejects.toThrow("Native plugin discovery is unavailable");
+      expect(executeTool).not.toHaveBeenCalled();
+    } finally { await temp.cleanup(); }
+  }, 60000);
+});
