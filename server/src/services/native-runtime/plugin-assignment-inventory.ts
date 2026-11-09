@@ -1,7 +1,7 @@
 import { heartbeatRuns, type Db } from "@paperclipai/db";
 import { and, eq } from "drizzle-orm";
 import { getAssignedMcpGateway } from "./assigned-mcp-tools.js";
-import { createPinnedToolAssignment, pinnedToolAssignmentDigest } from "./pinned-tool-assignment.js";
+import { createPinnedToolAssignment, intersectPinnedPluginTools, pinnedToolAssignmentDigest } from "./pinned-tool-assignment.js";
 
 /**
  * Capture through the configured server gateway, including authoritative run
@@ -135,4 +135,16 @@ export async function readToolAssignmentInventory(
   const captured = parseStoredPluginInventory(stored, false);
   if (captured.digest !== expectedAssignmentDigest) throw new Error("native_assignment_digest_mismatch");
   return captured;
+}
+
+/** Fresh discovery intersection only; dispatch must independently admit each call. */
+export async function resolvePinnedPluginToolsForRun(
+  db: Db,
+  binding: { companyId: string; agentId: string; runId: string },
+  expectedAssignmentDigest: string,
+) {
+  // Validate ownership and the expected immutable ceiling before consulting policy.
+  const captured = await readToolAssignmentInventory(db, binding, expectedAssignmentDigest);
+  const current = await getAssignedMcpGateway(db).listPluginToolsForRun(binding);
+  return intersectPinnedPluginTools(captured.assignment, current);
 }

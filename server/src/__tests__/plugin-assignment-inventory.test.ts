@@ -1,11 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { randomUUID } from "node:crypto";
 import { agents, companies, createDb, heartbeatRuns, toolProfiles, toolProfileBindings, toolProfileEntries, toolPolicies } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { createToolGatewayService } from "../services/tool-gateway.js";
 import { registerAssignedMcpGateway } from "../services/native-runtime/assigned-mcp-tools.js";
-import { readToolAssignmentInventory, captureToolAssignmentInventory, capturePluginAssignmentInventory, resolvePluginAssignmentInventory } from "../services/native-runtime/plugin-assignment-inventory.js";
+import { resolvePinnedPluginToolsForRun, readToolAssignmentInventory, captureToolAssignmentInventory, capturePluginAssignmentInventory, resolvePluginAssignmentInventory } from "../services/native-runtime/plugin-assignment-inventory.js";
 import type { PluginToolDispatcher } from "../services/plugin-tool-dispatcher.js";
 const support = await getEmbeddedPostgresTestSupport();
 (support.supported ? describe : describe.skip)("configured run-scoped native plugin capture", () => {
@@ -79,6 +79,26 @@ const support = await getEmbeddedPostgresTestSupport();
       await expect(readToolAssignmentInventory(db, { ...binding, runId: inactive!.id }, unified[0]!.digest)).rejects.toThrow("native_assignment_run_inactive");
       await expect(readToolAssignmentInventory(db, failedBinding, unified[0]!.digest)).rejects.toThrow("native_assignment_digest_mismatch");
       expect(listSpy).not.toHaveBeenCalled();
+      // A policy edit after capture changes the descriptor identity. It must
+      // disappear from exposure without changing the immutable run ceiling.
+      const intersection = await resolvePinnedPluginToolsForRun(db, binding, unified[0]!.digest);
+      expect(intersection.stale).toEqual([names[0]]);
+      expect(intersection.permitted.map(t => t.name)).toEqual([...names].filter(n => n !== names[0]).sort());
+      listSpy.mockClear();
+      await expect(resolvePinnedPluginToolsForRun(db, binding, "wrong-digest")).rejects.toThrow("native_assignment_digest_mismatch");
+      expect(listSpy).not.toHaveBeenCalled();
+      await db.delete(toolProfileEntries).where(and(eq(toolProfileEntries.profileId, profile!.id), eq(toolProfileEntries.toolName, names[1]!)));
+      const revoked = await resolvePinnedPluginToolsForRun(db, binding, unified[0]!.digest);
+      expect(revoked.permitted.map(t => t.name)).not.toContain(names[1]);
+      expect(revoked.permitted.map(t => t.name)).not.toContain("synthetic.pipeline:ungranted");
+      await db.insert(toolProfileEntries).values([
+        { companyId: company!.id, profileId: profile!.id, selectorType: "tool_name", effect: "include", toolName: names[1]! },
+        { companyId: company!.id, profileId: profile!.id, selectorType: "tool_name", effect: "include", toolName: "synthetic.pipeline:ungranted" },
+      ]);
+      const regranted = await resolvePinnedPluginToolsForRun(db, binding, unified[0]!.digest);
+      expect(regranted.permitted.map(t => t.name)).toContain(names[1]);
+      expect(regranted.permitted.map(t => t.name)).not.toContain("synthetic.pipeline:ungranted");
+      expect(await readToolAssignmentInventory(db, binding, unified[0]!.digest)).toEqual(unified[0]);
       const [full] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run!.id));
       expect(full!.contextSnapshot).toEqual({ retained: "synthetic", nativePluginAssignment: captured, nativeToolAssignment: unified[0] });
       await db.update(heartbeatRuns).set({ contextSnapshot: { nativeToolAssignment: { ...unified[0], digest: "corrupt" } } }).where(eq(heartbeatRuns.id, run!.id));
