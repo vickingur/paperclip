@@ -1305,7 +1305,39 @@ export function createToolGatewayService(
         agentId: session.agentId!, runId: session.runId!, companyId: session.companyId,
         projectId: session.projectId ?? "",
       });
-    }, approvedClaim);
+    }, (admissionDb, run) => validatePluginAdmission(admissionDb, run, session, tool), approvedClaim);
+  }
+
+  async function validatePluginAdmission(
+    admissionDb: Db,
+    run: typeof heartbeatRuns.$inferSelect,
+    session: ToolGatewaySession,
+    tool: ToolGatewayDescriptor,
+  ) {
+    const [registration] = await admissionDb.select({ status: plugins.status }).from(plugins)
+      .where(eq(plugins.id, tool.pluginId!));
+    if (registration?.status !== "ready") {
+      throw new ToolGatewayHttpError(403, "Plugin registration is not ready", "plugin_registration_inactive");
+    }
+    const stored = run.contextSnapshot?.nativeToolAssignment as { digest?: string } | undefined;
+    const expected = pinPluginDescriptor(tool);
+    if (stored === undefined && session.gatewayProfileId) {
+      const [profile] = await admissionDb.select().from(toolProfiles).where(and(
+        eq(toolProfiles.id, session.gatewayProfileId), eq(toolProfiles.companyId, session.companyId),
+      ));
+      if (profile?.profileKey.startsWith("native:") || profile?.metadata?.source === "paperclip_runner") {
+        throw new ToolGatewayHttpError(403, "Native run inventory is missing", "native_assignment_not_captured");
+      }
+    }
+    if (stored !== undefined) {
+      const captured = await readToolAssignmentInventory(admissionDb, {
+        companyId: session.companyId, agentId: session.agentId!, runId: session.runId!,
+      }, stored.digest ?? "");
+      const pinned = captured.assignment.plugins.find(entry => entry.name === tool.name);
+      if (!pinned || pinned.pluginId !== expected.pluginId || pinned.descriptorDigest !== expected.descriptorDigest) {
+        throw new ToolGatewayHttpError(403, "Plugin is outside the run inventory", "native_assignment_tool_stale");
+      }
+    }
   }
 
   // The callback must enter the provider synchronously. Return its promise in
@@ -1315,6 +1347,7 @@ export function createToolGatewayService(
     tool: ToolGatewayDescriptor,
     parameters: unknown,
     enter: () => Promise<T>,
+    validateProvider: (admissionDb: Db, run: typeof heartbeatRuns.$inferSelect) => Promise<void>,
     approvedClaim?: typeof toolActionRequests.$inferSelect,
   ): Promise<T> {
     const admitted = await db.transaction(async (tx) => {
@@ -1364,30 +1397,7 @@ export function createToolGatewayService(
           throw new ToolGatewayHttpError(401, "Gateway session is no longer valid", "session_invalid");
         }
       }
-      const [registration] = await admissionDb.select({ status: plugins.status }).from(plugins)
-        .where(eq(plugins.id, tool.pluginId!));
-      if (registration?.status !== "ready") {
-        throw new ToolGatewayHttpError(403, "Plugin registration is not ready", "plugin_registration_inactive");
-      }
-      const stored = run.contextSnapshot?.nativeToolAssignment as { digest?: string } | undefined;
-      const expected = pinPluginDescriptor(tool);
-      if (stored === undefined && session.gatewayProfileId) {
-        const [profile] = await admissionDb.select().from(toolProfiles).where(and(
-          eq(toolProfiles.id, session.gatewayProfileId), eq(toolProfiles.companyId, session.companyId),
-        ));
-        if (profile?.profileKey.startsWith("native:") || profile?.metadata?.source === "paperclip_runner") {
-          throw new ToolGatewayHttpError(403, "Native run inventory is missing", "native_assignment_not_captured");
-        }
-      }
-      if (stored !== undefined) {
-        const captured = await readToolAssignmentInventory(admissionDb, {
-          companyId: session.companyId, agentId: session.agentId!, runId: session.runId!,
-        }, stored.digest ?? "");
-        const pinned = captured.assignment.plugins.find(entry => entry.name === tool.name);
-        if (!pinned || pinned.pluginId !== expected.pluginId || pinned.descriptorDigest !== expected.descriptorDigest) {
-          throw new ToolGatewayHttpError(403, "Plugin is outside the run inventory", "native_assignment_tool_stale");
-        }
-      }
+      await validateProvider(admissionDb, run);
       const decision = await toolAccessPolicyService(admissionDb).decide(policyInputForTool({
         session, tool, parameters, consumeRateLimit: false,
       }));
@@ -4939,16 +4949,20 @@ export function createToolGatewayService(
     return findOrganizationGrant();
   }
 
-  async function assertAppRunInventory(session: ToolGatewaySession, entry: typeof toolCatalogEntries.$inferSelect) {
+  async function assertAppRunInventory(
+    session: ToolGatewaySession,
+    entry: typeof toolCatalogEntries.$inferSelect,
+    admissionDb: Db = db,
+  ) {
     if (!session.agentId || !session.runId) return;
-    const [run] = await db.select().from(heartbeatRuns).where(and(
+    const [run] = await admissionDb.select().from(heartbeatRuns).where(and(
       eq(heartbeatRuns.id, session.runId), eq(heartbeatRuns.companyId, session.companyId),
       eq(heartbeatRuns.agentId, session.agentId),
     ));
     const stored = run?.contextSnapshot?.nativeToolAssignment as { digest?: string } | undefined;
     if (stored === undefined) {
       if (session.gatewayProfileId) {
-        const [profile] = await db.select().from(toolProfiles).where(and(
+        const [profile] = await admissionDb.select().from(toolProfiles).where(and(
           eq(toolProfiles.id, session.gatewayProfileId), eq(toolProfiles.companyId, session.companyId),
         ));
         if (profile?.profileKey.startsWith("native:") || profile?.metadata?.source === "paperclip_runner") {
@@ -4960,7 +4974,7 @@ export function createToolGatewayService(
     if (run?.status !== "running") {
       throw new ToolGatewayHttpError(403, "App run is inactive", "native_assignment_run_inactive");
     }
-    const captured = await readToolAssignmentInventory(db, {
+    const captured = await readToolAssignmentInventory(admissionDb, {
       companyId: session.companyId, agentId: session.agentId, runId: session.runId,
     }, stored.digest ?? "");
     if (!captured.assignment.connections.includes(entry.connectionId) || !captured.assignment.tools.includes(entry.id)) {
