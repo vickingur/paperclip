@@ -1,3 +1,5 @@
+import { readToolAssignmentInventory, resolvePinnedPluginToolsForRun } from "../native-runtime/plugin-assignment-inventory.js";
+import { projectPinnedAssignmentProfile } from "../native-runtime/assignment-profile.js";
 import { spekoToolsForSession } from "../voice/speko-agent-tools.js";
 import { githubConfiguredInstructionSources } from "../chat-github-review-policy.js";
 import { CONFIGURED_ENVIRONMENT_KEYS } from "../../vendor/paperclip-runner/index.js";
@@ -911,6 +913,8 @@ export async function buildPaperclipRuntimeMcpServers(input: {
   runId: string;
   expectedAssignmentDigest?: string | null;
 }): Promise<AdapterRuntimeMcpServer[]> {
+  // An explicitly empty captured context must not acquire later app grants.
+  if (input.expectedAssignmentDigest === null) return [];
   const access = toolAccessService(input.db);
   const effective = await access.getEffectiveProfilesForAgent(
     input.agent.companyId,
@@ -1005,7 +1009,20 @@ export async function buildPaperclipRuntimeMcpServers(input: {
     assignedConnectionIds.has(tool.connectionId),
   );
   const service = createToolGatewayService(input.db);
-  if (assignedConnections.length === 0) {
+  const binding = { companyId: input.agent.companyId, agentId: input.agent.id, runId: input.runId };
+  const pinned = typeof input.expectedAssignmentDigest === "string"
+    ? await readToolAssignmentInventory(input.db, binding, input.expectedAssignmentDigest)
+    : null;
+  const plugins = pinned
+    ? await resolvePinnedPluginToolsForRun(input.db, binding, pinned.digest)
+    : null;
+  const pinnedEntries = pinned ? projectPinnedAssignmentProfile({
+    assignment: pinned.assignment,
+    connections: assignedConnections.map(connection => connection.id),
+    tools: assignedTools,
+    plugins: plugins!.permitted,
+  }) : null;
+  if (pinnedEntries ? pinnedEntries.length === 0 : assignedConnections.length === 0) {
     await service.recordRuntimeMcpDeliveryDiagnostic({
       companyId: input.agent.companyId,
       agentId: input.agent.id,
@@ -1020,7 +1037,7 @@ export async function buildPaperclipRuntimeMcpServers(input: {
     connections: assignedConnections.map((connection) => connection.id).sort(),
     tools: assignedTools.map((tool) => tool.id).sort(),
   };
-  const assignmentDigest = createHash("sha256")
+  const assignmentDigest = pinned?.digest ?? createHash("sha256")
     .update(JSON.stringify(assignment))
     .digest("hex");
   // Native runs may lose access after their immutable context is captured, but
@@ -1054,7 +1071,7 @@ export async function buildPaperclipRuntimeMcpServers(input: {
         )
         .map((entry) => entry.connectionId!),
     );
-    const entries = [
+    const entries = pinnedEntries ?? [
       ...assignedConnections
         .filter((connection) => fullConnectionIds.has(connection.id))
         .map((connection) => ({

@@ -39,7 +39,7 @@ vi.mock("../tool-access.js", () => ({
   }),
 }));
 
-import { createHash } from "node:crypto";
+import { createPinnedToolAssignment, pinnedToolAssignmentDigest } from "./pinned-tool-assignment.js";
 import { buildNativeRuntimeContext, captureNativeRuntimeToolAssignment, resolveNativeRuntimeMcpSnapshot } from "./runtime-context.js";
 
 const temporaryRoots: string[] = [];
@@ -62,6 +62,11 @@ async function makeTreeWritable(target: string): Promise<void> {
 beforeEach(async () => {
   vi.clearAllMocks();
   serviceMocks.readCommittedForRuntime.mockResolvedValue(null);
+  serviceMocks.captureToolAssignmentInventory.mockImplementation(async (_db, _binding, resolveApps) => {
+    const apps = await resolveApps();
+    const assignment = createPinnedToolAssignment({ ...apps, plugins: [] });
+    return { assignment, digest: pinnedToolAssignmentDigest(assignment) };
+  });
   serviceMocks.githubBotConnectionIdsForRun.mockResolvedValue(new Set());
   serviceMocks.spekoToolsForSession.mockResolvedValue([]);
   previousPaperclipHome = process.env.PAPERCLIP_HOME;
@@ -388,10 +393,10 @@ it("pins both permitted GitHub tool catalogs even when another user’s health p
   const limit = vi.fn(async () => [{ responsibleUserId: "A", activeIdentityContextId: "context-A" }]);
   const db = { select: () => ({ from: () => ({ where: () => ({ limit }) }) }) } as unknown as Db;
   const snapshot = await resolveNativeRuntimeMcpSnapshot({ db, agent: { id: "agent-1", companyId: "company-1" }, runId: "run-1" });
-  const expected = createHash("sha256").update(JSON.stringify({
-    version: 1, agentId: "agent-1", connections: ["github-A", "github-B"],
+  const expected = pinnedToolAssignmentDigest(createPinnedToolAssignment({
+    plugins: [], connections: ["github-A", "github-B"],
     tools: ["github-A-get_me", "github-B-get_me"],
-  })).digest("hex");
+  }));
   expect(snapshot.digest).toBe(expected);
   expect(snapshot.bindingId).toBe("native-mcp:run-1");
   expect(limit).toHaveBeenCalledOnce();

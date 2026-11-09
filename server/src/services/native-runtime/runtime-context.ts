@@ -252,8 +252,7 @@ export async function captureNativeRuntimeToolAssignment(input: { db: Db; agent:
   }, () => resolveNativeRuntimeAppAssignment(input));
 }
 
-/** Version-2 snapshot projection for the pinned delivery path. The legacy
- * builder must migrate together with its caller before this replaces v1. */
+/** Version-2 snapshot projection shared by capture and gateway realization. */
 export async function resolveCapturedNativeRuntimeMcpSnapshot(input: { db: Db; agent: Pick<RuntimeAgent, "id" | "companyId">; runId: string }) {
   const captured = await captureNativeRuntimeToolAssignment(input);
   return {
@@ -264,9 +263,7 @@ export async function resolveCapturedNativeRuntimeMcpSnapshot(input: { db: Db; a
 }
 
 export async function resolveNativeRuntimeMcpSnapshot(input: { db: Db; agent: Pick<RuntimeAgent, "id" | "companyId">; runId: string }) {
-  const assignment = await resolveNativeRuntimeAppAssignment(input);
-  const assignmentDigest = sha256(JSON.stringify(assignment));
-  return { assignmentSetId: `sha256:${assignmentDigest}`, digest: assignmentDigest, bindingId: assignment.connections.length ? `native-mcp:${input.runId}` : null };
+  return resolveCapturedNativeRuntimeMcpSnapshot(input);
 }
 
 export async function buildNativeRuntimeContext(input: { db: Db; agent: RuntimeAgent; runId: string; runtimeConfig: Record<string, unknown>; runtimeSkillEntries: PaperclipSkillEntry[]; instructionWorkingCopy?: { rootPath: string; entryPath: string; kind?: "agent_files" } }): Promise<NativeRuntimeContextSnapshot> {

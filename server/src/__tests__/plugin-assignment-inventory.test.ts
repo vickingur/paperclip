@@ -6,6 +6,7 @@ import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } fro
 import { createToolGatewayService } from "../services/tool-gateway.js";
 import { registerAssignedMcpGateway } from "../services/native-runtime/assigned-mcp-tools.js";
 import { resolvePinnedPluginToolsForRun, readToolAssignmentInventory, captureToolAssignmentInventory, capturePluginAssignmentInventory, resolvePluginAssignmentInventory } from "../services/native-runtime/plugin-assignment-inventory.js";
+import { buildPaperclipRuntimeMcpServers } from "../services/heartbeat/run-preparation.js";
 import type { PluginToolDispatcher } from "../services/plugin-tool-dispatcher.js";
 const support = await getEmbeddedPostgresTestSupport();
 (support.supported ? describe : describe.skip)("configured run-scoped native plugin capture", () => {
@@ -42,6 +43,11 @@ const support = await getEmbeddedPostgresTestSupport();
       expect(rolledBack!.contextSnapshot).toEqual({ retained: "rollback" });
       const fresh = await captureToolAssignmentInventory(db, failedBinding, async () => ({ connections: [], tools: [] }));
       expect(fresh).toEqual(captured);
+      const servers = await buildPaperclipRuntimeMcpServers({ db, agent: agent!, runId: failedRun!.id, expectedAssignmentDigest: fresh.digest });
+      expect(await buildPaperclipRuntimeMcpServers({ db, agent: agent!, runId: failedRun!.id, expectedAssignmentDigest: null })).toEqual([]);
+      expect(servers).toHaveLength(1);
+      expect(servers[0]!.connectionId).toBe(`assignment:${fresh.digest}`);
+      await expect(buildPaperclipRuntimeMcpServers({ db, agent: agent!, runId: failedRun!.id, expectedAssignmentDigest: "wrong" })).rejects.toThrow("native_assignment_digest_mismatch");
       const listSpy = vi.spyOn(dispatcher, "listToolsForAgent");
       const concurrent = await Promise.all(Array.from({ length: 3 }, () => capturePluginAssignmentInventory(db, binding)));
       expect(listSpy).toHaveBeenCalledTimes(1);
