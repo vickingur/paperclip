@@ -1,3 +1,4 @@
+import * as runtimeSlots from "../services/tool-runtime-supervisor.js";
 import * as accessPolicy from "../services/tool-access-policy.js";
 import { subscribeDeliveryWork } from "../services/delivery-work-notifications.js";
 import { DELIVERY_QUEUES } from "../services/delivery-work-notifications.js";
@@ -33,6 +34,7 @@ import {
   toolGatewaySessions,
   toolInvocations,
   toolPolicies,
+  toolStdioCommandTemplates,
 } from "@paperclipai/db";
 import type { PluginToolDispatcher } from "../services/plugin-tool-dispatcher.js";
 import type { VercelConnectClient } from "../services/vercel-connect.js";
@@ -1306,6 +1308,42 @@ describeEmbeddedPostgres("tool gateway service", () => {
       expect(changed).toBe(true);
       expect(provider).not.toHaveBeenCalled();
     } finally { policySpy.mockRestore(); }
+  });
+
+  it.each(["none", "template", "grant", "connection"])("fences stdio preparation after slot acquisition: %s", async (mutation) => {
+    const { company, agent, run } = await createRunFixture(db);
+    const fixture = await createRemoteMcpToolFixture(db, company.id);
+    await db.update(toolApplications).set({type:"mcp_stdio"}).where(eq(toolApplications.id,fixture.application.id));
+    const templateKey = `test.${randomUUID()}`;
+    const script = `const rl = require("node:readline").createInterface({input:process.stdin});
+      rl.on("line", line => { const m=JSON.parse(line); if(!m.id)return;
+      const result=m.method==="initialize" ? {protocolVersion:"2024-11-05",capabilities:{},serverInfo:{name:"fixture",version:"1"}} : {content:[{type:"text",text:"ok"}]};
+      process.stdout.write(JSON.stringify({jsonrpc:"2.0",id:m.id,result})+"\\n"); });`;
+    const [template] = await db.insert(toolStdioCommandTemplates).values({companyId:company.id,
+      templateKey, name:"Synthetic stdio", command:process.execPath, args:["-e",script], envKeys:[], tools:[], status:"active"}).returning();
+    await db.update(toolConnections).set({transport:"local_stdio", config:{templateId:templateKey}})
+      .where(eq(toolConnections.id,fixture.connection.id));
+    await db.insert(toolPolicies).values({companyId:company.id,name:"Allow reads",policyType:"allow",selectors:{riskLevel:"read"}});
+    const original = runtimeSlots.createToolRuntimeSupervisor;
+    const slotSpy = vi.spyOn(runtimeSlots,"createToolRuntimeSupervisor").mockImplementation((...args) => {
+      const supervisor = original(...args);
+      const useSlot = supervisor.useConnectionSlot;
+      supervisor.useConnectionSlot = (input, callback) => useSlot(input, async handle => {
+        if(mutation === "template") await db.update(toolStdioCommandTemplates).set({args:["-e","process.exit(88)"]}).where(eq(toolStdioCommandTemplates.id,template.id));
+        if(mutation === "grant") await db.update(connectionGrants).set({status:"revoked"}).where(eq(connectionGrants.connectionId,fixture.connection.id));
+        if(mutation === "connection") await db.update(toolConnections).set({config:{templateId:"changed"}}).where(eq(toolConnections.id,fixture.connection.id));
+        return callback(handle);
+      });
+      return supervisor;
+    });
+    try {
+      const gateway = createTestToolGatewayService(db);
+      const session = await gateway.createSession({companyId:company.id,agentId:agent.id,runId:run.id});
+      const tool = (await gateway.listToolsForSession(session.token)).find(t=>t.catalogEntryId===fixture.catalogEntry.id)!;
+      const call = gateway.executeTool({sessionToken:session.token,tool:tool.name,parameters:{}});
+      if(mutation === "none") await expect(call).resolves.toMatchObject({status:"completed"});
+      else await expect(call).rejects.toMatchObject({reasonCode:mutation === "template" ? "app_preparation_stale" : mutation === "connection" ? "local_stdio_template_invalid" : "organization_authorization_required"});
+    } finally { slotSpy.mockRestore(); }
   });
 
   it.each(["none", "connection", "grant", "application"])("fences prepared HTTP metadata after MCP initialization: %s", async (mutation) => {

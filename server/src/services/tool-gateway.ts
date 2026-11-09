@@ -1364,7 +1364,7 @@ export function createToolGatewayService(
         ${toolCatalogEntries}, ${toolGatewaySessions}, ${toolMcpGatewayTokens},
         ${toolActionRequests}, ${toolInvocations}, ${issueThreadInteractions}, ${approvals},
         ${connectionGrants}, ${connectionGrantMembers}, ${connectionGrantDelegations},
-        ${companyMemberships} IN SHARE MODE`);
+        ${companyMemberships}, ${toolStdioCommandTemplates} IN SHARE MODE`);
       const admissionDb = tx as unknown as Db;
       const [run] = await admissionDb.select().from(heartbeatRuns).where(and(
         eq(heartbeatRuns.id, session.runId!), eq(heartbeatRuns.companyId, session.companyId),
@@ -6671,6 +6671,7 @@ export function createToolGatewayService(
     parameters: unknown,
     ms: number,
     useProviderDefaultTimeout = false,
+    approvedClaim?: typeof toolActionRequests.$inferSelect,
   ): Promise<RemoteHttpExecutionResult> {
     const { entry, connection } = await resolveConnectedLocalStdioTool(
       session,
@@ -6684,8 +6685,25 @@ export function createToolGatewayService(
       template,
       grant,
     );
-    const invoke = () => callLocalStdioMcp({ connection, entry, template, env, parameters,
-      timeoutMs: useProviderDefaultTimeout && template.templateId === "paperclip.cognee-cloud" ? 60_000 : ms });
+    const invoke = () => {
+      const enter = () => callLocalStdioMcp({ connection, entry, template, env, parameters,
+        timeoutMs: useProviderDefaultTimeout && template.templateId === "paperclip.cognee-cloud" ? 60_000 : ms });
+      if (!session.agentId || !session.runId) return enter();
+      // Runtime slot acquisition can wait. Revalidate after it, immediately
+      // before entering the prepared command rather than before the slot wait.
+      return dispatchUnderAdmission(session, tool, parameters, enter, async (admissionDb) => {
+        const current = await resolveConnectedLocalStdioTool(session, tool, admissionDb);
+        const currentGrant = await resolveConnectionGrant(session, current.connection, false, admissionDb);
+        const currentTemplate = await resolveLocalStdioRuntimeTemplate(current.connection, admissionDb);
+        const preparedHash = (value: unknown) => stableHash(JSON.parse(JSON.stringify(value)));
+        if (preparedHash(current.entry) !== preparedHash(entry) ||
+            preparedHash(current.connection) !== preparedHash(connection) ||
+            preparedHash(currentGrant) !== preparedHash(grant) ||
+            preparedHash(currentTemplate) !== preparedHash(template)) {
+          throw new ToolGatewayHttpError(409, "Prepared connection changed before dispatch", "app_preparation_stale");
+        }
+      }, approvedClaim);
+    };
     // Cognee is a bundled HTTP client. Provider failures are tool failures, not
     // crashed local processes, and must never consume slots or restart budgets.
     const result = template.templateId === "paperclip.cognee-cloud"
@@ -8415,6 +8433,8 @@ export function createToolGatewayService(
                   tool,
                   parameters,
                   executionTimeoutMs,
+                  false,
+                  claimed,
                 )
               ).result
             : tool.providerType !== "paperclip_plugin"
@@ -10964,6 +10984,7 @@ export function createToolGatewayService(
                   effectiveParameters,
                   executionTimeoutMs,
                   input.timeoutMs === undefined,
+                  approvedPluginClaim,
                 )
               : null;
         const result = connectedMcpExecution
