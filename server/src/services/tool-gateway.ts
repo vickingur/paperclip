@@ -1322,6 +1322,9 @@ export function createToolGatewayService(
         if (!token || token.revokedAt || (token.expiresAt && token.expiresAt.getTime() <= Date.now())) {
           throw new ToolGatewayHttpError(401, "Gateway bearer token is no longer valid", "gateway_token_invalid");
         }
+        if (token.subjectType !== "heartbeat_run" || token.subjectId !== session.runId) {
+          throw new ToolGatewayHttpError(403, "Gateway bearer token run context changed", "gateway_token_run_context_invalid");
+        }
         if (!normalizeGatewayTokenActions(token.allowedActions).includes("tools/call")) {
           throw new ToolGatewayHttpError(403, "Gateway bearer token cannot call tools", "gateway_token_action_denied");
         }

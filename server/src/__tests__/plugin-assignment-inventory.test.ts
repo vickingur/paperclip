@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import * as accessPolicy from "../services/tool-access-policy.js";
 import { and, eq, sql } from "drizzle-orm";
 import { randomUUID } from "node:crypto";
-import { agents, companies, createDb, connectionGrants, toolApplications, toolConnections, toolCatalogEntries, heartbeatRuns, toolProfiles, toolProfileBindings, toolProfileEntries, toolPolicies, plugins, toolGatewaySessions } from "@paperclipai/db";
+import { agents, companies, createDb, connectionGrants, toolApplications, toolConnections, toolCatalogEntries, heartbeatRuns, toolProfiles, toolProfileBindings, toolProfileEntries, toolPolicies, plugins, toolGatewaySessions, toolMcpGatewayTokens } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { createToolGatewayService } from "../services/tool-gateway.js";
 import { registerAssignedMcpGateway } from "../services/native-runtime/assigned-mcp-tools.js";
@@ -207,6 +207,47 @@ const support = await getEmbeddedPostgresTestSupport();
       expect(revokeSession).toBe(false);
       expect(executeTool).not.toHaveBeenCalled();
       tokenPolicy.mockRestore();
+      // Mutating a named token after authentication must not carry authority
+      // into final dispatch, even when the replacement subject is another run.
+      const named = await dispatchGateway.createNamedGateway({ companyId: company!.id,
+        body: { name: `Synthetic ${randomUUID()}`, profileId: profile!.id, defaultProfileMode: "gateway_only" } });
+      for (const mutation of ["subject", "revoke", "actions"] as const) {
+        const namedToken = await dispatchGateway.createNamedGatewayToken({ companyId: company!.id,
+          gatewayId: named.id, body: { name: `Synthetic ${mutation}`, subjectType: "heartbeat_run",
+            subjectId: failedRun!.id, allowedActions: ["tools/list", "tools/call"] },
+          actor: { agentId: agent!.id } });
+        executeTool.mockResolvedValueOnce({ ok: true });
+        await dispatchGateway.executeTool({ sessionToken: namedToken.token, gatewayId: named.id,
+          tool: names[1]!, parameters: {} });
+        expect(executeTool).toHaveBeenCalledTimes(1);
+        executeTool.mockClear();
+        let changed = false;
+        const namedPolicy = vi.spyOn(accessPolicy, "toolAccessPolicyService").mockImplementation(policyDb => {
+          const service = originalPolicy(policyDb);
+          if (policyDb === db) {
+            const decide = service.decide;
+            service.decide = async (...args) => {
+              const result = await decide(...args);
+              if (!changed) {
+                changed = true;
+                await db.update(toolMcpGatewayTokens).set(mutation === "subject" ? { subjectId: run!.id }
+                  : mutation === "revoke" ? { revokedAt: new Date() } : { allowedActions: ["tools/list"] })
+                  .where(eq(toolMcpGatewayTokens.id, namedToken.id));
+              }
+              return result;
+            };
+          }
+          return service;
+        });
+        try {
+          const racingGateway = createToolGatewayService(db, { pluginToolDispatcher: dispatcher });
+          await expect(racingGateway.executeTool({ sessionToken: namedToken.token, gatewayId: named.id,
+            tool: names[1]!, parameters: {} })).rejects.toMatchObject({ reasonCode: mutation === "subject"
+              ? "gateway_token_run_context_invalid" : mutation === "revoke" ? "gateway_token_invalid" : "gateway_token_action_denied" });
+          expect(changed).toBe(true);
+          expect(executeTool).not.toHaveBeenCalled();
+        } finally { namedPolicy.mockRestore(); }
+      }
       const listSpy = vi.spyOn(dispatcher, "listToolsForAgent");
       const concurrent = await Promise.all(Array.from({ length: 3 }, () => capturePluginAssignmentInventory(db, binding)));
       expect(listSpy).toHaveBeenCalledTimes(1);
