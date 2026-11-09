@@ -54,6 +54,8 @@ import {
   issueThreadInteractions,
   issues,
   projects,
+  routines,
+  principalPermissionGrants,
   toolActionRequests,
   toolActionDeliveries,
   toolAccessAuditEvents,
@@ -1290,48 +1292,69 @@ export function createToolGatewayService(
     if (!session.agentId || !session.runId || !pluginToolDispatcher) {
       throw new ToolGatewayHttpError(403, "Plugin tools require an agent run context", "agent_context_required");
     }
-    const [run] = await db.select().from(heartbeatRuns).where(and(
-      eq(heartbeatRuns.id, session.runId), eq(heartbeatRuns.companyId, session.companyId),
-      eq(heartbeatRuns.agentId, session.agentId),
-    ));
-    if (!run || run.status !== "running") {
-      throw new ToolGatewayHttpError(403, "Plugin run is inactive", "native_assignment_run_inactive");
-    }
-    const stored = run.contextSnapshot?.nativeToolAssignment as { digest?: string } | undefined;
-    const expected = pinPluginDescriptor(tool);
-    if (stored === undefined && session.gatewayProfileId) {
-      const [profile] = await db.select().from(toolProfiles).where(and(
-        eq(toolProfiles.id, session.gatewayProfileId), eq(toolProfiles.companyId, session.companyId),
+    const admitted = await db.transaction(async (tx) => {
+      // SHARE conflicts with every INSERT/UPDATE/DELETE (including new deny
+      // rows). Row locks alone cannot fence policy insertions. Keep this short:
+      // authoritative reads and dispatcher entry only, never worker completion.
+      // A committed revoke precedes our reads, or waits until after admission.
+      await tx.execute(sql`SET LOCAL lock_timeout = '2s'`);
+      await tx.execute(sql`SET LOCAL statement_timeout = '5s'`);
+      await tx.execute(sql`LOCK TABLE ${agents}, ${heartbeatRuns}, ${issues},
+        ${projects}, ${routines}, ${principalPermissionGrants}, ${toolPolicies},
+        ${toolProfiles}, ${toolProfileBindings}, ${toolProfileEntries},
+        ${toolMcpGateways}, ${toolApplications}, ${toolConnections},
+        ${toolCatalogEntries} IN SHARE MODE`);
+      const admissionDb = tx as unknown as Db;
+      const [run] = await admissionDb.select().from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.id, session.runId!), eq(heartbeatRuns.companyId, session.companyId),
+        eq(heartbeatRuns.agentId, session.agentId!),
       ));
-      if (profile?.profileKey.startsWith("native:") || profile?.metadata?.source === "paperclip_runner") {
-        throw new ToolGatewayHttpError(403, "Native run inventory is missing", "native_assignment_not_captured");
+      if (!run || run.status !== "running") {
+        throw new ToolGatewayHttpError(403, "Plugin run is inactive", "native_assignment_run_inactive");
       }
-    }
-    if (stored !== undefined) {
-      const captured = await readToolAssignmentInventory(db, {
-        companyId: session.companyId, agentId: session.agentId, runId: session.runId,
-      }, stored.digest ?? "");
-      const pinned = captured.assignment.plugins.find(entry => entry.name === tool.name);
-      if (!pinned || pinned.pluginId !== expected.pluginId || pinned.descriptorDigest !== expected.descriptorDigest) {
-        throw new ToolGatewayHttpError(403, "Plugin is outside the run inventory", "native_assignment_tool_stale");
+      const stored = run.contextSnapshot?.nativeToolAssignment as { digest?: string } | undefined;
+      const expected = pinPluginDescriptor(tool);
+      if (stored === undefined && session.gatewayProfileId) {
+        const [profile] = await admissionDb.select().from(toolProfiles).where(and(
+          eq(toolProfiles.id, session.gatewayProfileId), eq(toolProfiles.companyId, session.companyId),
+        ));
+        if (profile?.profileKey.startsWith("native:") || profile?.metadata?.source === "paperclip_runner") {
+          throw new ToolGatewayHttpError(403, "Native run inventory is missing", "native_assignment_not_captured");
+        }
       }
-    }
-    const decision = await policyService.decide(policyInputForTool({
-      session, tool, parameters, consumeRateLimit: false,
-    }));
-    if (!decision.allowed && !(approved && decision.decision === "require_approval")) {
-      throw new ToolGatewayHttpError(policyErrorStatus(decision), decision.explanation, decision.reasonCode);
-    }
-    // No await between registry identity validation and dispatcher entry.
-    const fresh = pluginTools().find(entry => entry.name === tool.name);
-    const actual = fresh && pinPluginDescriptor(fresh);
-    if (!actual || actual.pluginId !== expected.pluginId || actual.descriptorDigest !== expected.descriptorDigest) {
-      throw new ToolGatewayHttpError(403, "Plugin descriptor changed before dispatch", "native_assignment_tool_stale");
-    }
-    return pluginToolDispatcher.executeTool(tool.name, parameters, {
-      agentId: session.agentId, runId: session.runId, companyId: session.companyId,
-      projectId: session.projectId ?? "",
-    });
+      if (stored !== undefined) {
+        const captured = await readToolAssignmentInventory(admissionDb, {
+          companyId: session.companyId, agentId: session.agentId!, runId: session.runId!,
+        }, stored.digest ?? "");
+        const pinned = captured.assignment.plugins.find(entry => entry.name === tool.name);
+        if (!pinned || pinned.pluginId !== expected.pluginId || pinned.descriptorDigest !== expected.descriptorDigest) {
+          throw new ToolGatewayHttpError(403, "Plugin is outside the run inventory", "native_assignment_tool_stale");
+        }
+      }
+      const decision = await toolAccessPolicyService(admissionDb).decide(policyInputForTool({
+        session, tool, parameters, consumeRateLimit: false,
+      }));
+      if (!decision.allowed && !(approved && decision.decision === "require_approval")) {
+        throw new ToolGatewayHttpError(policyErrorStatus(decision), decision.explanation, decision.reasonCode);
+      }
+      // No await between registry identity validation and dispatcher entry.
+      const fresh = pluginTools().find(entry => entry.name === tool.name);
+      const actual = fresh && pinPluginDescriptor(fresh);
+      if (!actual || actual.pluginId !== expected.pluginId || actual.descriptorDigest !== expected.descriptorDigest) {
+        throw new ToolGatewayHttpError(403, "Plugin descriptor changed before dispatch", "native_assignment_tool_stale");
+      }
+      const execution = pluginToolDispatcher.executeTool(tool.name, parameters, {
+        agentId: session.agentId!, runId: session.runId!, companyId: session.companyId,
+        projectId: session.projectId ?? "",
+      });
+      // A fast worker rejection can precede transaction commit; keep it handled
+      // while preserving the original promise for the caller.
+      void execution.catch(() => {});
+      // Do not retain database locks while a previously admitted operation runs.
+      // The envelope prevents the transaction from awaiting the worker promise.
+      return { execution };
+    }, { isolationLevel: "read committed" });
+    return admitted.execution;
   }
 
   function allTools(): ToolGatewayDescriptor[] {

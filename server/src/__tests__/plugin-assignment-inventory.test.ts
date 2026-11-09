@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
-import { and, eq } from "drizzle-orm";
+import * as accessPolicy from "../services/tool-access-policy.js";
+import { and, eq, sql } from "drizzle-orm";
 import { randomUUID } from "node:crypto";
 import { agents, companies, createDb, connectionGrants, toolApplications, toolConnections, toolCatalogEntries, heartbeatRuns, toolProfiles, toolProfileBindings, toolProfileEntries, toolPolicies } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
@@ -84,6 +85,58 @@ const support = await getEmbeddedPostgresTestSupport();
       await expect(call(names[1]!)).rejects.toThrow("descriptor changed before dispatch");
       expect(executeTool).not.toHaveBeenCalled();
       racing.mockRestore();
+      // A revoke launched at the final registry read cannot commit between
+      // the authoritative policy read and dispatcher entry. Once committed,
+      // subsequent direct invocation must reject without entering the worker.
+      const originalPolicy = accessPolicy.toolAccessPolicyService;
+      let admissionLockObserved = false;
+      const policyFactory = vi.spyOn(accessPolicy, "toolAccessPolicyService").mockImplementation(policyDb => {
+        const service = originalPolicy(policyDb);
+        if (policyDb !== db) {
+          const decide = service.decide;
+          service.decide = async (...args) => {
+            const locks = await policyDb.execute(sql`SELECT mode FROM pg_locks
+              WHERE pid = pg_backend_pid() AND relation = 'tool_profile_entries'::regclass
+                AND granted AND mode = 'ShareLock'`);
+            admissionLockObserved = locks.length === 1;
+            return decide(...args);
+          };
+        }
+        return service;
+      });
+      const order: string[] = [];
+      let revocation: Promise<unknown> | undefined;
+      let revokeStarted!: () => void;
+      const revocationStarted = new Promise<void>(resolve => { revokeStarted = resolve; });
+      let admissionReads = 0;
+      const boundary = vi.spyOn(dispatcher, "listToolsForAgent").mockImplementation(() => {
+        if (++admissionReads === 2) {
+          revocation = db.delete(toolProfileEntries).where(and(
+            eq(toolProfileEntries.profileId, profile!.id), eq(toolProfileEntries.toolName, names[1]!),
+          )).then(() => { order.push("revoke committed"); });
+          revokeStarted();
+        }
+        return originalList();
+      });
+      let finishOperation!: () => void;
+      const operation = new Promise<void>(resolve => { finishOperation = resolve; });
+      executeTool.mockImplementationOnce(() => { order.push("admitted"); return operation.then(() => ({ ok: true })); });
+      const admittedCall = call(names[1]!);
+      // Observe the revoke commit while the already admitted operation remains
+      // pending: admission locks must not be held for the worker's lifetime.
+      await revocationStarted;
+      await revocation;
+      expect(order).toEqual(["admitted", "revoke committed"]);
+      expect(admissionLockObserved).toBe(true);
+      finishOperation();
+      await admittedCall;
+      boundary.mockRestore();
+      policyFactory.mockRestore();
+      executeTool.mockClear();
+      await expect(call(names[1]!)).rejects.toThrow();
+      expect(executeTool).not.toHaveBeenCalled();
+      await db.insert(toolProfileEntries).values({ companyId: company!.id, profileId: profile!.id,
+        selectorType: "tool_name", effect: "include", toolName: names[1]! });
       const listSpy = vi.spyOn(dispatcher, "listToolsForAgent");
       const concurrent = await Promise.all(Array.from({ length: 3 }, () => capturePluginAssignmentInventory(db, binding)));
       expect(listSpy).toHaveBeenCalledTimes(1);
