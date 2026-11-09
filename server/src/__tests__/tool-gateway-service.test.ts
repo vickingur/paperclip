@@ -1257,7 +1257,7 @@ describeEmbeddedPostgres("tool gateway service", () => {
     expect((result.result as { result?: { data?: { target?: string } } }).result?.data?.target).toBe("repo");
   });
 
-  it.each(["application", "connection"])("rejects catalog %s replacement after tool resolution", async (mutation) => {
+  it.each(["application", "connection", "disabled"])("rejects catalog/application %s mutation after tool resolution", async (mutation) => {
     const { company, agent, run } = await createRunFixture(db);
     const first = await createRemoteMcpToolFixture(db, company.id);
     await db.update(toolApplications).set({ name: "Original MCP" }).where(eq(toolApplications.id, first.application.id));
@@ -1271,10 +1271,19 @@ describeEmbeddedPostgres("tool gateway service", () => {
     let armed = false;
     const policySpy = vi.spyOn(accessPolicy, "toolAccessPolicyService").mockImplementation(policyDb => {
       const service = originalPolicy(policyDb);
+      const recordInvocation = service.recordInvocation;
+      service.recordInvocation = async (...args) => {
+        const recorded = await recordInvocation(...args);
+        if (armed && !changed && mutation === "disabled") {
+          changed = true;
+          await db.update(toolApplications).set({ status: "disabled" }).where(eq(toolApplications.id, first.application.id));
+        }
+        return recorded;
+      };
       const decide = service.decide;
       service.decide = async (...args) => {
         const decision = await decide(...args);
-        if (armed && !changed) {
+        if (armed && !changed && mutation !== "disabled") {
           changed = true;
           await db.update(toolCatalogEntries).set(mutation === "application"
             ? { applicationId: replacement.application.id }
@@ -1293,7 +1302,7 @@ describeEmbeddedPostgres("tool gateway service", () => {
     armed = true;
     try {
       await expect(gateway.executeTool({ sessionToken: session.token, tool: tool.name,
-        parameters: {} })).rejects.toMatchObject({ reasonCode: "tool_not_found" });
+        parameters: {} })).rejects.toMatchObject({ reasonCode: mutation === "disabled" ? "application_disabled" : "tool_not_found" });
       expect(changed).toBe(true);
       expect(provider).not.toHaveBeenCalled();
     } finally { policySpy.mockRestore(); }

@@ -4626,10 +4626,11 @@ export function createToolGatewayService(
     session: ToolGatewaySession,
     connection: typeof toolConnections.$inferSelect,
     allowInteraction = true,
+    admissionDb: Db = db,
   ): Promise<typeof connectionGrants.$inferSelect> {
     const [run] =
       session.runId && !session.identityContextId
-        ? await db
+        ? await admissionDb
             .select({
               responsibleUserId: heartbeatRuns.responsibleUserId,
               invocationSource: heartbeatRuns.invocationSource,
@@ -4652,10 +4653,12 @@ export function createToolGatewayService(
       (connection.config.sourceTemplateKey === "github" ||
         connection.transportConfig?.sourceTemplateKey === "github")
     ) {
-      const captured = githubOperationCredentials.get(session);
+      // A final admission read must resolve current identity rather than reuse
+      // the credential-preparation cache from before the transaction.
+      const captured = admissionDb === db ? githubOperationCredentials.get(session) : undefined;
       const selected = captured
         ? { grant: captured.grant, error: undefined }
-        : await resolveManagedGitHubIdentitySelection(db, session.companyId, {
+        : await resolveManagedGitHubIdentitySelection(admissionDb, session.companyId, {
             agentId: session.agentId,
             responsibleUserId: session.responsibleUserId,
             allowStandingDelegation: false,
@@ -4669,7 +4672,7 @@ export function createToolGatewayService(
         );
       }
       if (selected.grant.kind === "user") {
-        const [member] = await db
+        const [member] = await admissionDb
           .select({ role: companyMemberships.membershipRole })
           .from(companyMemberships)
           .where(
@@ -4699,7 +4702,7 @@ export function createToolGatewayService(
         run?.invocationSource === "timer");
     const findUserGrant = async () => {
       if (!actingUserId) return undefined;
-      const [membership] = await db
+      const [membership] = await admissionDb
         .select({ id: companyMemberships.id })
         .from(companyMemberships)
         .where(
@@ -4723,7 +4726,7 @@ export function createToolGatewayService(
           },
         );
       }
-      const [grant] = await db
+      const [grant] = await admissionDb
         .select()
         .from(connectionGrants)
         .where(
@@ -4739,7 +4742,7 @@ export function createToolGatewayService(
       return grant;
     };
     const findOrganizationGrant = async () => {
-      const [grant] = await db
+      const [grant] = await admissionDb
         .select()
         .from(connectionGrants)
         .where(
@@ -4762,7 +4765,7 @@ export function createToolGatewayService(
           },
         );
       }
-      const members = await db
+      const members = await admissionDb
         .select({ subjectId: connectionGrantMembers.subjectId })
         .from(connectionGrantMembers)
         .where(
@@ -4773,7 +4776,7 @@ export function createToolGatewayService(
           ),
         );
       const activeAudienceMember = actingUserId
-        ? await db
+        ? await admissionDb
             .select({ id: companyMemberships.id })
             .from(companyMemberships)
             .where(
@@ -4819,7 +4822,7 @@ export function createToolGatewayService(
           },
         );
       }
-      const [agentGrant] = await db
+      const [agentGrant] = await admissionDb
         .select()
         .from(connectionGrants)
         .where(
@@ -4861,7 +4864,7 @@ export function createToolGatewayService(
       session.agentId &&
       connection.credentialPolicy !== "shared"
     ) {
-      const delegated = await db
+      const delegated = await admissionDb
         .select({ grant: connectionGrants })
         .from(connectionGrantDelegations)
         .innerJoin(
@@ -4896,7 +4899,7 @@ export function createToolGatewayService(
       }
       userGrant = delegated[0]?.grant;
       if (userGrant?.subjectUserId) {
-        const [membership] = await db
+        const [membership] = await admissionDb
           .select({ id: companyMemberships.id })
           .from(companyMemberships)
           .where(
@@ -4930,7 +4933,7 @@ export function createToolGatewayService(
         );
     if (resolution === "user" && userGrant) return userGrant;
     if (resolution === "user_authorization_required") {
-      if (actingUserId && allowInteraction)
+      if (actingUserId && allowInteraction && admissionDb === db)
         await createUserAuthorizationInteraction(
           session,
           connection,
@@ -4947,6 +4950,20 @@ export function createToolGatewayService(
       );
     }
     return findOrganizationGrant();
+  }
+
+  async function assertApplicationActive(
+    session: ToolGatewaySession,
+    applicationId: string,
+    admissionDb: Db,
+  ) {
+    const [application] = await admissionDb.select().from(toolApplications).where(and(
+      eq(toolApplications.id, applicationId),
+      eq(toolApplications.companyId, session.companyId),
+    ));
+    if (!application || application.status !== "active") {
+      throw new ToolGatewayHttpError(403, "Application is disabled", "application_disabled");
+    }
   }
 
   async function assertAppRunInventory(
@@ -5048,6 +5065,7 @@ export function createToolGatewayService(
     if (isRailwayEndpoint(connection.config.url) && isRailwayToolBlocked(entry.toolName)) {
       throw new ToolGatewayHttpError(403, "This Railway action cannot bind its effects to an approved target. Use redeploy, restart, or rollback for an existing deployment.", "railway_action_blocked");
     }
+    await assertApplicationActive(session, entry.applicationId, admissionDb);
     await assertAppRunInventory(session, entry, admissionDb);
     return { entry, connection };
   }
@@ -5140,6 +5158,7 @@ export function createToolGatewayService(
         },
       );
     }
+    await assertApplicationActive(session, entry.applicationId, admissionDb);
     await assertAppRunInventory(session, entry, admissionDb);
     return { entry, connection };
   }
@@ -5164,11 +5183,12 @@ export function createToolGatewayService(
 
   async function resolveLocalStdioRuntimeTemplate(
     connection: typeof toolConnections.$inferSelect,
+    admissionDb: Db = db,
   ): Promise<LocalStdioRuntimeTemplate> {
     const templateId = localStdioTemplateId(connection);
     const builtIn = BUILTIN_LOCAL_STDIO_RUNTIME_TEMPLATES[templateId];
     if (builtIn) return { templateId, ...builtIn };
-    const [template] = await db
+    const [template] = await admissionDb
       .select()
       .from(toolStdioCommandTemplates)
       .where(
