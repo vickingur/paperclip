@@ -1362,7 +1362,9 @@ export function createToolGatewayService(
         ${toolProfiles}, ${toolProfileBindings}, ${toolProfileEntries},
         ${toolMcpGateways}, ${toolApplications}, ${toolConnections},
         ${toolCatalogEntries}, ${toolGatewaySessions}, ${toolMcpGatewayTokens},
-        ${toolActionRequests}, ${toolInvocations}, ${issueThreadInteractions}, ${approvals} IN SHARE MODE`);
+        ${toolActionRequests}, ${toolInvocations}, ${issueThreadInteractions}, ${approvals},
+        ${connectionGrants}, ${connectionGrantMembers}, ${connectionGrantDelegations},
+        ${companyMemberships} IN SHARE MODE`);
       const admissionDb = tx as unknown as Db;
       const [run] = await admissionDb.select().from(heartbeatRuns).where(and(
         eq(heartbeatRuns.id, session.runId!), eq(heartbeatRuns.companyId, session.companyId),
@@ -1386,7 +1388,7 @@ export function createToolGatewayService(
         if (!normalizeGatewayTokenActions(token.allowedActions).includes("tools/call")) {
           throw new ToolGatewayHttpError(403, "Gateway bearer token cannot call tools", "gateway_token_action_denied");
         }
-      } else if (session.id !== "plugin-route") {
+      } else if (session.id !== "plugin-route" && session.id !== `approved-action:${approvedClaim?.id}`) {
         const [authenticated] = await admissionDb.select().from(toolGatewaySessions).where(and(
           eq(toolGatewaySessions.id, session.id),
           eq(toolGatewaySessions.companyId, session.companyId),
@@ -4227,7 +4229,7 @@ export function createToolGatewayService(
             502,
           );
         }
-        await db
+        const [refreshedGrant] = await db
           .update(connectionGrants)
           .set({
             externalCredential: vercelGrantReference({
@@ -4245,13 +4247,31 @@ export function createToolGatewayService(
               eq(connectionGrants.id, grant.id),
               eq(connectionGrants.companyId, connection.companyId),
               eq(connectionGrants.connectionId, connection.id),
+              eq(connectionGrants.status, "active"),
+              isNull(connectionGrants.revokedAt),
+              sql`date_trunc('milliseconds', ${connectionGrants.updatedAt}) = ${grant.updatedAt.toISOString()}::timestamptz`,
+              eq(connectionGrants.credentialSecretRefs, grant.credentialSecretRefs),
+              eq(connectionGrants.kind, grant.kind),
+              eq(connectionGrants.isDefault, grant.isDefault),
+              sql`${connectionGrants.subjectUserId} IS NOT DISTINCT FROM ${grant.subjectUserId}`,
+              sql`${connectionGrants.subjectAgentId} IS NOT DISTINCT FROM ${grant.subjectAgentId}::uuid`,
+              sql`${connectionGrants.providerTenant} IS NOT DISTINCT FROM ${grant.providerTenant == null ? null : JSON.stringify(grant.providerTenant)}::jsonb`,
+              sql`${connectionGrants.externalCredential} IS NOT DISTINCT FROM ${grant.externalCredential == null ? null : JSON.stringify(grant.externalCredential)}::jsonb`,
             ),
-          );
+          ).returning();
+        if (!refreshedGrant) {
+          throw new ToolGatewayHttpError(409, "Credential grant changed during token preparation", "app_preparation_stale");
+        }
+        // Token metadata is written by this preparation step. Retain the exact
+        // row written so final admission can distinguish it from later edits.
+        grant.externalCredential = refreshedGrant.externalCredential;
+        grant.updatedAt = refreshedGrant.updatedAt;
         return {
           [connection.externalCredential.headerName]:
             `${connection.externalCredential.headerPrefix ?? ""}${token.token}`,
         };
       } catch (error) {
+        if (error instanceof ToolGatewayHttpError) throw error;
         if (
           error instanceof VercelConnectClientError &&
           error.code === "vercel_connect_authorization_required"
@@ -6181,6 +6201,7 @@ export function createToolGatewayService(
     invocationId: string,
     callerHeaders?: ExecuteGatewayToolInput["callerHeaders"],
     useDefaultTimeout = false,
+    approvedClaim?: typeof toolActionRequests.$inferSelect,
   ): Promise<RemoteHttpExecutionResult> {
     const { entry, connection } = await resolveConnectedRemoteTool(
       session,
@@ -6233,8 +6254,8 @@ export function createToolGatewayService(
     // identity's session and leaves other agents on the connection alone.
     let mcpSession: { scope: string; headers: Record<string, string>; sessionId: string } | undefined;
     try {
-      const dispatchRemote = (target: string, init: RequestInit) =>
-        options.remoteHttpRequest
+      const dispatchRemote = (target: string, init: RequestInit) => {
+        const enter = () => options.remoteHttpRequest
           ? options.remoteHttpRequest(target, init)
           : guardedRemoteHttpFetch(target, init, {
               ...remoteHttpFetchOptions(),
@@ -6243,6 +6264,23 @@ export function createToolGatewayService(
               // letting the tighter default cut a legitimately slow tool short.
               responseTimeoutMs: ms,
             });
+        // Interactive calls have no run-owned assignment. Autonomous calls
+        // must revalidate the exact prepared metadata at every HTTP entry,
+        // including tools/call after an asynchronous MCP initialization.
+        if (!session.agentId || !session.runId) return enter();
+        return dispatchUnderAdmission(session, tool, parameters, enter, async (admissionDb) => {
+          const current = await resolveConnectedRemoteTool(session, tool, admissionDb);
+          const currentGrant = await resolveConnectionGrant(session, current.connection, false, admissionDb);
+          // JSON serialization retains timestamp values (stableSerialize alone
+          // treats Date objects as empty objects).
+          const preparedHash = (value: unknown) => stableHash(JSON.parse(JSON.stringify(value)));
+          if (preparedHash(current.entry) !== preparedHash(entry) ||
+              preparedHash(current.connection) !== preparedHash(connection) ||
+              preparedHash(currentGrant) !== preparedHash(grant)) {
+            throw new ToolGatewayHttpError(409, "Prepared connection changed before dispatch", "app_preparation_stale");
+          }
+        }, approvedClaim);
+      };
       const requireExplicitRetryAfterOAuthRefresh = async (refreshedResponse: Response): Promise<never> => {
         // The provider rejected this dispatch, but automatic replay is unsafe:
         // a server can apply a request before returning 401. A caller retry
@@ -8365,6 +8403,9 @@ export function createToolGatewayService(
                 parameters,
                 executionTimeoutMs,
                 invocation.id,
+                undefined,
+                false,
+                claimed,
               )
             ).result
           : tool.providerType === "mcp_local_stdio"
@@ -10914,6 +10955,7 @@ export function createToolGatewayService(
                 invocationId,
                 input.callerHeaders,
                 input.timeoutMs === undefined,
+                approvedPluginClaim,
               )
             : tool.providerType === "mcp_local_stdio"
               ? await executeLocalStdioTool(

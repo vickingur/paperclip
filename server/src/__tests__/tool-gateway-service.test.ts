@@ -1308,6 +1308,47 @@ describeEmbeddedPostgres("tool gateway service", () => {
     } finally { policySpy.mockRestore(); }
   });
 
+  it.each(["none", "connection", "grant", "application"])("fences prepared HTTP metadata after MCP initialization: %s", async (mutation) => {
+    const { company, agent, run } = await createRunFixture(db);
+    const fixture = await createRemoteMcpToolFixture(db, company.id);
+    await db.update(toolConnections).set({ config: { url: "https://8.8.8.8/mcp", mcpSessionRequired: true } })
+      .where(eq(toolConnections.id, fixture.connection.id));
+    await db.insert(toolPolicies).values({ companyId: company.id, name: "Allow reads",
+      policyType: "allow", selectors: { riskLevel: "read" } });
+    const methods: string[] = [];
+    const gateway = createTestToolGatewayService(db, { remoteHttpRequest: async (_url, init) => {
+      const payload = JSON.parse(String(init.body));
+      methods.push(payload.method);
+      if (payload.method === "initialize") {
+        // This write must finish while the provider promise is pending: admission
+        // locks are released at entry, rather than held for provider completion.
+        if (mutation === "connection") await db.update(toolConnections)
+          .set({ config: { url: "https://1.1.1.1/mcp", mcpSessionRequired: true } })
+          .where(eq(toolConnections.id, fixture.connection.id));
+        if (mutation === "grant") await db.update(connectionGrants)
+          .set({ credentialSecretRefs: [{ configPath: "token", secretId: randomUUID(), versionSelector: "latest" }] })
+          .where(eq(connectionGrants.connectionId, fixture.connection.id));
+        if (mutation === "application") await db.update(toolApplications).set({ status: "disabled" })
+          .where(eq(toolApplications.id, fixture.application.id));
+        return Response.json({ jsonrpc: "2.0", id: payload.id, result: {
+          protocolVersion: "2025-06-18", capabilities: { tools: {} }, serverInfo: { name: "fixture", version: "1" },
+        } }, { headers: { "mcp-session-id": randomUUID() } });
+      }
+      if (payload.method === "notifications/initialized") return new Response(null, { status: 202 });
+      return Response.json({ jsonrpc: "2.0", id: payload.id, result: { content: [{ type: "text", text: "ok" }] } });
+    } });
+    const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+    const tool = (await gateway.listToolsForSession(session.token)).find(t => t.catalogEntryId === fixture.catalogEntry.id)!;
+    const call = gateway.executeTool({ sessionToken: session.token, tool: tool.name, parameters: {} });
+    if (mutation === "none") {
+      await expect(call).resolves.toMatchObject({ status: "completed" });
+      expect(methods).toEqual(["initialize", "notifications/initialized", "tools/call"]);
+    } else {
+      await expect(call).rejects.toMatchObject({ reasonCode: mutation === "application" ? "application_disabled" : "app_preparation_stale" });
+      expect(methods).toEqual(["initialize"]);
+    }
+  });
+
   it("maps remote MCP elicitation to a durable issue interaction", async () => {
     const { company, agent, run } = await createRunFixture(db);
     await createRemoteMcpToolFixture(db, company.id);
@@ -1601,7 +1642,7 @@ describeEmbeddedPostgres("tool gateway service", () => {
     });
   });
 
-  it("refreshes Vercel tokens after an upstream 401 without replaying the tool call", async () => {
+  it.each(["none", "revoked", "references"])("preserves Vercel preparation authority and explicit retry: %s", async (mutation) => {
     const { company, agent, run } = await createRunFixture(db);
     const { connection } = await createRemoteMcpToolFixture(db, company.id);
     await db.update(toolConnections).set({
@@ -1631,12 +1672,18 @@ describeEmbeddedPostgres("tool gateway service", () => {
       selectors: { riskLevel: "read" },
     });
 
-    const getToken = vi.fn<VercelConnectClient["getToken"]>(async (_request, options) => ({
+    const getToken = vi.fn<VercelConnectClient["getToken"]>(async (_request, options) => {
+      if (mutation === "revoked") await db.update(connectionGrants).set({ status: "revoked", revokedAt: new Date() })
+        .where(eq(connectionGrants.connectionId, connection.id));
+      if (mutation === "references") await db.update(connectionGrants).set({ externalCredential: null, credentialSecretRefs: [
+        { configPath: "token", secretId: randomUUID(), versionSelector: "latest" },
+      ] }).where(eq(connectionGrants.connectionId, connection.id));
+      return {
       token: options?.forceRefresh ? "fresh-provider-bearer" : "stale-provider-bearer",
       tokenId: options?.forceRefresh ? "stk_fresh" : "stk_stale",
       expiresAt: Date.now() + 60_000,
       connector: { id: "scl_posthog", uid: "posthog-paperclip", type: "api-key" },
-    }));
+    }; });
     const evict = vi.fn<VercelConnectClient["evict"]>();
     const vercelConnectClient: VercelConnectClient = {
       getConnectorMetadata: vi.fn(),
@@ -1663,6 +1710,15 @@ describeEmbeddedPostgres("tool gateway service", () => {
     const tool = (await gateway.listToolsForSession(session.token))
       .find((candidate) => candidate.providerType === "mcp_remote_http");
 
+    if (mutation !== "none") {
+      await expect(gateway.executeTool({ sessionToken: session.token, tool: tool!.name, parameters: {} }))
+        .rejects.toMatchObject({ status: 409, reasonCode: "app_preparation_stale" });
+      expect(authorizationHeaders).toEqual([]);
+      const [stored] = await db.select().from(connectionGrants).where(eq(connectionGrants.connectionId, connection.id));
+      if (mutation === "revoked") expect(stored.status).toBe("revoked");
+      else expect(stored.credentialSecretRefs).toHaveLength(1);
+      return;
+    }
     await expect(gateway.executeTool({
       sessionToken: session.token,
       tool: tool!.name,
