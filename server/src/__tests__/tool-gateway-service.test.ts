@@ -1131,7 +1131,7 @@ describeEmbeddedPostgres("tool gateway service", () => {
     expect(requests[1]?.status).toBe("pending");
   });
 
-  it.each(["none", "expiry", "formal"])("revalidates approved plugin admission: %s", async (mutation) => {
+  it.each(["none", "expiry", "formal", "claim", "signature", "arguments", "invocation", "confirmation", "issue"])("revalidates approved plugin admission: %s", async (mutation) => {
     const { company, agent, run } = await createRunFixture(db);
     await db.insert(toolPolicies).values({
       companyId: company.id,
@@ -1207,6 +1207,24 @@ describeEmbeddedPostgres("tool gateway service", () => {
           if (mutation === "expiry") {
             await policyDb.update(toolActionRequests).set({ expiresAt: new Date(0) })
               .where(eq(toolActionRequests.id, actionRequest.id));
+          } else if (mutation === "claim") {
+            await policyDb.update(toolActionRequests).set({ updatedAt: new Date(0) })
+              .where(eq(toolActionRequests.id, actionRequest.id));
+          } else if (mutation === "signature") {
+            await policyDb.update(toolActionRequests).set({ signedArguments: "tampered" })
+              .where(eq(toolActionRequests.id, actionRequest.id));
+          } else if (mutation === "arguments") {
+            await policyDb.update(toolActionRequests).set({ canonicalArgumentsHash: "tampered" })
+              .where(eq(toolActionRequests.id, actionRequest.id));
+          } else if (mutation === "invocation") {
+            await policyDb.update(toolInvocations).set({ toolName: "fixture:other" })
+              .where(eq(toolInvocations.id, actionRequest.invocationId));
+          } else if (mutation === "confirmation") {
+            await policyDb.update(issueThreadInteractions).set({ status: "rejected" })
+              .where(eq(issueThreadInteractions.id, actionRequest.interactionId!));
+          } else if (mutation === "issue") {
+            await policyDb.update(issues).set({ status: "done" })
+              .where(eq(issues.id, session.issueId!));
           } else {
             await policyDb.update(approvals).set({ status: "rejected" })
               .where(eq(approvals.id, approval.id));
@@ -1221,7 +1239,8 @@ describeEmbeddedPostgres("tool gateway service", () => {
         await expect(gateway.executeTool({ sessionToken: session.token,
           tool: "fixture:delete_everything", approvedActionRequestId: actionRequest.id,
           parameters: { target: "tampered" } })).rejects.toMatchObject({
-            reasonCode: mutation === "expiry" ? "action_claim_stale" : "formal_approval_required",
+            reasonCode: mutation === "formal" ? "formal_approval_required"
+              : ["confirmation", "issue"].includes(mutation) ? "action_scope_mismatch" : "action_claim_stale",
           });
         expect(worker).not.toHaveBeenCalled();
       } finally { policySpy.mockRestore(); }
