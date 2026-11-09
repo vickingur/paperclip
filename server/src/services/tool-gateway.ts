@@ -1293,6 +1293,30 @@ export function createToolGatewayService(
     if (!session.agentId || !session.runId || !pluginToolDispatcher) {
       throw new ToolGatewayHttpError(403, "Plugin tools require an agent run context", "agent_context_required");
     }
+    return dispatchUnderAdmission(session, tool, parameters, () => {
+      // No await between registry identity validation and dispatcher entry.
+      const expected = pinPluginDescriptor(tool);
+      const fresh = pluginTools().find(entry => entry.name === tool.name);
+      const actual = fresh && pinPluginDescriptor(fresh);
+      if (!actual || actual.pluginId !== expected.pluginId || actual.descriptorDigest !== expected.descriptorDigest) {
+        throw new ToolGatewayHttpError(403, "Plugin descriptor changed before dispatch", "native_assignment_tool_stale");
+      }
+      return pluginToolDispatcher!.executeTool(tool.name, parameters, {
+        agentId: session.agentId!, runId: session.runId!, companyId: session.companyId,
+        projectId: session.projectId ?? "",
+      });
+    }, approvedClaim);
+  }
+
+  // The callback must enter the provider synchronously. Return its promise in
+  // an envelope so transaction completion releases locks before provider work.
+  async function dispatchUnderAdmission<T>(
+    session: ToolGatewaySession,
+    tool: ToolGatewayDescriptor,
+    parameters: unknown,
+    enter: () => Promise<T>,
+    approvedClaim?: typeof toolActionRequests.$inferSelect,
+  ): Promise<T> {
     const admitted = await db.transaction(async (tx) => {
       // SHARE conflicts with every INSERT/UPDATE/DELETE (including new deny
       // rows). Row locks alone cannot fence policy insertions. Keep this short:
@@ -1417,21 +1441,9 @@ export function createToolGatewayService(
           }
         }
       }
-      // No await between registry identity validation and dispatcher entry.
-      const fresh = pluginTools().find(entry => entry.name === tool.name);
-      const actual = fresh && pinPluginDescriptor(fresh);
-      if (!actual || actual.pluginId !== expected.pluginId || actual.descriptorDigest !== expected.descriptorDigest) {
-        throw new ToolGatewayHttpError(403, "Plugin descriptor changed before dispatch", "native_assignment_tool_stale");
-      }
-      const execution = pluginToolDispatcher.executeTool(tool.name, parameters, {
-        agentId: session.agentId!, runId: session.runId!, companyId: session.companyId,
-        projectId: session.projectId ?? "",
-      });
-      // A fast worker rejection can precede transaction commit; keep it handled
-      // while preserving the original promise for the caller.
+      const execution = enter();
+      // Handle early rejection without awaiting external work under DB locks.
       void execution.catch(() => {});
-      // Do not retain database locks while a previously admitted operation runs.
-      // The envelope prevents the transaction from awaiting the worker promise.
       return { execution };
     }, { isolationLevel: "read committed" });
     return admitted.execution;
