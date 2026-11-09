@@ -4824,6 +4824,35 @@ export function createToolGatewayService(
     return findOrganizationGrant();
   }
 
+  async function assertAppRunInventory(session: ToolGatewaySession, entry: typeof toolCatalogEntries.$inferSelect) {
+    if (!session.agentId || !session.runId) return;
+    const [run] = await db.select().from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.id, session.runId), eq(heartbeatRuns.companyId, session.companyId),
+      eq(heartbeatRuns.agentId, session.agentId),
+    ));
+    const stored = run?.contextSnapshot?.nativeToolAssignment as { digest?: string } | undefined;
+    if (stored === undefined) {
+      if (session.gatewayProfileId) {
+        const [profile] = await db.select().from(toolProfiles).where(and(
+          eq(toolProfiles.id, session.gatewayProfileId), eq(toolProfiles.companyId, session.companyId),
+        ));
+        if (profile?.profileKey.startsWith("native:") || profile?.metadata?.source === "paperclip_runner") {
+          throw new ToolGatewayHttpError(403, "Native run inventory is missing", "native_assignment_not_captured");
+        }
+      }
+      return;
+    }
+    if (run?.status !== "running") {
+      throw new ToolGatewayHttpError(403, "App run is inactive", "native_assignment_run_inactive");
+    }
+    const captured = await readToolAssignmentInventory(db, {
+      companyId: session.companyId, agentId: session.agentId, runId: session.runId,
+    }, stored.digest ?? "");
+    if (!captured.assignment.connections.includes(entry.connectionId) || !captured.assignment.tools.includes(entry.id)) {
+      throw new ToolGatewayHttpError(403, "App tool is outside the run inventory", "native_assignment_tool_stale");
+    }
+  }
+
   async function resolveConnectedRemoteTool(
     session: ToolGatewaySession,
     tool: ToolGatewayDescriptor,
@@ -4889,6 +4918,7 @@ export function createToolGatewayService(
     if (isRailwayEndpoint(connection.config.url) && isRailwayToolBlocked(entry.toolName)) {
       throw new ToolGatewayHttpError(403, "This Railway action cannot bind its effects to an approved target. Use redeploy, restart, or rollback for an existing deployment.", "railway_action_blocked");
     }
+    await assertAppRunInventory(session, entry);
     return { entry, connection };
   }
 
@@ -4979,6 +5009,7 @@ export function createToolGatewayService(
         },
       );
     }
+    await assertAppRunInventory(session, entry);
     return { entry, connection };
   }
 

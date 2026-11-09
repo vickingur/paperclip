@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { and, eq } from "drizzle-orm";
 import { randomUUID } from "node:crypto";
-import { agents, companies, createDb, heartbeatRuns, toolProfiles, toolProfileBindings, toolProfileEntries, toolPolicies } from "@paperclipai/db";
+import { agents, companies, createDb, connectionGrants, toolApplications, toolConnections, toolCatalogEntries, heartbeatRuns, toolProfiles, toolProfileBindings, toolProfileEntries, toolPolicies } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { createToolGatewayService } from "../services/tool-gateway.js";
 import { registerAssignedMcpGateway } from "../services/native-runtime/assigned-mcp-tools.js";
@@ -48,6 +48,21 @@ const support = await getEmbeddedPostgresTestSupport();
       expect(servers).toHaveLength(1);
       expect(servers[0]!.connectionId).toBe(`assignment:${fresh.digest}`);
       await expect(buildPaperclipRuntimeMcpServers({ db, agent: agent!, runId: failedRun!.id, expectedAssignmentDigest: "wrong" })).rejects.toThrow("native_assignment_digest_mismatch");
+      // A broad session must not enlarge a captured plugin-only assignment.
+      const [application] = await db.insert(toolApplications).values({ companyId: company!.id, applicationKey: "synthetic-app", name: "Synthetic app", type: "mcp_http" }).returning();
+      const [connection] = await db.insert(toolConnections).values({ companyId: company!.id, applicationId: application!.id, name: "Synthetic remote", uid: "synthetic-remote", healthStatus: "ok", transport: "mcp_remote", status: "active", enabled: true, credentialPolicy: "shared", config: { url: "https://8.8.8.8/mcp" } }).returning();
+      await db.insert(connectionGrants).values({ companyId: company!.id, connectionId: connection!.id, kind: "organization", status: "active", isDefault: true, credentialSecretRefs: [] });
+      const [catalog] = await db.insert(toolCatalogEntries).values({ companyId: company!.id, applicationId: application!.id, connectionId: connection!.id, entryKind: "tool", name: "read_note", toolName: "read_note", title: "Read note", riskLevel: "read", isReadOnly: true, status: "active", versionHash: "synthetic", schemaHash: "synthetic" }).returning();
+      await db.insert(toolProfileEntries).values({ companyId: company!.id, profileId: profile!.id, selectorType: "catalog_entry", effect: "include", catalogEntryId: catalog!.id, connectionId: connection!.id, applicationId: application!.id });
+      const remoteHttpRequest = vi.fn();
+      const appGateway = createToolGatewayService(db, { pluginToolDispatcher: dispatcher, remoteHttpRequest });
+      const appSession = await appGateway.createSession(failedBinding);
+      await expect(appGateway.executeTool({ sessionToken: appSession.token, tool: `mcp.synthetic-app-${connection!.id.replaceAll("-", "").slice(0, 8)}:read-note`, parameters: {} })).rejects.toMatchObject({ reasonCode: "native_assignment_tool_stale" });
+      expect(remoteHttpRequest).not.toHaveBeenCalled();
+      // Local stdio must fail before template resolution or process startup too.
+      await db.update(toolApplications).set({ type: "mcp_stdio" }).where(eq(toolApplications.id, application!.id));
+      await db.update(toolConnections).set({ transport: "local_stdio" }).where(eq(toolConnections.id, connection!.id));
+      await expect(appGateway.executeTool({ sessionToken: appSession.token, tool: `mcp.synthetic-app-${connection!.id.replaceAll("-", "").slice(0, 8)}:read-note`, parameters: {} })).rejects.toMatchObject({ reasonCode: "native_assignment_tool_stale" });
       // Direct plugin routes must respect the same persisted ceiling as MCP.
       const dispatchGateway = createToolGatewayService(db, { pluginToolDispatcher: dispatcher });
       const call = (tool: string) => dispatchGateway.executePluginTool({
