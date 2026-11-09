@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import * as accessPolicy from "../services/tool-access-policy.js";
 import { and, eq, sql } from "drizzle-orm";
 import { randomUUID } from "node:crypto";
-import { agents, companies, createDb, connectionGrants, toolApplications, toolConnections, toolCatalogEntries, heartbeatRuns, toolProfiles, toolProfileBindings, toolProfileEntries, toolPolicies, plugins } from "@paperclipai/db";
+import { agents, companies, createDb, connectionGrants, toolApplications, toolConnections, toolCatalogEntries, heartbeatRuns, toolProfiles, toolProfileBindings, toolProfileEntries, toolPolicies, plugins, toolGatewaySessions } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { createToolGatewayService } from "../services/tool-gateway.js";
 import { registerAssignedMcpGateway } from "../services/native-runtime/assigned-mcp-tools.js";
@@ -177,6 +177,36 @@ const support = await getEmbeddedPostgresTestSupport();
       await expect(call(names[1]!)).rejects.toMatchObject({ reasonCode: "plugin_registration_inactive" });
       expect(executeTool).not.toHaveBeenCalled();
       await db.update(plugins).set({ status: "ready" }).where(eq(plugins.id, registration!.id));
+      // Authentication earlier in the request cannot authorize a session
+      // revoked during policy bookkeeping before final dispatcher admission.
+      const tokenSession = await dispatchGateway.createSession(failedBinding);
+      executeTool.mockResolvedValueOnce({ ok: true });
+      await dispatchGateway.executeTool({ sessionToken: tokenSession.token, tool: names[1]!, parameters: {} });
+      expect(executeTool).toHaveBeenCalledTimes(1);
+      executeTool.mockClear();
+      let revokeSession = true;
+      const tokenPolicy = vi.spyOn(accessPolicy, "toolAccessPolicyService").mockImplementation(policyDb => {
+        const service = originalPolicy(policyDb);
+        if (policyDb === db) {
+          const decide = service.decide;
+          service.decide = async (...args) => {
+            const result = await decide(...args);
+            if (revokeSession) {
+              revokeSession = false;
+              await db.update(toolGatewaySessions).set({ revokedAt: new Date() })
+                .where(eq(toolGatewaySessions.id, tokenSession.id));
+            }
+            return result;
+          };
+        }
+        return service;
+      });
+      const tokenGateway = createToolGatewayService(db, { pluginToolDispatcher: dispatcher });
+      await expect(tokenGateway.executeTool({ sessionToken: tokenSession.token,
+        tool: names[1]!, parameters: {} })).rejects.toMatchObject({ reasonCode: "session_invalid" });
+      expect(revokeSession).toBe(false);
+      expect(executeTool).not.toHaveBeenCalled();
+      tokenPolicy.mockRestore();
       const listSpy = vi.spyOn(dispatcher, "listToolsForAgent");
       const concurrent = await Promise.all(Array.from({ length: 3 }, () => capturePluginAssignmentInventory(db, binding)));
       expect(listSpy).toHaveBeenCalledTimes(1);

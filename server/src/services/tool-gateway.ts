@@ -1304,7 +1304,7 @@ export function createToolGatewayService(
         ${projects}, ${routines}, ${plugins}, ${principalPermissionGrants}, ${toolPolicies},
         ${toolProfiles}, ${toolProfileBindings}, ${toolProfileEntries},
         ${toolMcpGateways}, ${toolApplications}, ${toolConnections},
-        ${toolCatalogEntries} IN SHARE MODE`);
+        ${toolCatalogEntries}, ${toolGatewaySessions}, ${toolMcpGatewayTokens} IN SHARE MODE`);
       const admissionDb = tx as unknown as Db;
       const [run] = await admissionDb.select().from(heartbeatRuns).where(and(
         eq(heartbeatRuns.id, session.runId!), eq(heartbeatRuns.companyId, session.companyId),
@@ -1312,6 +1312,29 @@ export function createToolGatewayService(
       ));
       if (!run || run.status !== "running") {
         throw new ToolGatewayHttpError(403, "Plugin run is inactive", "native_assignment_run_inactive");
+      }
+      if (session.gatewayTokenId) {
+        const [token] = await admissionDb.select().from(toolMcpGatewayTokens).where(and(
+          eq(toolMcpGatewayTokens.id, session.gatewayTokenId),
+          eq(toolMcpGatewayTokens.companyId, session.companyId),
+          eq(toolMcpGatewayTokens.gatewayId, session.gatewayId!),
+        ));
+        if (!token || token.revokedAt || (token.expiresAt && token.expiresAt.getTime() <= Date.now())) {
+          throw new ToolGatewayHttpError(401, "Gateway bearer token is no longer valid", "gateway_token_invalid");
+        }
+        if (!normalizeGatewayTokenActions(token.allowedActions).includes("tools/call")) {
+          throw new ToolGatewayHttpError(403, "Gateway bearer token cannot call tools", "gateway_token_action_denied");
+        }
+      } else if (session.id !== "plugin-route") {
+        const [authenticated] = await admissionDb.select().from(toolGatewaySessions).where(and(
+          eq(toolGatewaySessions.id, session.id),
+          eq(toolGatewaySessions.companyId, session.companyId),
+          eq(toolGatewaySessions.agentId, session.agentId!),
+          eq(toolGatewaySessions.runId, session.runId!),
+        ));
+        if (!authenticated || authenticated.revokedAt || authenticated.expiresAt.getTime() <= Date.now()) {
+          throw new ToolGatewayHttpError(401, "Gateway session is no longer valid", "session_invalid");
+        }
       }
       const [registration] = await admissionDb.select({ status: plugins.status }).from(plugins)
         .where(eq(plugins.id, tool.pluginId!));
