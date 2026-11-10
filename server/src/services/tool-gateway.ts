@@ -1511,16 +1511,18 @@ export function createToolGatewayService(
       void execution.catch(() => {});
       return { execution };
     }, { isolationLevel: "read committed" }).catch((error: unknown) => {
+      // Any transaction failure after entry (including connection loss during
+      // commit) leaves the external outcome uncertain. Never advertise replay
+      // or attribute a local transaction failure to provider health.
+      if (providerEntered) {
+        throw new ToolGatewayHttpError(502, "Provider entered; dispatch outcome is uncertain", "dispatch_outcome_unknown");
+      }
       // Drizzle wraps PostgreSQL errors in `cause`. Contention before provider
       // entry is a local admission failure, not evidence of provider ill health.
       let cause: unknown = error;
       for (let depth = 0; depth < 8 && cause && typeof cause === "object"; depth++) {
         const failure = cause as { code?: unknown; cause?: unknown };
         if (failure.code === "55P03" || failure.code === "40P01" || failure.code === "57014" || failure.code === "40001") {
-          if (providerEntered) {
-            // A transaction error after entry must never advertise safe replay.
-            throw new ToolGatewayHttpError(502, "Provider entered; dispatch outcome is uncertain", "dispatch_outcome_unknown");
-          }
           throw new ToolGatewayHttpError(503, "Tool admission is temporarily busy", "admission_contended");
         }
         cause = failure.cause;

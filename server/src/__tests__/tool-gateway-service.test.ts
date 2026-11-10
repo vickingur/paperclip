@@ -1837,6 +1837,36 @@ describeEmbeddedPostgres("tool gateway service", () => {
     }
   });
 
+  it.each(["40001", "08006"])("reports uncertain dispatch after provider entry and transaction failure %s", async (code) => {
+    const { company, agent, run } = await createRunFixture(db);
+    const fixture = await createRemoteMcpToolFixture(db, company.id);
+    await db.insert(toolPolicies).values({ companyId: company.id, name: "Allow reads",
+      policyType: "allow", selectors: { riskLevel: "read" } });
+    const provider = vi.fn<NonNullable<ToolGatewayServiceOptions["remoteHttpRequest"]>>(async (_url, init) =>
+      Response.json({ jsonrpc: "2.0", id: JSON.parse(String(init.body)).id,
+        result: { content: [{ type: "text", text: "ok" }] } }));
+    const gateway = createTestToolGatewayService(db, { remoteHttpRequest: provider });
+    const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+    const tool = (await gateway.listToolsForSession(session.token)).find(t => t.catalogEntryId === fixture.catalogEntry.id)!;
+    const transaction = db.transaction.bind(db);
+    // Fail after the admission callback entered the provider, before commit.
+    const transactionSpy = vi.spyOn(db, "transaction").mockImplementation((callback, options) =>
+      transaction(async tx => {
+        const result = await callback(tx);
+        if (provider.mock.calls.length) throw Object.assign(new Error("Synthetic commit failure"), { code });
+        return result;
+      }, options));
+    try {
+      await expect(gateway.executeTool({ sessionToken: session.token, tool: tool.name, parameters: {} }))
+        .rejects.toMatchObject({ status: 502, reasonCode: "dispatch_outcome_unknown" });
+      expect(provider).toHaveBeenCalledTimes(1);
+    } finally { transactionSpy.mockRestore(); }
+    expect(provider).toHaveBeenCalledTimes(1); // Never automatically replay an entered call.
+    const [connection] = await db.select().from(toolConnections).where(eq(toolConnections.id, fixture.connection.id));
+    expect(connection.healthStatus).toBe(fixture.connection.healthStatus);
+    expect((await gateway.listToolsForSession(session.token)).some(t => t.catalogEntryId === fixture.catalogEntry.id)).toBe(true);
+  });
+
   it("fails closed when the company authority epoch is missing", async () => {
     const { company, agent, run } = await createRunFixture(db);
     const fixture = await createRemoteMcpToolFixture(db, company.id);
