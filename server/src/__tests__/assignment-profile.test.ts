@@ -19,6 +19,14 @@ describe("exact native assignment profile projection", () => {
     expect(JSON.stringify(entries)).not.toContain("new-catalog");
     expect(JSON.stringify(entries)).not.toContain("new_tool");
   });
+  it("preserves exact catalog routing when the application is absent", () => {
+    const unbound = { ...tool, applicationId: null };
+    expect(projectPinnedAssignmentProfile({ ...current, tools: [unbound], plugins: [] }))
+      .toEqual([{ selectorType: "catalog_entry", effect: "include", catalogEntryId: tool.id,
+        connectionId: tool.connectionId, applicationId: null }]);
+    expect(() => projectPinnedAssignmentProfile({ ...current, tools: [unbound, tool] }))
+      .toThrow("native_assignment_catalog_collision");
+  });
   it("withholds revoked connections, catalog entries and changed plugin registrations", () => {
     expect(projectPinnedAssignmentProfile({ ...current, connections: [], plugins: [] })).toEqual([]);
     expect(projectPinnedAssignmentProfile({ ...current, tools: [], plugins: [] })).toEqual([]);
