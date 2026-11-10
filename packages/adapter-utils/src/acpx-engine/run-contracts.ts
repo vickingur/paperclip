@@ -475,6 +475,8 @@ export interface SessionFingerprintIdentity {
   readonly skillPromptInstructions: string;
   readonly paperclipClaudeSettings: PaperclipClaudeSettingsIdentity | null;
   readonly mcpServers: readonly McpServerIdentity[];
+  /** Policy-filtered plugin catalog; independent of per-run MCP credentials. */
+  readonly pluginToolInventoryDigest?: string | null;
   readonly secretManifestHash: string;
   readonly adapterEnvHash: string;
   /**

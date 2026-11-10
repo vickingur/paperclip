@@ -42,7 +42,7 @@ export function railwaySshArguments(directory: string, instanceId: string): stri
   ];
 }
 
-export async function runRailwaySshCommand(input: RailwaySshInput & { privateKey: string; knownHosts: string }) {
+export async function runRailwaySshCommand(input: RailwaySshInput & { privateKey: string; knownHosts: string; admit?: <T>(enter: () => Promise<T>) => Promise<T> }) {
   input.signal.throwIfAborted();
   const knownHosts = validateRailwayKnownHosts(input.knownHosts);
   if (!input.privateKey.startsWith("-----BEGIN OPENSSH PRIVATE KEY-----")) throw new RailwayError("railway_ssh_key_invalid", "Regenerate the Railway connection's SSH key.", 422);
@@ -51,7 +51,8 @@ export async function runRailwaySshCommand(input: RailwaySshInput & { privateKey
     await writeFile(path.join(directory, "identity"), input.privateKey, { mode: 0o600 });
     await writeFile(path.join(directory, "known_hosts"), knownHosts, { mode: 0o600 });
     input.signal.throwIfAborted();
-    return await new Promise<{ exitCode: number | null; stdout: string; stderr: string; truncated: boolean; timedOut: boolean }>((resolve, reject) => {
+    const enter = () => new Promise<{ exitCode: number | null; stdout: string; stderr: string; truncated: boolean; timedOut: boolean }>((resolve, reject) => {
+      input.signal.throwIfAborted();
       // No developer SSH config/agent, CLI login, provider token or ambient env.
       const child = spawn("/usr/bin/ssh", railwaySshArguments(directory, input.deploymentInstanceId), { env: { PATH: "/usr/bin:/bin", LANG: "C.UTF-8" }, stdio: ["pipe", "pipe", "pipe"] });
       let stdout = "", stderr = "", bytes = 0, truncated = false, timedOut = false, deliveryFailed = false;
@@ -87,5 +88,8 @@ export async function runRailwaySshCommand(input: RailwaySshInput & { privateKey
       const quotedCommand = "'" + input.command.replace(/'/g, "'\\''") + "'";
       child.stdin.end(`sh -c ${quotedCommand} </dev/null\npaperclip_command_status=$?\nprintf '\\n${marker}:%d\\n' "$paperclip_command_status"\nexit "$paperclip_command_status"\n`);
     });
+    // Preparation performs async filesystem work. Admit only after it finishes,
+    // with process creation synchronous inside the admission callback.
+    return await (input.admit ? input.admit(enter) : enter());
   } finally { await rm(directory, { recursive: true, force: true }); }
 }

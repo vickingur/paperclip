@@ -2342,6 +2342,11 @@ async function buildRuntime(input: {
     // Qualified built-in ACP harnesses reconnect to the supplied MCP servers
     // on session/load. Keep their conversation identity independent of tools.
     mcpServers: ["claude", "codex", "grok", "gemini", "kimi"].includes(acpxAgent) ? [] : mcpIdentity,
+    // session/load may reconnect MCP without refreshing a cached plugin catalog.
+    // Change the conversation identity when the agent's visible tools change.
+    ...(asString(context.paperclipPluginToolInventoryDigest, "")
+      ? { pluginToolInventoryDigest: asString(context.paperclipPluginToolInventoryDigest, "") }
+      : {}),
     secretManifestHash: shortHash(secretManifest),
     // Fold the resolved adapter env (all applied user-configured values —
     // plain, secret_ref, and stable PAPERCLIP_* config such as an explicit

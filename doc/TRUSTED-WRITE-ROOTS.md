@@ -56,8 +56,11 @@ directories, not symlinks, owned by root or the server uid, not group/world
 writable; the root is not inside, and does not contain, any of the run's
 writable roots (cwd, `/tmp`, temp dirs, agent home, scratch, referenced
 projects, `CODEX_CONFIG` writable roots); no nesting between roots; no
-`.git`, `.codex` or `.agents` entry (only a confirmed `ENOENT` counts as
-absent; `EACCES`, `EIO` or any other lookup error drops the root); not `/`, `/paperclip` or
+`.git`, `.codex` or `.agents` content. An entry may be absent (confirmed
+`ENOENT`) or an empty real directory owned by the server uid with no
+group/world write bits. Symlinks, files, foreign owners, non-empty directories
+and inspection errors drop the root. The directory identity and mode are
+checked again after listing its children; not `/`, `/paperclip` or
 `/paperclip/worktrees`. It records `{dev, ino}`, re-checks right before the
 borrow/spawn decision and again before a prompt on a reused warm runtime, and
 codex-acp re-checks before every turn. Any failure drops that root.
@@ -177,5 +180,20 @@ lock inode and preserved bans and holds.
   §3.7 window). D1 accepts this for the VIK-2195 grant only; D2 (protected
   parents through the deploy boundary) is required before any second grant.
 - Codex mounts read-only `.git`/`.agents`/`.codex` targets inside each writable
-  root while a command runs. If a validation runs at that moment, the root is
-  rejected (fail closed, no grant for that run).
+  root while a command runs. Empty server-owned directories now pass admission,
+  including targets left after a command. No cleanup deletes host entries.
+  This exception does not prove which process created a given directory.
+- The pinned Codex 0.160.0 Linux sandbox source constructs missing protected
+  metadata targets with `--tmpfs` and `--remount-ro`, and tracks synthetic
+  targets for cleanup. See [the pinned implementation](https://github.com/openai/codex/blob/rust-v0.160.0/codex-rs/linux-sandbox/src/bwrap.rs).
+  There is no change here to Codex's metadata protection. Disabling it would
+  weaken the sandbox; deleting empty entries at teardown could race other
+  runs. Admission therefore tolerates only the restricted empty-directory
+  shape and retains every other validation check.
+- Regression tests simulate target creation between two engine runs and also
+  use real temporary directories for consecutive validator admissions. These
+  tests prove admission behavior, not a full sandbox lifecycle. A nested
+  pinned-binary sandbox probe in the restricted development runtime failed
+  before launch with `app-server socket directory must be a user-owned
+  directory with mode 0700`. The historical creator and cleanup failure still
+  require runner-side qualification; they are not established by these tests.

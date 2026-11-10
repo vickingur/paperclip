@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { pinPluginDescriptor } from "./pinned-tool-assignment.js";
 import type { Db } from "@paperclipai/db";
 import { ToolGatewayHttpError, type ToolGatewayDescriptor, type ToolGatewayService } from "../tool-gateway.js";
 
@@ -70,6 +71,27 @@ export async function resolveAssignedConnectionInstructionsForRun(db: Db, bindin
   return gateway ? gateway.resolveConnectionInstructionsForRun(binding) : null;
 }
 
+// Resolve the policy-filtered plugin catalog on every run. No configured gateway
+// means no delivered plugin tools; tokens and run IDs never enter this digest.
+export async function resolveAssignedPluginToolInventoryDigestForRun(
+  db: Db, binding: { companyId: string; agentId: string },
+): Promise<string | null> {
+  const gateway = assignedMcpGateways.get(db);
+  if (!gateway) return null;
+  const tools = await gateway.listPluginToolsForAgent(binding);
+  function canonical(value: unknown): unknown {
+    if (Array.isArray(value)) return value.map(canonical);
+    if (value && typeof value === "object") {
+      return Object.fromEntries(Object.entries(value).sort(([a], [b]) => a.localeCompare(b))
+        .map(([key, entry]) => [key, canonical(entry)]));
+    }
+    return value;
+  }
+  return createHash("sha256").update(JSON.stringify(canonical(
+    tools.map(pinPluginDescriptor).sort((a, b) => a.name.localeCompare(b.name)),
+  ))).digest("hex");
+}
+
 function assignedToolName(name: string): string {
   const sanitize = (value: string) => value.replace(/[^a-zA-Z0-9_]+/g, "_").replace(/^_+|_+$/g, "");
   const separator = name.lastIndexOf(":");
@@ -95,8 +117,27 @@ export async function createAssignedMcpTools(input: {
   for (const descriptor of listed) {
     const name = assignedToolName(descriptor.name);
     if (tools.has(name)) throw new Error("assigned_mcp_tool_name_collision");
-    tools.set(name, descriptor);
+    tools.set(name, structuredClone(descriptor));
   }
+  // Compare only the descriptor contract and routing identity. Transport metadata
+  // may contain credentials and must never become part of the session ceiling.
+  const identity = (tool: ToolGatewayDescriptor) => JSON.stringify({
+    ...pinPluginDescriptor(tool), providerType: tool.providerType, risk: tool.risk,
+    connectionId: tool.connectionId ?? null, catalogEntryId: tool.catalogEntryId ?? null,
+    upstreamToolName: tool.upstreamToolName ?? null,
+  });
+  const pinnedIdentities = new Map([...tools].map(([name, tool]) => [name, identity(tool)]));
+  async function currentTools() {
+    const current = new Map<string, ToolGatewayDescriptor>();
+    for (const tool of await input.gateway.listToolsForNamedGateway({
+      gatewayPublicId: input.gatewayPublicId, bearerToken: input.bearerToken,
+    })) {
+      if (current.has(tool.name)) throw new Error("assigned_mcp_tool_name_collision");
+      current.set(tool.name, tool);
+    }
+    return current;
+  }
+  const matchesPin = (name: string, tool: ToolGatewayDescriptor) => pinnedIdentities.get(name) === identity(tool);
   const permits = (tool: ToolGatewayDescriptor, mode: WorkMode = input.workMode ?? "standard") => mode === "standard" || tool.risk === "read";
 
   async function search(argumentsValue: unknown, currentWorkMode?: WorkMode) {
@@ -114,13 +155,11 @@ export async function createAssignedMcpTools(input: {
     }
     // Intersect fresh grants with this session's pinned catalog. Revocations
     // take effect immediately; newly assigned tools require a new session.
-    const current = new Map((await input.gateway.listToolsForNamedGateway({
-      gatewayPublicId: input.gatewayPublicId, bearerToken: input.bearerToken,
-    })).map(tool => [tool.name, tool]));
+    const current = await currentTools();
     const terms = args.query.toLowerCase().trim().split(/\s+/).filter(Boolean);
-    const authorized = [...tools].filter(([, tool]) => {
+    const authorized = [...tools].filter(([name, tool]) => {
       const fresh = current.get(tool.name);
-      return fresh && permits(tool) && permits(tool, currentWorkMode) &&
+      return fresh && matchesPin(name, fresh) && permits(tool) && permits(tool, currentWorkMode) &&
         permits(fresh) && permits(fresh, currentWorkMode);
     });
     if (typeof args.schemaTool === "string") {
@@ -177,6 +216,9 @@ export async function createAssignedMcpTools(input: {
       const descriptor = tools.get(name);
       if (!descriptor) throw new Error("assigned_mcp_tool_unknown");
       if (!permits(descriptor) || !permits(descriptor, currentWorkMode)) throw new Error("paperclip_runner_tool_mode_denied");
+      const fresh = (await currentTools()).get(descriptor.name);
+      if (!fresh || !matchesPin(name, fresh)) throw new Error("assigned_mcp_tool_stale");
+      if (!permits(fresh) || !permits(fresh, currentWorkMode)) throw new Error("paperclip_runner_tool_mode_denied");
       // Reauthorize through the existing gateway on every call. Discovery is
       // not a grant: revocation, policy, approval, and audit remain server-owned.
       const result = await input.gateway.executeTool({

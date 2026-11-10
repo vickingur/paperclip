@@ -178,7 +178,7 @@ describeEmbeddedPostgres("heartbeat runtime MCP servers", () => {
         runId: randomUUID(),
         expectedAssignmentDigest: "0".repeat(64),
       }),
-    ).resolves.toEqual([]);
+    ).rejects.toThrow("native_assignment_run_scope_mismatch");
     expect(await db.select().from(toolMcpGatewayTokens)).toHaveLength(2);
 
     await db.update(toolConnections)
@@ -191,7 +191,7 @@ describeEmbeddedPostgres("heartbeat runtime MCP servers", () => {
         runId: randomUUID(),
         expectedAssignmentDigest: first[0]!.connectionId.slice("assignment:".length),
       }),
-    ).resolves.toEqual([]);
+    ).rejects.toThrow("native_assignment_run_scope_mismatch");
     expect(await db.select().from(toolMcpGatewayTokens)).toHaveLength(2);
     await expect(
       createManagedMcpRunConfig({

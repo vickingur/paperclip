@@ -9,12 +9,15 @@ import {
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const serviceMocks = vi.hoisted(() => ({
+  captureToolAssignmentInventory: vi.fn(),
   exportFiles: vi.fn(),
   readCommittedForRuntime: vi.fn(),
   getEffectiveProfilesForAgent: vi.fn(),
   githubBotConnectionIdsForRun: vi.fn(),
   spekoToolsForSession: vi.fn(),
 }));
+
+vi.mock("./plugin-assignment-inventory.js", () => ({ captureToolAssignmentInventory: serviceMocks.captureToolAssignmentInventory }));
 
 vi.mock("../voice/speko-agent-tools.js", () => ({ spekoToolsForSession: serviceMocks.spekoToolsForSession }));
 vi.mock("../chat-github-tools.js", () => ({
@@ -36,8 +39,8 @@ vi.mock("../tool-access.js", () => ({
   }),
 }));
 
-import { createHash } from "node:crypto";
-import { buildNativeRuntimeContext, resolveNativeRuntimeMcpSnapshot } from "./runtime-context.js";
+import { createPinnedToolAssignment, pinnedToolAssignmentDigest } from "./pinned-tool-assignment.js";
+import { buildNativeRuntimeContext, captureNativeRuntimeToolAssignment, resolveNativeRuntimeMcpSnapshot } from "./runtime-context.js";
 
 const temporaryRoots: string[] = [];
 let previousPaperclipHome: string | undefined;
@@ -59,6 +62,11 @@ async function makeTreeWritable(target: string): Promise<void> {
 beforeEach(async () => {
   vi.clearAllMocks();
   serviceMocks.readCommittedForRuntime.mockResolvedValue(null);
+  serviceMocks.captureToolAssignmentInventory.mockImplementation(async (_db, _binding, resolveApps) => {
+    const apps = await resolveApps();
+    const assignment = createPinnedToolAssignment({ ...apps, plugins: [] });
+    return { assignment, digest: pinnedToolAssignmentDigest(assignment) };
+  });
   serviceMocks.githubBotConnectionIdsForRun.mockResolvedValue(new Set());
   serviceMocks.spekoToolsForSession.mockResolvedValue([]);
   previousPaperclipHome = process.env.PAPERCLIP_HOME;
@@ -100,6 +108,34 @@ afterEach(async () => {
 });
 
 describe("buildNativeRuntimeContext", () => {
+  it("refreshes native compatibility for plugin grants and descriptor changes without run-binding churn", async () => {
+    serviceMocks.exportFiles.mockResolvedValue({ entryFile: "AGENTS.md", files: { "AGENTS.md": "Synthetic instructions\n" } });
+    const tool = (name: string, parametersSchema = {}) => ({ name, pluginId: "synthetic", displayName: name, description: "Synthetic", parametersSchema });
+    const input = { db: {} as Db, agent: { id: "agent-1", companyId: "company-1", name: "Synthetic", adapterConfig: {} }, runId: "run-1", runtimeConfig: {}, runtimeSkillEntries: [] };
+    const capture = (plugins: ReturnType<typeof tool>[]) => {
+      const assignment = createPinnedToolAssignment({ connections: [], tools: [], plugins });
+      serviceMocks.captureToolAssignmentInventory.mockResolvedValue({ assignment, digest: pinnedToolAssignmentDigest(assignment) });
+    };
+    capture([tool("synthetic:status")]);
+    const before = await buildNativeRuntimeContext(input);
+    const nextRun = await buildNativeRuntimeContext({ ...input, runId: "run-2" });
+    expect(nextRun.mcp.bindingId).not.toBe(before.mcp.bindingId);
+    expect(nextRun.aggregateDigest).toBe(before.aggregateDigest);
+    capture([tool("synthetic:status"), tool("synthetic:asset_put")]);
+    const granted = await buildNativeRuntimeContext(input);
+    expect(granted.aggregateDigest).not.toBe(before.aggregateDigest);
+    capture([tool("synthetic:asset_put"), tool("synthetic:status")]);
+    expect((await buildNativeRuntimeContext(input)).aggregateDigest).toBe(granted.aggregateDigest);
+    capture([tool("synthetic:status", { type: "string" }), tool("synthetic:asset_put")]);
+    expect((await buildNativeRuntimeContext(input)).aggregateDigest).not.toBe(granted.aggregateDigest);
+    capture([]);
+    const revoked = await buildNativeRuntimeContext(input);
+    expect(revoked.mcp.bindingId).toBeNull();
+    expect(revoked.aggregateDigest).not.toBe(before.aggregateDigest);
+    capture([tool("synthetic:status")]);
+    expect((await buildNativeRuntimeContext(input)).aggregateDigest).toBe(before.aggregateDigest);
+  });
+
   it("uses committed instructions when the disk projection is stale", async () => {
     serviceMocks.exportFiles.mockResolvedValue({
       entryFile: "AGENTS.md",
@@ -385,10 +421,10 @@ it("pins both permitted GitHub tool catalogs even when another user’s health p
   const limit = vi.fn(async () => [{ responsibleUserId: "A", activeIdentityContextId: "context-A" }]);
   const db = { select: () => ({ from: () => ({ where: () => ({ limit }) }) }) } as unknown as Db;
   const snapshot = await resolveNativeRuntimeMcpSnapshot({ db, agent: { id: "agent-1", companyId: "company-1" }, runId: "run-1" });
-  const expected = createHash("sha256").update(JSON.stringify({
-    version: 1, agentId: "agent-1", connections: ["github-A", "github-B"],
+  const expected = pinnedToolAssignmentDigest(createPinnedToolAssignment({
+    plugins: [], connections: ["github-A", "github-B"],
     tools: ["github-A-get_me", "github-B-get_me"],
-  })).digest("hex");
+  }));
   expect(snapshot.digest).toBe(expected);
   expect(snapshot.bindingId).toBe("native-mcp:run-1");
   expect(limit).toHaveBeenCalledOnce();
@@ -419,4 +455,38 @@ it("pins a voice tool only when the current requester can call through that assi
   serviceMocks.spekoToolsForSession.mockResolvedValue([{ connectionId: "voice-connection" }]);
   expect((await resolveNativeRuntimeMcpSnapshot(input)).bindingId).toBe("native-mcp:run-1");
   expect(serviceMocks.spekoToolsForSession).toHaveBeenLastCalledWith(db, { companyId: "company-1", agentId: "agent-1", runId: "run-1", issueId: "task-1", identityContextId: "identity-1" });
+});
+
+ it("captures apps using authoritative run selection only when the persistence layer requests it", async () => {
+  const db = {} as Db;
+  const pin = { assignment: { version: 2, connections: [], tools: [], plugins: [] }, digest: "stored" };
+  serviceMocks.captureToolAssignmentInventory.mockImplementationOnce(async (database, binding, resolveApps) => {
+    expect(database).toBe(db);
+    expect(binding).toEqual({ companyId: "company-1", agentId: "agent-1", runId: "run-1" });
+    expect(await resolveApps()).toEqual({ version: 1, agentId: "agent-1", connections: ["connection-1"], tools: ["tool-1"] });
+    return pin;
+  });
+  const input = { db, agent: { id: "agent-1", companyId: "company-1" }, runId: "run-1" };
+  expect(await captureNativeRuntimeToolAssignment(input)).toBe(pin);
+  serviceMocks.getEffectiveProfilesForAgent.mockClear();
+  serviceMocks.captureToolAssignmentInventory.mockResolvedValueOnce(pin);
+  expect(await captureNativeRuntimeToolAssignment(input)).toBe(pin);
+  expect(serviceMocks.getEffectiveProfilesForAgent).not.toHaveBeenCalled();
+});
+
+
+it("projects the persisted mixed inventory digest and connectionless plugin binding without rediscovery", async () => {
+  const { resolveCapturedNativeRuntimeMcpSnapshot } = await import("./runtime-context.js");
+  const input = { db: {} as Db, agent: { id: "agent-1", companyId: "company-1" }, runId: "run-1" };
+  const assignment = { version: 2, connections: [], tools: [], plugins: [{ name: "synthetic:read", pluginId: "synthetic", descriptorDigest: "a".repeat(64) }] };
+  serviceMocks.captureToolAssignmentInventory.mockResolvedValue({ assignment, digest: "persisted-digest" });
+  serviceMocks.getEffectiveProfilesForAgent.mockClear();
+  expect(await resolveCapturedNativeRuntimeMcpSnapshot(input)).toEqual({ assignmentSetId: "sha256:persisted-digest", digest: "persisted-digest", bindingId: "native-mcp:run-1" });
+  serviceMocks.captureToolAssignmentInventory.mockResolvedValueOnce({ assignment: { ...assignment, plugins: [], connections: ["app"] }, digest: "mixed-digest" });
+  expect((await resolveCapturedNativeRuntimeMcpSnapshot(input)).bindingId).toBe("native-mcp:run-1");
+  serviceMocks.captureToolAssignmentInventory.mockResolvedValueOnce({ assignment: { ...assignment, plugins: [] }, digest: "empty-digest" });
+  expect(await resolveCapturedNativeRuntimeMcpSnapshot(input)).toEqual({ assignmentSetId: "sha256:empty-digest", digest: "empty-digest", bindingId: null });
+  expect(serviceMocks.getEffectiveProfilesForAgent).not.toHaveBeenCalled();
+  serviceMocks.captureToolAssignmentInventory.mockRejectedValueOnce(new Error("native_assignment_invalid_persisted_inventory"));
+  await expect(resolveCapturedNativeRuntimeMcpSnapshot(input)).rejects.toThrow("native_assignment_invalid_persisted_inventory");
 });

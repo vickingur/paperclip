@@ -25,6 +25,8 @@ import {
 import { resolvePaperclipInstanceRoot } from "../../home-paths.js";
 import { agentInstructionsService, agentInstructionsBundleMode } from "../agent-instructions.js";
 import { agentInstructionRevisionService } from "../agent-instruction-revisions.js";
+import { hasPinnedTools } from "./pinned-tool-assignment.js";
+import { captureToolAssignmentInventory } from "./plugin-assignment-inventory.js";
 import { toolAccessService } from "../tool-access.js";
 import { filterResolvedGitHubConnectionsForRun } from "../git-credentials.js";
 
@@ -185,7 +187,7 @@ async function materializeSelectedSkills(runtimeConfig: Record<string, unknown>,
   }));
 }
 
-export async function resolveNativeRuntimeMcpSnapshot(input: { db: Db; agent: Pick<RuntimeAgent, "id" | "companyId">; runId: string }) {
+export async function resolveNativeRuntimeAppAssignment(input: { db: Db; agent: Pick<RuntimeAgent, "id" | "companyId">; runId: string }) {
   const effective = await toolAccessService(input.db).getEffectiveProfilesForAgent(input.agent.companyId, input.agent.id);
   const permitted = new Set([...effective.entries.filter((entry) => entry.effect === "include" && entry.connectionId).map((entry) => entry.connectionId!), ...effective.allowedTools.map((tool) => tool.connectionId)]);
   const hasGitHubConnection = effective.installedConnections.some((connection) => {
@@ -240,8 +242,28 @@ export async function resolveNativeRuntimeMcpSnapshot(input: { db: Db; agent: Pi
       .map((tool) => tool.id)
       .sort(),
   };
-  const assignmentDigest = sha256(JSON.stringify(assignment));
-  return { assignmentSetId: `sha256:${assignmentDigest}`, digest: assignmentDigest, bindingId: assignment.connections.length ? `native-mcp:${input.runId}` : null };
+  return assignment;
+}
+
+/** Capture the immutable ceiling; this does not authorize gateway exposure. */
+export async function captureNativeRuntimeToolAssignment(input: { db: Db; agent: Pick<RuntimeAgent, "id" | "companyId">; runId: string }) {
+  return captureToolAssignmentInventory(input.db, {
+    companyId: input.agent.companyId, agentId: input.agent.id, runId: input.runId,
+  }, () => resolveNativeRuntimeAppAssignment(input));
+}
+
+/** Version-2 snapshot projection shared by capture and gateway realization. */
+export async function resolveCapturedNativeRuntimeMcpSnapshot(input: { db: Db; agent: Pick<RuntimeAgent, "id" | "companyId">; runId: string }) {
+  const captured = await captureNativeRuntimeToolAssignment(input);
+  return {
+    assignmentSetId: `sha256:${captured.digest}`,
+    digest: captured.digest,
+    bindingId: hasPinnedTools(captured.assignment) ? `native-mcp:${input.runId}` : null,
+  };
+}
+
+export async function resolveNativeRuntimeMcpSnapshot(input: { db: Db; agent: Pick<RuntimeAgent, "id" | "companyId">; runId: string }) {
+  return resolveCapturedNativeRuntimeMcpSnapshot(input);
 }
 
 export async function buildNativeRuntimeContext(input: { db: Db; agent: RuntimeAgent; runId: string; runtimeConfig: Record<string, unknown>; runtimeSkillEntries: PaperclipSkillEntry[]; instructionWorkingCopy?: { rootPath: string; entryPath: string; kind?: "agent_files" } }): Promise<NativeRuntimeContextSnapshot> {

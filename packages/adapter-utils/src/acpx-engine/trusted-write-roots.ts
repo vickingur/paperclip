@@ -6,7 +6,7 @@
 // them on the server-built `context.paperclipWorkspace`. The engine accepts a
 // root only when it is canonical, a real directory with no symlinked
 // component, owned by root or the server uid with no group/world write bit on
-// it or any ancestor, free of `.git`/`.codex`/`.agents`, and not replaceable
+// it or any ancestor, free of non-placeholder `.git`/`.codex`/`.agents` entries, and not replaceable
 // from the run's own sandbox namespace (the parent-entry predicate below). Any
 // failure drops that root. The `{dev, ino}` recorded here is re-checked at the
 // launch boundary and, inside codex-acp, before every turn.
@@ -39,6 +39,7 @@ export interface TrustedWriteRootValidation {
 export interface TrustedWriteRootFs {
   lstat(p: string): Promise<Pick<Stats, "dev" | "ino" | "uid" | "mode" | "isDirectory" | "isSymbolicLink">>;
   realpath(p: string): Promise<string>;
+  readdir(p: string): Promise<string[]>;
   /**
    * Resolves when the entry exists (without following a final symlink). Rejects
    * with `code: "ENOENT"` only when it is confirmed absent; any other rejection
@@ -50,6 +51,7 @@ export interface TrustedWriteRootFs {
 export const defaultTrustedWriteRootFs: TrustedWriteRootFs = {
   lstat: (p) => fsPromises.lstat(p),
   realpath: (p) => fsPromises.realpath(p),
+  readdir: (p) => fsPromises.readdir(p),
   lexists: async (p) => {
     await fsPromises.lstat(p);
   },
@@ -224,16 +226,36 @@ async function checkCandidate(
     }
     if (component === candidate) identity = { path: candidate, dev: stat.dev, ino: stat.ino };
   }
-  // (5) no repository, Codex or agent-skill entry inside the root. Only a
+  // (5) no repository, Codex or agent-skill content inside the root. Only a
   // confirmed ENOENT counts as absent; any other lookup error (EACCES, EIO, ...)
   // leaves absence unknown and drops the root.
   for (const entry of FORBIDDEN_ENTRIES) {
     try {
       await fs.lexists(path.join(candidate, entry));
-      return { ok: false, reason: `contains ${entry}` };
     } catch (error) {
       const code = (error as NodeJS.ErrnoException | null)?.code;
       if (code === "ENOENT") continue;
+      return { ok: false, reason: `cannot inspect ${entry} (${typeof code === "string" ? code : "unknown error"})` };
+    }
+    // Codex/bubblewrap may leave an empty mount target after protecting absent
+    // metadata. Inspect without following links and never remove host entries.
+    // Only the server uid may own this exception (root ownership alone is not
+    // sufficient). Recheck after listing so replacement fails closed.
+    const entryPath = path.join(candidate, entry);
+    try {
+      const before = await fs.lstat(entryPath);
+      if (before.isSymbolicLink() || !before.isDirectory() || before.uid !== serverUid ||
+          (before.mode & (fsConstants.S_IWGRP | fsConstants.S_IWOTH)) !== 0 ||
+          (await fs.readdir(entryPath)).length !== 0) {
+        return { ok: false, reason: `contains ${entry}` };
+      }
+      const after = await fs.lstat(entryPath);
+      if (after.isSymbolicLink() || !after.isDirectory() || after.uid !== serverUid ||
+          after.dev !== before.dev || after.ino !== before.ino || after.mode !== before.mode) {
+        return { ok: false, reason: `contains ${entry}` };
+      }
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException | null)?.code;
       return { ok: false, reason: `cannot inspect ${entry} (${typeof code === "string" ? code : "unknown error"})` };
     }
   }

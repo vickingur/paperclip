@@ -2982,6 +2982,23 @@ describe("shared ACPX engine runtime behavior", () => {
     expect(third.runtimeOptions[0]?.mcpServers).toEqual([]);
   });
 
+  it.each(["claude", "codex", "grok", "gemini", "kimi"])("starts a fresh %s session after a plugin grant or catalog change", async (agent) => {
+    const root = await makeTempRoot();
+    const config = { agent, agentCommand: "node ./fake-acp.js", cwd: root, stateDir: path.join(root, "state"), paperclipRuntimeSkills: [], paperclipSkillSync: { desiredSkills: [] } };
+    const first = await runExecutor(config, { context: { paperclipPluginToolInventoryDigest: "old-tools" } });
+    const unchanged = await runExecutor(config, {
+      runtime: { sessionParams: sessionCodec.deserialize(first.result.sessionParams), taskKey: "default" },
+      context: { paperclipPluginToolInventoryDigest: "old-tools" },
+    });
+    expect(unchanged.sessionInputs[0]?.resumeSessionId).toBe("backend-session");
+    const changed = await runExecutor(config, {
+      runtime: { sessionParams: sessionCodec.deserialize(unchanged.result.sessionParams), taskKey: "default" },
+      context: { paperclipPluginToolInventoryDigest: "new-grant-or-schema" },
+    });
+    expect(changed.sessionInputs[0]?.resumeSessionId).toBeUndefined();
+    expect(changed.result.sessionParams?.configFingerprint).not.toBe(first.result.sessionParams?.configFingerprint);
+  });
+
   it("injects runtime MCP servers and fingerprints their identity without persisting bearer tokens", async () => {
     const root = await makeTempRoot();
     const baseConfig = {
