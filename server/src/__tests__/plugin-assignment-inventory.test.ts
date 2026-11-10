@@ -218,7 +218,7 @@ const support = await getEmbeddedPostgresTestSupport();
       // into final dispatch, even when the replacement subject is another run.
       const named = await dispatchGateway.createNamedGateway({ companyId: company!.id,
         body: { name: `Synthetic ${randomUUID()}`, profileId: profile!.id, defaultProfileMode: "gateway_only" } });
-      for (const mutation of ["subject", "revoke", "actions"] as const) {
+      for (const mutation of ["subject", "revoke", "actions", "contention"] as const) {
         const namedToken = await dispatchGateway.createNamedGatewayToken({ companyId: company!.id,
           gatewayId: named.id, body: { name: `Synthetic ${mutation}`, subjectType: "heartbeat_run",
             subjectId: failedRun!.id, allowedActions: ["tools/list", "tools/call"] },
@@ -229,6 +229,9 @@ const support = await getEmbeddedPostgresTestSupport();
         expect(executeTool).toHaveBeenCalledTimes(1);
         executeTool.mockClear();
         let changed = false;
+        let releaseWriter!: () => void;
+        const held = new Promise<void>(resolve => { releaseWriter = resolve; });
+        let writer: Promise<unknown> | undefined;
         const namedPolicy = vi.spyOn(accessPolicy, "toolAccessPolicyService").mockImplementation(policyDb => {
           const service = originalPolicy(policyDb);
           if (policyDb === db) {
@@ -237,7 +240,18 @@ const support = await getEmbeddedPostgresTestSupport();
               const result = await decide(...args);
               if (!changed) {
                 changed = true;
-                await db.update(toolMcpGatewayTokens).set(mutation === "subject" ? { subjectId: run!.id }
+                if (mutation === "contention") {
+                  let locked!: () => void;
+                  const ready = new Promise<void>(resolve => { locked = resolve; });
+                  writer = db.transaction(async tx => {
+                    await tx.execute(sql`SET LOCAL lock_timeout='500ms'`);
+                    await tx.update(toolMcpGatewayTokens).set({ revokedAt: new Date() })
+                      .where(eq(toolMcpGatewayTokens.id, namedToken.id));
+                    locked(); await held;
+                    await tx.update(toolPolicies).set({ priority: 1 }).where(eq(toolPolicies.companyId, company!.id));
+                  });
+                  await ready;
+                } else await db.update(toolMcpGatewayTokens).set(mutation === "subject" ? { subjectId: run!.id }
                   : mutation === "revoke" ? { revokedAt: new Date() } : { allowedActions: ["tools/list"] })
                   .where(eq(toolMcpGatewayTokens.id, namedToken.id));
               }
@@ -249,11 +263,18 @@ const support = await getEmbeddedPostgresTestSupport();
         try {
           const racingGateway = createToolGatewayService(db, { pluginToolDispatcher: dispatcher });
           await expect(racingGateway.executeTool({ sessionToken: namedToken.token, gatewayId: named.id,
-            tool: names[1]!, parameters: {} })).rejects.toMatchObject({ reasonCode: mutation === "subject"
+            tool: names[1]!, parameters: {} })).rejects.toMatchObject({ reasonCode: mutation === "contention" ? "admission_contended" : mutation === "subject"
               ? "gateway_token_run_context_invalid" : mutation === "revoke" ? "gateway_token_invalid" : "gateway_token_action_denied" });
           expect(changed).toBe(true);
           expect(executeTool).not.toHaveBeenCalled();
-        } finally { namedPolicy.mockRestore(); }
+        } finally { releaseWriter(); namedPolicy.mockRestore(); await writer; }
+        if (mutation === "contention") {
+          const [current] = await db.select().from(toolMcpGatewayTokens).where(eq(toolMcpGatewayTokens.id, namedToken.id));
+          expect(current.revokedAt).toBeInstanceOf(Date);
+          await expect(dispatchGateway.executeTool({ sessionToken: namedToken.token, gatewayId: named.id,
+            tool: names[1]!, parameters: {} })).rejects.toMatchObject({ reasonCode: "gateway_token_revoked" });
+          expect(executeTool).not.toHaveBeenCalled();
+        }
       }
       const listSpy = vi.spyOn(dispatcher, "listToolsForAgent");
       const concurrent = await Promise.all(Array.from({ length: 3 }, () => capturePluginAssignmentInventory(db, binding)));

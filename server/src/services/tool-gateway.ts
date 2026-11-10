@@ -1327,6 +1327,11 @@ export function createToolGatewayService(
       throw new ToolGatewayHttpError(403, "Plugin tools require an agent run context", "agent_context_required");
     }
     return dispatchUnderAdmission(session, tool, parameters, () => {
+      return pluginToolDispatcher!.executeTool(tool.name, parameters, {
+        agentId: session.agentId!, runId: session.runId!, companyId: session.companyId,
+        projectId: session.projectId ?? "",
+      });
+    }, (admissionDb, run) => validatePluginAdmission(admissionDb, run, session, tool), approvedClaim, () => {
       // No await between registry identity validation and dispatcher entry.
       const expected = pinPluginDescriptor(tool);
       const fresh = pluginTools().find(entry => entry.name === tool.name);
@@ -1334,11 +1339,7 @@ export function createToolGatewayService(
       if (!actual || actual.pluginId !== expected.pluginId || actual.descriptorDigest !== expected.descriptorDigest) {
         throw new ToolGatewayHttpError(403, "Plugin descriptor changed before dispatch", "native_assignment_tool_stale");
       }
-      return pluginToolDispatcher!.executeTool(tool.name, parameters, {
-        agentId: session.agentId!, runId: session.runId!, companyId: session.companyId,
-        projectId: session.projectId ?? "",
-      });
-    }, (admissionDb, run) => validatePluginAdmission(admissionDb, run, session, tool), approvedClaim);
+    });
   }
 
   async function validatePluginAdmission(
@@ -1382,6 +1383,7 @@ export function createToolGatewayService(
     enter: () => Promise<T>,
     validateProvider: (admissionDb: Db, run: typeof heartbeatRuns.$inferSelect) => Promise<void>,
     approvedClaim?: typeof toolActionRequests.$inferSelect,
+    validateEntry?: () => void,
   ): Promise<T> {
     let providerEntered = false;
     const admitted = await db.transaction(async (tx) => {
@@ -1505,6 +1507,8 @@ export function createToolGatewayService(
           }
         }
       }
+      // Synchronous local guards can reject before external entry.
+      validateEntry?.();
       providerEntered = true;
       const execution = enter();
       // Handle early rejection without awaiting external work under DB locks.

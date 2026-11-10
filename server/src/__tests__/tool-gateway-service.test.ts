@@ -1138,7 +1138,7 @@ describeEmbeddedPostgres("tool gateway service", () => {
     expect(requests[1]?.status).toBe("pending");
   });
 
-  it.each(["none", "expiry", "formal", "claim", "signature", "arguments", "invocation", "confirmation", "issue"])("revalidates approved plugin admission: %s", async (mutation) => {
+  it.each(["none", "expiry", "formal", "claim", "signature", "arguments", "invocation", "confirmation", "issue", "formal-contention"])("revalidates approved plugin admission: %s", async (mutation) => {
     const { company, agent, run } = await createRunFixture(db);
     await db.insert(toolPolicies).values({
       companyId: company.id,
@@ -1204,6 +1204,9 @@ describeEmbeddedPostgres("tool gateway service", () => {
       updatedAt: new Date(),
     }).where(eq(approvals.id, approval.id));
 
+    let releaseWriter!: () => void;
+    const writerGate = new Promise<void>(resolve => { releaseWriter = resolve; });
+    let writer: Promise<unknown> | undefined;
     const originalPolicy = accessPolicy.toolAccessPolicyService;
     const policySpy = vi.spyOn(accessPolicy, "toolAccessPolicyService").mockImplementation(policyDb => {
       const service = originalPolicy(policyDb);
@@ -1211,7 +1214,19 @@ describeEmbeddedPostgres("tool gateway service", () => {
         const decide = service.decide;
         service.decide = async (...args) => {
           const decision = await decide(...args);
-          if (mutation === "expiry") {
+          if (mutation === "formal-contention") {
+            let locked!: () => void;
+            const ready = new Promise<void>(resolve => { locked = resolve; });
+            writer = db.transaction(async tx => {
+              await tx.execute(sql`SET LOCAL lock_timeout='500ms'`);
+              await tx.update(approvals).set({ status: "rejected" }).where(eq(approvals.id, approval.id));
+              locked();
+              await writerGate;
+              // Reverse operational -> authority ordering must commit unharmed.
+              await tx.update(toolPolicies).set({ priority: 1 }).where(eq(toolPolicies.companyId, company.id));
+            });
+            await ready;
+          } else if (mutation === "expiry") {
             await policyDb.update(toolActionRequests).set({ expiresAt: new Date(0) })
               .where(eq(toolActionRequests.id, actionRequest.id));
           } else if (mutation === "claim") {
@@ -1246,11 +1261,16 @@ describeEmbeddedPostgres("tool gateway service", () => {
         await expect(gateway.executeTool({ sessionToken: session.token,
           tool: "fixture:delete_everything", approvedActionRequestId: actionRequest.id,
           parameters: { target: "tampered" } })).rejects.toMatchObject({
-            reasonCode: mutation === "formal" ? "formal_approval_required"
+            reasonCode: mutation === "formal-contention" ? "admission_contended"
+              : mutation === "formal" ? "formal_approval_required"
               : ["confirmation", "issue"].includes(mutation) ? "action_scope_mismatch" : "action_claim_stale",
           });
         expect(worker).not.toHaveBeenCalled();
-      } finally { policySpy.mockRestore(); }
+      } finally { releaseWriter(); policySpy.mockRestore(); await writer; }
+      if (mutation === "formal-contention") {
+        const [current] = await db.select().from(approvals).where(eq(approvals.id, approval.id));
+        expect(current.status).toBe("rejected");
+      }
       return;
     }
     policySpy.mockRestore();
