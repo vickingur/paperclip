@@ -1314,6 +1314,72 @@ describeEmbeddedPostgres("tool gateway service", () => {
     } finally { policySpy.mockRestore(); }
   });
 
+  it.each(["browser", "cognee"].flatMap(provider => ["refresh", "scopes", "credential"].map(mutation => ({ provider, mutation }))))("revalidates overlapping $provider calls after grant $mutation", async ({ provider, mutation }) => {
+    const { company, agent, run } = await createRunFixture(db);
+    const fixture = await createRemoteMcpToolFixture(db, company.id);
+    await db.update(toolApplications).set({ type: provider === "browser" ? "rest_api" : "mcp_stdio" })
+      .where(eq(toolApplications.id, fixture.application.id));
+    await db.update(toolConnections).set(provider === "browser"
+      ? { transport: "rest_api", config: { sourceTemplateKey: "browser-use-cloud" } }
+      : { transport: "local_stdio", config: { templateId: "paperclip.cognee-cloud" } })
+      .where(eq(toolConnections.id, fixture.connection.id));
+    await db.update(connectionGrants).set({ providerTenant: { oauth: { scopes: ["read"] } } })
+      .where(eq(connectionGrants.connectionId, fixture.connection.id));
+    await db.insert(toolPolicies).values({ companyId: company.id, name: "Allow reads", policyType: "allow", selectors: { riskLevel: "read" } });
+    const original = browserUse.browserUseService;
+    const bridgeSpy = vi.spyOn(browserUse, "browserUseService").mockImplementation((serviceDb, request, ...rest) => {
+      const service = original(serviceDb, request, ...rest);
+      service.execute = async () => {
+        await request!("https://api.browser-use.com/api/v2/sessions", { method: "POST" });
+        await request!("https://api.browser-use.com/api/v2/tasks", { method: "POST" });
+        return {} as never;
+      };
+      return service;
+    });
+    const urlSpy = vi.spyOn(cognee, "cogneeCloudUrl").mockReturnValue(new URL("https://fixture.aws.cognee.ai"));
+    const cogneeSpy = vi.spyOn(cognee, "callCogneeCloud").mockImplementation(async input => {
+      await input.request(new URL("https://fixture.aws.cognee.ai/datasets"), { method: "GET" });
+      await input.request(new URL("https://fixture.aws.cognee.ai/recall"), { method: "POST" });
+      return { content: [{ type: "text", text: "ok" }], structuredContent: {}, isError: false };
+    });
+    let entered!: () => void;
+    const firstEntered = new Promise<void>(resolve => { entered = resolve; });
+    let release!: () => void;
+    const firstRelease = new Promise<void>(resolve => { release = resolve; });
+    let calls = 0;
+    const gateway = createTestToolGatewayService(db, { remoteHttpRequest: async () => {
+      if (++calls === 1) { entered(); await firstRelease; }
+      return new Response("{}");
+    } });
+    let first: Promise<unknown> | undefined;
+    try {
+      const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+      const tool = (await gateway.listToolsForSession(session.token)).find(t => t.catalogEntryId === fixture.catalogEntry.id)!;
+      const execute = () => gateway.executeTool({ sessionToken: session.token, tool: tool.name, parameters: {} });
+      first = execute();
+      // Attach a rejection handler before releasing the in-flight provider request.
+      const firstResult = first.then(value => ({ value }), error => ({ error }));
+      await firstEntered;
+      await db.update(connectionGrants).set(mutation === "credential"
+        ? { credentialSecretRefs: [{ secretId: randomUUID(), configPath: "headers.Authorization", versionSelector: "latest" }] }
+        : { lastUsedAt: new Date(), updatedAt: new Date(), providerTenant: { oauth: {
+          scopes: mutation === "scopes" ? ["write"] : ["read"],
+          refreshedAt: new Date().toISOString(), accessTokenExpiresAt: "2099-01-01T00:00:00Z",
+          refreshTokenExpiresAt: "2099-02-01T00:00:00Z", refreshLease: { id: "synthetic", expiresAt: "2099-01-01T00:00:00Z" },
+        } } }).where(eq(connectionGrants.connectionId, fixture.connection.id));
+      if (mutation === "refresh") await expect(execute()).resolves.toMatchObject({ status: "completed" });
+      release();
+      const result = await firstResult;
+      if (mutation === "refresh") {
+        expect(result).toMatchObject({ value: { status: "completed" } });
+        expect(calls).toBe(4);
+      } else {
+        expect(result).toMatchObject({ error: { reasonCode: "app_preparation_stale" } });
+        expect(calls).toBe(1);
+      }
+    } finally { release(); await first?.catch(() => {}); bridgeSpy.mockRestore(); cogneeSpy.mockRestore(); urlSpy.mockRestore(); }
+  });
+
   it.each(["none", "health", "connection", "grant"])("fences every Browser Use request: %s", async (mutation) => {
     const { company, agent, run } = await createRunFixture(db);
     const fixture = await createRemoteMcpToolFixture(db, company.id);

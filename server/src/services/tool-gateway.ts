@@ -872,6 +872,20 @@ function preparedConnectionHash(connection: typeof toolConnections.$inferSelect)
   return stableHash(JSON.parse(JSON.stringify(authority)));
 }
 
+// Usage and refresh scheduling do not change grant authority. Preserve scopes,
+// subject/tenant identity, credential references and all unrecognized metadata.
+// Credential version validation remains independent of this projection.
+function preparedGrantHash(grant: typeof connectionGrants.$inferSelect): string {
+  const { lastUsedAt, updatedAt, ...authority } = grant;
+  const tenant = authority.providerTenant;
+  if (tenant?.oauth) {
+    const { accessTokenExpiresAt, refreshedAt, refreshTokenExpiresAt, refreshLease,
+      ...oauthAuthority } = tenant.oauth;
+    authority.providerTenant = { ...tenant, oauth: oauthAuthority };
+  }
+  return stableHash(JSON.parse(JSON.stringify(authority)));
+}
+
 function normalizeSignedApprovalSnapshot(
   value: unknown,
 ): Record<string, unknown> | null {
@@ -6307,7 +6321,7 @@ export function createToolGatewayService(
         const preparedHash = (value: unknown) => stableHash(JSON.parse(JSON.stringify(value)));
         if (preparedHash(current.entry) !== preparedHash(entry) ||
             preparedConnectionHash(current.connection) !== preparedConnectionHash(connection) ||
-            preparedHash(currentGrant) !== preparedHash(grant) ||
+            preparedGrantHash(currentGrant) !== preparedGrantHash(grant) ||
             await preparedCredentialState(current.connection, currentGrant, admissionDb) !== credentialState) {
           throw new ToolGatewayHttpError(409, "Prepared connection changed before dispatch", "app_preparation_stale");
         }
@@ -6783,7 +6797,7 @@ export function createToolGatewayService(
         const preparedHash = (value: unknown) => stableHash(JSON.parse(JSON.stringify(value)));
         if (preparedHash(current.entry) !== preparedHash(entry) ||
             preparedConnectionHash(current.connection) !== preparedConnectionHash(connection) ||
-            preparedHash(currentGrant) !== preparedHash(grant) ||
+            preparedGrantHash(currentGrant) !== preparedGrantHash(grant) ||
             preparedHash(currentTemplate) !== preparedHash(template) ||
             await preparedCredentialState(current.connection, currentGrant, admissionDb) !== credentialState) {
           throw new ToolGatewayHttpError(409, "Prepared connection changed before dispatch", "app_preparation_stale");
