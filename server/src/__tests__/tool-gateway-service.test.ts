@@ -1725,8 +1725,10 @@ describeEmbeddedPostgres("tool gateway service", () => {
     expect(restored.config).toEqual({ syntheticRevision: 2 });
   });
 
-  it.each(["agent", "run", "issue", "session", "revoke", "deny"])("rejects NOWAIT contention before provider entry without harming the %s writer", async (target) => {
+  it.each(["agent", "run", "issue", "project", "session", "revoke", "deny"])("rejects NOWAIT contention before provider entry without harming the %s writer", async (target) => {
     const { company, agent, issue, run } = await createRunFixture(db);
+    const [project] = await db.insert(projects).values({ companyId: company.id, name: "Admission project" }).returning();
+    await db.update(issues).set({ projectId: project.id }).where(eq(issues.id, issue.id));
     const fixture = await createRemoteMcpToolFixture(db, company.id);
     await db.insert(toolPolicies).values({ companyId: company.id, name: "Allow reads",
       policyType: "allow", selectors: { riskLevel: "read" } });
@@ -1752,6 +1754,7 @@ describeEmbeddedPostgres("tool gateway service", () => {
             if (target === "agent") await tx.update(agents).set({ updatedAt: new Date() }).where(eq(agents.id, agent.id));
             if (target === "run") await tx.update(heartbeatRuns).set({ updatedAt: new Date() }).where(eq(heartbeatRuns.id, run.id));
             if (target === "issue") await tx.update(issues).set({ updatedAt: new Date() }).where(eq(issues.id, issue.id));
+            if (target === "project") await tx.update(projects).set({ updatedAt: new Date() }).where(eq(projects.id, project.id));
             if (target === "session") await tx.update(toolGatewaySessions).set({ updatedAt: new Date() }).where(eq(toolGatewaySessions.id, session.id));
             if (target === "revoke") await tx.update(connectionGrants).set({ status: "revoked" }).where(eq(connectionGrants.connectionId, fixture.connection.id));
             if (target === "deny") await tx.insert(toolPolicies).values({ companyId: company.id, name: "New deny", policyType: "block", priority: 0, selectors: { riskLevel: "read" } });
