@@ -863,6 +863,15 @@ function stableHash(value: unknown): string {
   return createHash("sha256").update(stableSerialize(value)).digest("hex");
 }
 
+// Health observations can change between preparation and admission without
+// changing provider identity or authority. Keep all other fields fail-closed,
+// including credential refs and provider configuration.
+function preparedConnectionHash(connection: typeof toolConnections.$inferSelect): string {
+  const { healthStatus, healthMessage, healthCheckedAt, lastHealthAt,
+    lastCatalogRefreshAt, lastError, updatedAt, ...authority } = connection;
+  return stableHash(JSON.parse(JSON.stringify(authority)));
+}
+
 function normalizeSignedApprovalSnapshot(
   value: unknown,
 ): Record<string, unknown> | null {
@@ -6297,7 +6306,7 @@ export function createToolGatewayService(
         // treats Date objects as empty objects).
         const preparedHash = (value: unknown) => stableHash(JSON.parse(JSON.stringify(value)));
         if (preparedHash(current.entry) !== preparedHash(entry) ||
-            preparedHash(current.connection) !== preparedHash(connection) ||
+            preparedConnectionHash(current.connection) !== preparedConnectionHash(connection) ||
             preparedHash(currentGrant) !== preparedHash(grant) ||
             await preparedCredentialState(current.connection, currentGrant, admissionDb) !== credentialState) {
           throw new ToolGatewayHttpError(409, "Prepared connection changed before dispatch", "app_preparation_stale");
@@ -6773,7 +6782,7 @@ export function createToolGatewayService(
         const currentTemplate = await resolveLocalStdioRuntimeTemplate(current.connection, admissionDb);
         const preparedHash = (value: unknown) => stableHash(JSON.parse(JSON.stringify(value)));
         if (preparedHash(current.entry) !== preparedHash(entry) ||
-            preparedHash(current.connection) !== preparedHash(connection) ||
+            preparedConnectionHash(current.connection) !== preparedConnectionHash(connection) ||
             preparedHash(currentGrant) !== preparedHash(grant) ||
             preparedHash(currentTemplate) !== preparedHash(template) ||
             await preparedCredentialState(current.connection, currentGrant, admissionDb) !== credentialState) {

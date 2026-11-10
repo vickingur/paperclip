@@ -1314,7 +1314,7 @@ describeEmbeddedPostgres("tool gateway service", () => {
     } finally { policySpy.mockRestore(); }
   });
 
-  it.each(["none", "connection", "grant"])("fences every Browser Use request: %s", async (mutation) => {
+  it.each(["none", "health", "connection", "grant"])("fences every Browser Use request: %s", async (mutation) => {
     const { company, agent, run } = await createRunFixture(db);
     const fixture = await createRemoteMcpToolFixture(db, company.id);
     await db.update(toolApplications).set({ type: "rest_api" }).where(eq(toolApplications.id, fixture.application.id));
@@ -1334,6 +1334,10 @@ describeEmbeddedPostgres("tool gateway service", () => {
     let calls = 0;
     const gateway = createTestToolGatewayService(db, { remoteHttpRequest: async () => {
       calls++;
+      if (calls === 1 && mutation === "health") await db.update(toolConnections).set({
+        healthStatus: "ok", healthMessage: "synthetic observation", healthCheckedAt: new Date(),
+        lastHealthAt: new Date(), lastCatalogRefreshAt: new Date(), lastError: null, updatedAt: new Date(),
+      }).where(eq(toolConnections.id, fixture.connection.id));
       if (calls === 1 && mutation === "connection") await db.update(toolConnections).set({ name: "Changed browser connection" }).where(eq(toolConnections.id, fixture.connection.id));
       if (calls === 1 && mutation === "grant") await db.update(connectionGrants).set({ status: "revoked" }).where(eq(connectionGrants.connectionId, fixture.connection.id));
       return new Response("{}");
@@ -1343,13 +1347,13 @@ describeEmbeddedPostgres("tool gateway service", () => {
       const tool = (await gateway.listToolsForSession(session.token)).find(t => t.catalogEntryId === fixture.catalogEntry.id)!;
       expect(tool).toBeTruthy();
       const call = gateway.executeTool({ sessionToken: session.token, tool: tool.name, parameters: {} });
-      if (mutation === "none") await expect(call).resolves.toMatchObject({ status: "completed" });
+      if ((mutation === "none" || mutation === "health")) await expect(call).resolves.toMatchObject({ status: "completed" });
       else await expect(call).rejects.toMatchObject({ reasonCode: mutation === "grant" ? "organization_authorization_required" : "app_preparation_stale" });
-      expect(calls).toBe(mutation === "none" ? 2 : 1);
+      expect(calls).toBe((mutation === "none" || mutation === "health") ? 2 : 1);
     } finally { bridgeSpy.mockRestore(); }
   });
 
-  it.each(["none", "connection", "grant"])("fences every bundled Cognee request: %s", async (mutation) => {
+  it.each(["none", "health", "connection", "grant"])("fences every bundled Cognee request: %s", async (mutation) => {
     const { company, agent, run } = await createRunFixture(db);
     const fixture = await createRemoteMcpToolFixture(db, company.id);
     await db.update(toolApplications).set({ type: "mcp_stdio" }).where(eq(toolApplications.id, fixture.application.id));
@@ -1366,6 +1370,10 @@ describeEmbeddedPostgres("tool gateway service", () => {
     let calls = 0;
     const gateway = createTestToolGatewayService(db, { remoteHttpRequest: async () => {
       calls++;
+      if (calls === 1 && mutation === "health") await db.update(toolConnections).set({
+        healthStatus: "ok", healthMessage: "synthetic observation", healthCheckedAt: new Date(),
+        lastHealthAt: new Date(), lastCatalogRefreshAt: new Date(), lastError: null, updatedAt: new Date(),
+      }).where(eq(toolConnections.id, fixture.connection.id));
       if (calls === 1 && mutation === "connection") await db.update(toolConnections).set({ config: { templateId: "changed" } }).where(eq(toolConnections.id, fixture.connection.id));
       if (calls === 1 && mutation === "grant") await db.update(connectionGrants).set({ status: "revoked" }).where(eq(connectionGrants.connectionId, fixture.connection.id));
       return new Response("{}");
@@ -1374,9 +1382,9 @@ describeEmbeddedPostgres("tool gateway service", () => {
       const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
       const tool = (await gateway.listToolsForSession(session.token)).find(t => t.catalogEntryId === fixture.catalogEntry.id)!;
       const call = gateway.executeTool({ sessionToken: session.token, tool: tool.name, parameters: {} });
-      if (mutation === "none") await expect(call).resolves.toMatchObject({ status: "completed" });
+      if ((mutation === "none" || mutation === "health")) await expect(call).resolves.toMatchObject({ status: "completed" });
       else await expect(call).rejects.toMatchObject({ reasonCode: mutation === "grant" ? "organization_authorization_required" : "local_stdio_template_invalid" });
-      expect(calls).toBe(mutation === "none" ? 2 : 1);
+      expect(calls).toBe((mutation === "none" || mutation === "health") ? 2 : 1);
     } finally { bridgeSpy.mockRestore(); urlSpy.mockRestore(); }
   });
 
