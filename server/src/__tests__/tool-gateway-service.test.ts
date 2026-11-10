@@ -1264,7 +1264,7 @@ describeEmbeddedPostgres("tool gateway service", () => {
     expect((result.result as { result?: { data?: { target?: string } } }).result?.data?.target).toBe("repo");
   });
 
-  it.each(["application", "connection", "disabled"])("rejects catalog/application %s mutation after tool resolution", async (mutation) => {
+  it.each(["application", "connection", "disabled", "unbound"])("rejects catalog/application %s mutation after tool resolution", async (mutation) => {
     const { company, agent, run } = await createRunFixture(db);
     const first = await createRemoteMcpToolFixture(db, company.id);
     await db.update(toolApplications).set({ name: "Original MCP" }).where(eq(toolApplications.id, first.application.id));
@@ -1294,6 +1294,7 @@ describeEmbeddedPostgres("tool gateway service", () => {
           changed = true;
           await db.update(toolCatalogEntries).set(mutation === "application"
             ? { applicationId: replacement.application.id }
+            : mutation === "unbound" ? { applicationId: null }
             : { connectionId: replacement.connection.id })
             .where(eq(toolCatalogEntries.id, first.catalogEntry.id));
         }

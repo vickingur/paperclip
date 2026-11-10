@@ -5097,9 +5097,12 @@ export function createToolGatewayService(
 
   async function assertApplicationActive(
     session: ToolGatewaySession,
-    applicationId: string,
+    applicationId: string | null,
     admissionDb: Db,
   ) {
+    if (!applicationId) {
+      throw new ToolGatewayHttpError(403, "Application binding is missing", "application_disabled");
+    }
     const [application] = await admissionDb.select().from(toolApplications).where(and(
       eq(toolApplications.id, applicationId),
       eq(toolApplications.companyId, session.companyId),
