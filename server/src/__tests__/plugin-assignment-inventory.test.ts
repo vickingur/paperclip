@@ -103,10 +103,17 @@ const support = await getEmbeddedPostgresTestSupport();
         if (policyDb !== db) {
           const decide = service.decide;
           service.decide = async (...args) => {
-            const locks = await policyDb.execute(sql`SELECT mode FROM pg_locks
-              WHERE pid = pg_backend_pid() AND relation = 'tool_profile_entries'::regclass
-                AND granted AND mode = 'ShareLock'`);
-            admissionLockObserved = locks.length === 1;
+            // Probe the actual company row from another transaction: an epoch
+            // read lock must exclude a writer before the policy is consulted.
+            try {
+              await db.transaction(async tx => {
+                await tx.execute(sql`SELECT company_id FROM tool_authority_epochs
+                  WHERE company_id = ${company!.id} FOR UPDATE NOWAIT`);
+              });
+            } catch (error) {
+              const failure = error as { code?: string; cause?: { code?: string } };
+              admissionLockObserved = (failure.code ?? failure.cause?.code) === "55P03";
+            }
             return decide(...args);
           };
         }

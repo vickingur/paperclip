@@ -33,6 +33,7 @@ import {
   toolCatalogEntries,
   toolConnections,
   toolAccessAuditEvents,
+  toolAuthorityEpochs,
   toolActionRequests,
   toolCallEvents,
   toolGatewaySessions,
@@ -1454,7 +1455,7 @@ describeEmbeddedPostgres("tool gateway service", () => {
     } finally { bridgeSpy.mockRestore(); urlSpy.mockRestore(); }
   });
 
-  it.each(["none", "template", "grant", "connection", "rotation", "secret_disabled", "version_revoked", "binding", "provider_config", "provider_disabled"])("fences stdio preparation after slot acquisition: %s", async (mutation) => {
+  it.each(["none", "observations", "template", "grant", "connection", "rotation", "secret_disabled", "version_revoked", "binding", "provider_config", "provider_disabled"])("fences stdio preparation after slot acquisition: %s", async (mutation) => {
     const { company, agent, run } = await createRunFixture(db);
     const fixture = await createRemoteMcpToolFixture(db, company.id);
     await db.update(toolApplications).set({type:"mcp_stdio"}).where(eq(toolApplications.id,fixture.application.id));
@@ -1491,6 +1492,11 @@ describeEmbeddedPostgres("tool gateway service", () => {
         if(mutation === "template") await db.update(toolStdioCommandTemplates).set({args:["-e","process.exit(88)"]}).where(eq(toolStdioCommandTemplates.id,template.id));
         if(mutation === "grant") await db.update(connectionGrants).set({status:"revoked"}).where(eq(connectionGrants.connectionId,fixture.connection.id));
         if(mutation === "connection") await db.update(toolConnections).set({config:{templateId:"changed"}}).where(eq(toolConnections.id,fixture.connection.id));
+        if (mutation === "observations") {
+          await db.update(toolCatalogEntries).set({ lastSeenAt: new Date(), updatedAt: new Date() }).where(eq(toolCatalogEntries.id, fixture.catalogEntry.id));
+          await db.update(companySecrets).set({ lastResolvedAt: new Date(), updatedAt: new Date() }).where(eq(companySecrets.id, credential.id));
+          await db.update(companySecretProviderConfigs).set({ healthStatus: "ok", healthCheckedAt: new Date(), healthMessage: "synthetic", healthDetails: { synthetic: true }, updatedAt: new Date() }).where(eq(companySecretProviderConfigs.id, providerConfig.id));
+        }
         if (mutation === "provider_config") await db.update(companySecretProviderConfigs).set({ config: { syntheticRevision: 2 } }).where(eq(companySecretProviderConfigs.id, providerConfig.id));
         if (mutation === "provider_disabled") await db.update(companySecretProviderConfigs).set({ status: "disabled" }).where(eq(companySecretProviderConfigs.id, providerConfig.id));
         if (mutation === "binding") await db.delete(companySecretBindings).where(eq(companySecretBindings.secretId, credential.id));
@@ -1506,7 +1512,7 @@ describeEmbeddedPostgres("tool gateway service", () => {
       const session = await gateway.createSession({companyId:company.id,agentId:agent.id,runId:run.id});
       const tool = (await gateway.listToolsForSession(session.token)).find(t=>t.catalogEntryId===fixture.catalogEntry.id)!;
       const call = gateway.executeTool({sessionToken:session.token,tool:tool.name,parameters:{}});
-      if(mutation === "none") await expect(call).resolves.toMatchObject({status:"completed"});
+      if(mutation === "none" || mutation === "observations") await expect(call).resolves.toMatchObject({status:"completed"});
       else await expect(call).rejects.toMatchObject({reasonCode:["template", "rotation", "secret_disabled", "version_revoked", "binding", "provider_config", "provider_disabled"].includes(mutation) ? "app_preparation_stale" : mutation === "connection" ? "local_stdio_template_invalid" : "organization_authorization_required"});
     } finally { slotSpy.mockRestore(); }
   });
@@ -1558,7 +1564,7 @@ describeEmbeddedPostgres("tool gateway service", () => {
     } finally { slotSpy.mockRestore(); }
   });
 
-  it.each(["none", "connection", "grant", "application", "rotation", "secret_disabled", "version_revoked", "binding", "provider_config", "provider_disabled"])("fences prepared HTTP metadata after MCP initialization: %s", async (mutation) => {
+  it.each(["none", "observations", "connection", "grant", "application", "rotation", "secret_disabled", "version_revoked", "binding", "provider_config", "provider_disabled"])("fences prepared HTTP metadata after MCP initialization: %s", async (mutation) => {
     const { company, agent, run } = await createRunFixture(db);
     const fixture = await createRemoteMcpToolFixture(db, company.id);
     await db.update(toolConnections).set({ config: { url: "https://8.8.8.8/mcp", mcpSessionRequired: true } })
@@ -1593,6 +1599,11 @@ describeEmbeddedPostgres("tool gateway service", () => {
         if (mutation === "grant") await db.update(connectionGrants)
           .set({ credentialSecretRefs: [{ configPath: "token", secretId: randomUUID(), versionSelector: "latest" }] })
           .where(eq(connectionGrants.connectionId, fixture.connection.id));
+        if (mutation === "observations") {
+          await db.update(toolCatalogEntries).set({ lastSeenAt: new Date(), updatedAt: new Date() }).where(eq(toolCatalogEntries.id, fixture.catalogEntry.id));
+          await db.update(companySecrets).set({ lastResolvedAt: new Date(), updatedAt: new Date() }).where(eq(companySecrets.id, credential.id));
+          await db.update(companySecretProviderConfigs).set({ healthStatus: "ok", healthCheckedAt: new Date(), healthMessage: "synthetic", healthDetails: { synthetic: true }, updatedAt: new Date() }).where(eq(companySecretProviderConfigs.id, providerConfig.id));
+        }
         if (mutation === "provider_config") await db.update(companySecretProviderConfigs).set({ config: { syntheticRevision: 2 } }).where(eq(companySecretProviderConfigs.id, providerConfig.id));
         if (mutation === "provider_disabled") await db.update(companySecretProviderConfigs).set({ status: "disabled" }).where(eq(companySecretProviderConfigs.id, providerConfig.id));
         if (mutation === "binding") await db.delete(companySecretBindings).where(eq(companySecretBindings.secretId, credential.id));
@@ -1611,7 +1622,7 @@ describeEmbeddedPostgres("tool gateway service", () => {
     const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
     const tool = (await gateway.listToolsForSession(session.token)).find(t => t.catalogEntryId === fixture.catalogEntry.id)!;
     const call = gateway.executeTool({ sessionToken: session.token, tool: tool.name, parameters: {} });
-    if (mutation === "none") {
+    if (mutation === "none" || mutation === "observations") {
       await expect(call).resolves.toMatchObject({ status: "completed" });
       expect(methods).toEqual(["initialize", "notifications/initialized", "tools/call"]);
     } else {
@@ -1620,7 +1631,7 @@ describeEmbeddedPostgres("tool gateway service", () => {
     }
   });
 
-  it.each(["provider", "agent", "run", "issue"])("fails closed on unrelated-company %s writer and recovers after release", async (writerTable) => {
+  it.each(["provider", "agent", "run", "issue"])("admits during unrelated-company %s writes", async (writerTable) => {
     const { company, agent, run } = await createRunFixture(db);
     const fixture = await createRemoteMcpToolFixture(db, company.id);
     await db.insert(toolPolicies).values({ companyId: company.id, name: "Allow reads",
@@ -1652,20 +1663,19 @@ describeEmbeddedPostgres("tool gateway service", () => {
     });
     try {
       await ready;
-      // No reference to the other company's provider; the table fence still conflicts.
       await expect(gateway.executeTool({ sessionToken: session.token, tool: tool.name, parameters: {} }))
-        .rejects.toMatchObject({ status: 503, reasonCode: "admission_contended" });
-      expect(request).not.toHaveBeenCalled();
+        .resolves.toMatchObject({ status: "completed" });
+      expect(request).toHaveBeenCalledTimes(1);
     } finally {
       release();
       await writer;
     }
     await expect(gateway.executeTool({ sessionToken: session.token, tool: tool.name, parameters: {} }))
       .resolves.toMatchObject({ status: "completed" });
-    expect(request).toHaveBeenCalledTimes(1);
+    expect(request).toHaveBeenCalledTimes(2);
   });
 
-  it("bounds reverse-order writer contention before provider entry", async () => {
+  it("preserves reverse-order unrelated writers while admitting provider entry", async () => {
     const { company, agent, run } = await createRunFixture(db);
     const other = await createRunFixture(db);
     const fixture = await createRemoteMcpToolFixture(db, company.id);
@@ -1690,8 +1700,7 @@ describeEmbeddedPostgres("tool gateway service", () => {
         .where(eq(companySecretProviderConfigs.id, provider.id));
       locked();
       await held;
-      // Admission has already locked agents and is waiting for our later table.
-      // This upgrade forms the reverse-order cycle; bound the writer's wait.
+      // Reverse table order must no longer create a global admission cycle.
       await tx.update(agents).set({ updatedAt: new Date() }).where(eq(agents.id, other.agent.id));
     });
     const writerResult = Promise.allSettled([writer]);
@@ -1699,30 +1708,146 @@ describeEmbeddedPostgres("tool gateway service", () => {
     const call = gateway.executeTool({ sessionToken: session.token, tool: tool.name, parameters: {} });
     const callResult = Promise.allSettled([call]);
     try {
-      await vi.waitFor(async () => {
-        const waiting = await db.execute(sql`SELECT 1 FROM pg_locks
-          WHERE relation = 'company_secret_provider_configs'::regclass
-          AND mode = 'ShareLock' AND NOT granted`);
-        expect(waiting.length).toBeGreaterThan(0);
-      }, { timeout: 1500, interval: 10 });
-      expect(request).not.toHaveBeenCalled();
+      await expect(call).resolves.toMatchObject({ status: "completed" });
+      expect(request).toHaveBeenCalledTimes(1);
     } finally {
       release();
     }
     const [writerOutcome] = await writerResult;
-    expect(writerOutcome.status).toBe("rejected");
-    if (writerOutcome.status === "rejected") {
-      const error = writerOutcome.reason;
-      expect(error.code ?? error.cause?.code).toBe("55P03");
-    }
+    expect(writerOutcome.status).toBe("fulfilled");
     expect(await callResult).toEqual([expect.objectContaining({
       status: "fulfilled", value: expect.objectContaining({ status: "completed" }),
     })]);
     expect(request).toHaveBeenCalledTimes(1);
-    // Rollback restores the unrelated writer's state; no health repair needed.
+    // The unrelated writer commits its real mutation; no rollback or repair.
     const [restored] = await db.select().from(companySecretProviderConfigs)
       .where(eq(companySecretProviderConfigs.id, provider.id));
-    expect(restored.config).toEqual({});
+    expect(restored.config).toEqual({ syntheticRevision: 2 });
+  });
+
+  it.each(["agent", "run", "issue", "session", "revoke", "deny"])("rejects NOWAIT contention before provider entry without harming the %s writer", async (target) => {
+    const { company, agent, issue, run } = await createRunFixture(db);
+    const fixture = await createRemoteMcpToolFixture(db, company.id);
+    await db.insert(toolPolicies).values({ companyId: company.id, name: "Allow reads",
+      policyType: "allow", selectors: { riskLevel: "read" } });
+    const provider = vi.fn<NonNullable<ToolGatewayServiceOptions["remoteHttpRequest"]>>(async (_url, init) =>
+      Response.json({ jsonrpc: "2.0", id: JSON.parse(String(init.body)).id,
+        result: { content: [{ type: "text", text: "ok" }] } }));
+    const gateway = createTestToolGatewayService(db, { remoteHttpRequest: provider });
+    const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+    const tool = (await gateway.listToolsForSession(session.token)).find(t => t.catalogEntryId === fixture.catalogEntry.id)!;
+    let release!: () => void, locked!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    const ready = new Promise<void>(resolve => { locked = resolve; });
+    let writer: Promise<unknown> | undefined, armed = true;
+    const original = accessPolicy.toolAccessPolicyService;
+    const policySpy = vi.spyOn(accessPolicy, "toolAccessPolicyService").mockImplementation(policyDb => {
+      const service = original(policyDb), record = service.recordInvocation;
+      service.recordInvocation = async (...args) => {
+        const result = await record(...args);
+        if (policyDb === db && armed) {
+          armed = false;
+          writer = db.transaction(async tx => {
+            await tx.execute(sql`SET LOCAL lock_timeout='500ms'`);
+            if (target === "agent") await tx.update(agents).set({ updatedAt: new Date() }).where(eq(agents.id, agent.id));
+            if (target === "run") await tx.update(heartbeatRuns).set({ updatedAt: new Date() }).where(eq(heartbeatRuns.id, run.id));
+            if (target === "issue") await tx.update(issues).set({ updatedAt: new Date() }).where(eq(issues.id, issue.id));
+            if (target === "session") await tx.update(toolGatewaySessions).set({ updatedAt: new Date() }).where(eq(toolGatewaySessions.id, session.id));
+            if (target === "revoke") await tx.update(connectionGrants).set({ status: "revoked" }).where(eq(connectionGrants.connectionId, fixture.connection.id));
+            if (target === "deny") await tx.insert(toolPolicies).values({ companyId: company.id, name: "New deny", policyType: "block", priority: 0, selectors: { riskLevel: "read" } });
+            locked(); await held;
+            // Inverted operational -> authority order must not hurt the writer.
+            if (!["revoke", "deny"].includes(target)) await tx.update(toolPolicies).set({ priority: 1 }).where(eq(toolPolicies.companyId, company.id));
+          });
+          await ready;
+        }
+        return result;
+      };
+      return service;
+    });
+    const executingGateway = createTestToolGatewayService(db, { remoteHttpRequest: provider });
+    try {
+      await expect(executingGateway.executeTool({ sessionToken: session.token, tool: tool.name, parameters: {} }))
+        .rejects.toMatchObject({ status: 503, reasonCode: "admission_contended" });
+      expect(provider).not.toHaveBeenCalled();
+    } finally { release(); policySpy.mockRestore(); await writer; }
+    const retry = gateway.executeTool({ sessionToken: session.token, tool: tool.name, parameters: {} });
+    if (target === "revoke" || target === "deny") {
+      await expect(retry).rejects.toBeInstanceOf(ToolGatewayHttpError);
+      expect(provider).not.toHaveBeenCalled();
+    } else {
+      await expect(retry).resolves.toMatchObject({ status: "completed" });
+      expect(provider).toHaveBeenCalledTimes(1);
+    }
+  });
+
+  it("admits before a waiting revoke, then releases locks before provider completion", async () => {
+    const { company, agent, run } = await createRunFixture(db);
+    const fixture = await createRemoteMcpToolFixture(db, company.id);
+    await db.insert(toolPolicies).values({ companyId: company.id, name: "Allow reads", policyType: "allow", selectors: { riskLevel: "read" } });
+    let releaseAdmission!: () => void, releaseProvider!: () => void, decided!: () => void, entered!: () => void;
+    const admissionGate = new Promise<void>(resolve => { releaseAdmission = resolve; });
+    const providerGate = new Promise<void>(resolve => { releaseProvider = resolve; });
+    const ready = new Promise<void>(resolve => { decided = resolve; });
+    const providerReady = new Promise<void>(resolve => { entered = resolve; });
+    let armed = true, writer: Promise<unknown> | undefined, call: Promise<unknown> | undefined;
+    const original = accessPolicy.toolAccessPolicyService;
+    const policySpy = vi.spyOn(accessPolicy, "toolAccessPolicyService").mockImplementation(policyDb => {
+      const service = original(policyDb), decide = service.decide;
+      service.decide = async (...args) => {
+        const decision = await decide(...args);
+        if (policyDb !== db && armed) { armed = false; decided(); await admissionGate; }
+        return decision;
+      };
+      return service;
+    });
+    const provider = vi.fn<NonNullable<ToolGatewayServiceOptions["remoteHttpRequest"]>>(async (_url, init) => {
+      entered(); await providerGate;
+      return Response.json({ jsonrpc: "2.0", id: JSON.parse(String(init.body)).id,
+        result: { content: [{ type: "text", text: "ok" }] } });
+    });
+    try {
+      const gateway = createTestToolGatewayService(db, { remoteHttpRequest: provider });
+      const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+      const tool = (await gateway.listToolsForSession(session.token)).find(t => t.catalogEntryId === fixture.catalogEntry.id)!;
+      call = gateway.executeTool({ sessionToken: session.token, tool: tool.name, parameters: {} });
+      await ready;
+      writer = db.transaction(async tx => {
+        await tx.execute(sql`SET LOCAL lock_timeout='2s'`);
+        await tx.update(connectionGrants).set({ status: "revoked" }).where(eq(connectionGrants.connectionId, fixture.connection.id));
+      });
+      await vi.waitFor(async () => {
+        const rows = await db.execute(sql`SELECT 1 FROM pg_stat_activity WHERE wait_event_type='Lock'
+          AND query LIKE 'update "connection_grants"%'`);
+        expect(rows.length).toBeGreaterThan(0);
+      }, { timeout: 1000, interval: 10 });
+      expect(provider).not.toHaveBeenCalled();
+      releaseAdmission(); await providerReady;
+      await writer; // Completes while the provider's response is still held.
+      await db.update(heartbeatRuns).set({ updatedAt: new Date() }).where(eq(heartbeatRuns.id, run.id));
+      releaseProvider(); await expect(call).resolves.toMatchObject({ status: "completed" });
+      await expect(gateway.executeTool({ sessionToken: session.token, tool: tool.name, parameters: {} })).rejects.toBeInstanceOf(ToolGatewayHttpError);
+      expect(provider).toHaveBeenCalledTimes(1);
+    } finally {
+      releaseAdmission(); releaseProvider(); policySpy.mockRestore();
+      await Promise.allSettled([call, writer]);
+    }
+  });
+
+  it("fails closed when the company authority epoch is missing", async () => {
+    const { company, agent, run } = await createRunFixture(db);
+    const fixture = await createRemoteMcpToolFixture(db, company.id);
+    await db.insert(toolPolicies).values({ companyId: company.id, name: "Allow reads", policyType: "allow", selectors: { riskLevel: "read" } });
+    const provider = vi.fn();
+    const gateway = createTestToolGatewayService(db, { remoteHttpRequest: provider });
+    const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+    const tool = (await gateway.listToolsForSession(session.token)).find(t => t.catalogEntryId === fixture.catalogEntry.id)!;
+    const [epoch] = await db.delete(toolAuthorityEpochs).where(eq(toolAuthorityEpochs.companyId, company.id)).returning();
+    try {
+      await expect(gateway.executeTool({ sessionToken: session.token, tool: tool.name, parameters: {} }))
+        .rejects.toMatchObject({ status: 503, reasonCode: "authority_epoch_missing" });
+      expect(provider).not.toHaveBeenCalled();
+    } finally { await db.insert(toolAuthorityEpochs).values(epoch); }
   });
 
   it("admits concurrent remote calls before either provider completes", async () => {

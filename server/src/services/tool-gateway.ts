@@ -60,6 +60,7 @@ import {
   routines,
   principalPermissionGrants,
   plugins,
+  toolAuthorityEpochs,
   toolActionRequests,
   toolActionDeliveries,
   toolAccessAuditEvents,
@@ -886,6 +887,12 @@ function preparedGrantHash(grant: typeof connectionGrants.$inferSelect): string 
   return stableHash(JSON.parse(JSON.stringify(authority)));
 }
 
+// Repeated catalog sightings do not change descriptors or execution authority.
+function preparedCatalogHash(entry: typeof toolCatalogEntries.$inferSelect): string {
+  const { lastSeenAt, updatedAt, ...authority } = entry;
+  return stableHash(JSON.parse(JSON.stringify(authority)));
+}
+
 function normalizeSignedApprovalSnapshot(
   value: unknown,
 ): Record<string, unknown> | null {
@@ -1376,37 +1383,54 @@ export function createToolGatewayService(
     validateProvider: (admissionDb: Db, run: typeof heartbeatRuns.$inferSelect) => Promise<void>,
     approvedClaim?: typeof toolActionRequests.$inferSelect,
   ): Promise<T> {
+    let providerEntered = false;
     const admitted = await db.transaction(async (tx) => {
-      // SHARE conflicts with every INSERT/UPDATE/DELETE (including new deny
-      // rows). Row locks alone cannot fence policy insertions. Keep this short:
-      // authoritative reads and dispatcher entry only, never worker completion.
-      // A committed revoke precedes our reads, or waits until after admission.
+      // Epoch first, then operational rows in this deterministic order:
+      // run, agent, issues (UUID order), projects (UUID order), routine,
+      // session/token, request, invocation, interaction, formal approval.
+      // Every admission lock is NOWAIT: an inverted operational writer wins
+      // immediately and cannot be rolled back by an admission wait cycle.
       await tx.execute(sql`SET LOCAL lock_timeout = '2s'`);
       await tx.execute(sql`SET LOCAL statement_timeout = '5s'`);
-      await tx.execute(sql`LOCK TABLE ${agents}, ${heartbeatRuns}, ${issues},
-        ${projects}, ${routines}, ${plugins}, ${principalPermissionGrants}, ${toolPolicies},
-        ${toolProfiles}, ${toolProfileBindings}, ${toolProfileEntries},
-        ${toolMcpGateways}, ${toolApplications}, ${toolConnections},
-        ${toolCatalogEntries}, ${toolGatewaySessions}, ${toolMcpGatewayTokens},
-        ${toolActionRequests}, ${toolInvocations}, ${issueThreadInteractions}, ${approvals},
-        ${connectionGrants}, ${connectionGrantMembers}, ${connectionGrantDelegations},
-        ${companyMemberships}, ${toolStdioCommandTemplates},
-        ${companySecrets}, ${companySecretVersions}, ${companySecretBindings},
-        ${companySecretProviderConfigs} IN SHARE MODE`);
-      const admissionDb = tx as unknown as Db;
-      const [run] = await admissionDb.select().from(heartbeatRuns).where(and(
+      const [epoch] = await tx.select().from(toolAuthorityEpochs).where(
+        eq(toolAuthorityEpochs.companyId, session.companyId),
+      ).for("share", { noWait: true });
+      if (!epoch) {
+        throw new ToolGatewayHttpError(503, "Tool authority epoch is missing", "authority_epoch_missing");
+      }
+      const [run] = await tx.select().from(heartbeatRuns).where(and(
         eq(heartbeatRuns.id, session.runId!), eq(heartbeatRuns.companyId, session.companyId),
         eq(heartbeatRuns.agentId, session.agentId!),
-      ));
+      )).for("share", { noWait: true });
       if (!run || run.status !== "running") {
         throw new ToolGatewayHttpError(403, "Plugin run is inactive", "native_assignment_run_inactive");
       }
+      await tx.select({ id: agents.id }).from(agents).where(and(
+        eq(agents.id, session.agentId!), eq(agents.companyId, session.companyId),
+      )).for("share", { noWait: true });
+      const context = run.contextSnapshot ?? {};
+      const ids = (...values: unknown[]) => [...new Set(values.filter(
+        (value): value is string => typeof value === "string" && value.length > 0,
+      ))].sort();
+      const issueIds = ids(session.issueId, context.issueId, approvedClaim?.issueId);
+      const lockedIssues = issueIds.length ? await tx.select({ projectId: issues.projectId }).from(issues)
+        .where(and(inArray(issues.id, issueIds), eq(issues.companyId, session.companyId)))
+        .orderBy(asc(issues.id)).for("share", { noWait: true }) : [];
+      const projectIds = ids(session.projectId, context.projectId, ...lockedIssues.map(row => row.projectId));
+      if (projectIds.length) await tx.select({ id: projects.id }).from(projects)
+        .where(and(inArray(projects.id, projectIds), eq(projects.companyId, session.companyId)))
+        .orderBy(asc(projects.id)).for("share", { noWait: true });
+      const routineIds = ids(context.routineId);
+      if (routineIds.length) await tx.select({ id: routines.id }).from(routines)
+        .where(and(inArray(routines.id, routineIds), eq(routines.companyId, session.companyId)))
+        .orderBy(asc(routines.id)).for("share", { noWait: true });
+      const admissionDb = tx as unknown as Db;
       if (session.gatewayTokenId) {
         const [token] = await admissionDb.select().from(toolMcpGatewayTokens).where(and(
           eq(toolMcpGatewayTokens.id, session.gatewayTokenId),
           eq(toolMcpGatewayTokens.companyId, session.companyId),
           eq(toolMcpGatewayTokens.gatewayId, session.gatewayId!),
-        ));
+        )).for("share", { noWait: true });
         if (!token || token.revokedAt || (token.expiresAt && token.expiresAt.getTime() <= Date.now())) {
           throw new ToolGatewayHttpError(401, "Gateway bearer token is no longer valid", "gateway_token_invalid");
         }
@@ -1422,7 +1446,7 @@ export function createToolGatewayService(
           eq(toolGatewaySessions.companyId, session.companyId),
           eq(toolGatewaySessions.agentId, session.agentId!),
           eq(toolGatewaySessions.runId, session.runId!),
-        ));
+        )).for("share", { noWait: true });
         if (!authenticated || authenticated.revokedAt || authenticated.expiresAt.getTime() <= Date.now()) {
           throw new ToolGatewayHttpError(401, "Gateway session is no longer valid", "session_invalid");
         }
@@ -1438,11 +1462,11 @@ export function createToolGatewayService(
         const [request] = await admissionDb.select().from(toolActionRequests).where(and(
           eq(toolActionRequests.id, approvedClaim.id),
           eq(toolActionRequests.companyId, session.companyId),
-        ));
+        )).for("share", { noWait: true });
         const [invocation] = await admissionDb.select().from(toolInvocations).where(and(
           eq(toolInvocations.id, approvedClaim.invocationId),
           eq(toolInvocations.companyId, session.companyId),
-        ));
+        )).for("share", { noWait: true });
         // Bind the bypass to the exact claim whose signed payload was verified
         // earlier, rather than accepting any executing request for this tool.
         if (!request || request.status !== "executing" ||
@@ -1461,12 +1485,12 @@ export function createToolGatewayService(
         }
         const [issue] = await admissionDb.select().from(issues).where(and(
           eq(issues.id, request.issueId!), eq(issues.companyId, session.companyId),
-        ));
+        )).for("share", { noWait: true });
         const [interaction] = await admissionDb.select().from(issueThreadInteractions).where(and(
           eq(issueThreadInteractions.id, request.interactionId!),
           eq(issueThreadInteractions.companyId, session.companyId),
           eq(issueThreadInteractions.issueId, request.issueId!),
-        ));
+        )).for("share", { noWait: true });
         if (!issue || issue.status === "done" || issue.status === "cancelled" ||
             !interaction || interaction.kind !== "request_confirmation" ||
             !["accepted", "executing"].includes(interaction.status)) {
@@ -1475,12 +1499,13 @@ export function createToolGatewayService(
         if (request.approvalId) {
           const [approval] = await admissionDb.select().from(approvals).where(and(
             eq(approvals.id, request.approvalId), eq(approvals.companyId, session.companyId),
-          ));
+          )).for("share", { noWait: true });
           if (approval?.status !== "approved") {
             throw new ToolGatewayHttpError(409, "Formal approval is no longer valid", "formal_approval_required");
           }
         }
       }
+      providerEntered = true;
       const execution = enter();
       // Handle early rejection without awaiting external work under DB locks.
       void execution.catch(() => {});
@@ -1491,7 +1516,11 @@ export function createToolGatewayService(
       let cause: unknown = error;
       for (let depth = 0; depth < 8 && cause && typeof cause === "object"; depth++) {
         const failure = cause as { code?: unknown; cause?: unknown };
-        if (failure.code === "55P03" || failure.code === "40P01" || failure.code === "57014") {
+        if (failure.code === "55P03" || failure.code === "40P01" || failure.code === "57014" || failure.code === "40001") {
+          if (providerEntered) {
+            // A transaction error after entry must never advertise safe replay.
+            throw new ToolGatewayHttpError(502, "Provider entered; dispatch outcome is uncertain", "dispatch_outcome_unknown");
+          }
           throw new ToolGatewayHttpError(503, "Tool admission is temporarily busy", "admission_contended");
         }
         cause = failure.cause;
@@ -6319,7 +6348,7 @@ export function createToolGatewayService(
         // JSON serialization retains timestamp values (stableSerialize alone
         // treats Date objects as empty objects).
         const preparedHash = (value: unknown) => stableHash(JSON.parse(JSON.stringify(value)));
-        if (preparedHash(current.entry) !== preparedHash(entry) ||
+        if (preparedCatalogHash(current.entry) !== preparedCatalogHash(entry) ||
             preparedConnectionHash(current.connection) !== preparedConnectionHash(connection) ||
             preparedGrantHash(currentGrant) !== preparedGrantHash(grant) ||
             await preparedCredentialState(current.connection, currentGrant, admissionDb) !== credentialState) {
@@ -6795,7 +6824,7 @@ export function createToolGatewayService(
         const currentGrant = await resolveConnectionGrant(session, current.connection, false, admissionDb);
         const currentTemplate = await resolveLocalStdioRuntimeTemplate(current.connection, admissionDb);
         const preparedHash = (value: unknown) => stableHash(JSON.parse(JSON.stringify(value)));
-        if (preparedHash(current.entry) !== preparedHash(entry) ||
+        if (preparedCatalogHash(current.entry) !== preparedCatalogHash(entry) ||
             preparedConnectionHash(current.connection) !== preparedConnectionHash(connection) ||
             preparedGrantHash(currentGrant) !== preparedGrantHash(grant) ||
             preparedHash(currentTemplate) !== preparedHash(template) ||
